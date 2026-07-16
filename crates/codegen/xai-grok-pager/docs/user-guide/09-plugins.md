@@ -146,6 +146,8 @@ grok plugin marketplace remove <url>      # Git URL or local path of a configure
 grok plugin marketplace update [<name>]   # Omit the name to refresh all sources
 ```
 
+The Grok Build repository is itself a marketplace (named `grok-build`) carrying the bundled plugins under `plugins/` — currently the [Discord channel](25-channels.md#the-bundled-discord-plugin): `grok plugin marketplace add lakerfan901/grok-build`, then `grok plugin install discord --trust`.
+
 ### Example: set up a team marketplace
 
 ```bash

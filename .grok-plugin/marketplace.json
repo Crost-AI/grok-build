@@ -1,0 +1,16 @@
+{
+  "name": "grok-build",
+  "description": "Plugins bundled with the Grok Build repository.",
+  "owner": { "name": "xAI" },
+  "plugins": [
+    {
+      "name": "discord",
+      "version": "0.1.0",
+      "description": "Discord channel: forwards Discord messages into a running session and lets the agent reply, react, and read history.",
+      "category": "productivity",
+      "source": "./plugins/discord",
+      "tags": ["channel", "discord", "chat", "bridge"],
+      "keywords": ["discord", "channel", "chat", "bot", "bridge", "notifications"]
+    }
+  ]
+}

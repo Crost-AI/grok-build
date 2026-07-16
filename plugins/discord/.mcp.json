@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "discord": {
+      "command": "node",
+      "args": ["${GROK_PLUGIN_ROOT}/server/discord-channel.mjs"]
+    }
+  }
+}

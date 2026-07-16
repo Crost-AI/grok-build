@@ -122,6 +122,28 @@ States you may see: `active`, `blocked: [channels] enabled = false`, `blocked: n
 
 ---
 
+## The Bundled Discord Plugin
+
+The Grok Build repository ships a ready-made Discord channel — DM the bot (or @mention it in a server channel) and the message lands in your running session; the agent replies through the same channel:
+
+```sh
+grok plugin marketplace add lakerfan901/grok-build
+grok plugin install discord --trust
+
+mkdir -p ~/.grok/channels/discord
+cat > ~/.grok/channels/discord/.env <<'EOF'
+DISCORD_BOT_TOKEN=your-bot-token
+DISCORD_ALLOWED_USER_IDS=your-discord-user-id
+EOF
+chmod 600 ~/.grok/channels/discord/.env
+
+grok --channels plugin:discord@grok-build
+```
+
+Only allowlisted sender ids are forwarded; guild messages additionally require @mentioning the bot by default. The agent gets `send_message`, `add_reaction`, and `read_messages` tools for the return path. Bot creation, intents, invites, and all options are covered in the [plugin's README](../../../../../plugins/discord/README.md).
+
+---
+
 ## Security
 
 An ungated channel is a prompt-injection vector: anyone who can reach its endpoint can put text in front of the agent. Layered controls:
@@ -242,6 +264,8 @@ Bootstrap patterns that work well: reply to unknown senders with a one-time pair
 ### Package as a plugin
 
 To make a channel installable, ship it in a [plugin](09-plugins.md) that contributes the MCP server (via the plugin's `.mcp.json`). Users then enable it per session with `--channels plugin:<name>@<marketplace>`.
+
+The [bundled Discord plugin](../../../../../plugins/discord) is a complete working reference: a single-file bridge with gateway reconnect/resume, sender gating, and reply tools, plus an end-to-end test that mocks the platform.
 
 ---
 
