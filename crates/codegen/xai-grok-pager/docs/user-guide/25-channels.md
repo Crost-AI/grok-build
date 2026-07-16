@@ -128,7 +128,7 @@ The Grok Build repository ships a ready-made Discord channel — DM the bot (or 
 
 ```sh
 grok plugin marketplace add lakerfan901/grok-build
-grok plugin install discord --trust
+grok plugin install discord@grok-build --trust
 
 mkdir -p ~/.grok/channels/discord
 cat > ~/.grok/channels/discord/.env <<'EOF'

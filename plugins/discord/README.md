@@ -28,10 +28,10 @@ Discord **Settings → Advanced → Developer Mode** on, then right-click your o
 
 ```sh
 grok plugin marketplace add lakerfan901/grok-build
-grok plugin install discord --trust
+grok plugin install discord@grok-build --trust
 ```
 
-(Or straight from the repo: `grok plugin install lakerfan901/grok-build#plugins/discord --trust`.)
+The `@grok-build` qualifier matters: other configured marketplaces (including the default official one) may also carry a plugin named `discord`, and an unqualified install is rejected as ambiguous. (Installing straight from the repo also works: `grok plugin install lakerfan901/grok-build#plugins/discord --trust`.)
 
 ### 4. Configure credentials
 
