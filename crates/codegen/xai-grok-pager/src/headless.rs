@@ -176,6 +176,9 @@ pub struct HeadlessOptions {
     pub disable_web_search: bool,
     pub allow_rules: Vec<String>,
     pub deny_rules: Vec<String>,
+    /// Channel opt-in entries from `--channels`, forwarded as
+    /// `startupHints.channels`.
+    pub channels: Vec<String>,
     pub max_turns: Option<u32>,
     pub permission_mode_flag: Option<String>,
     /// Effort token (`--reasoning-effort` / `--effort`); resolved like `/effort` after models load.
@@ -557,6 +560,7 @@ async fn authenticate(
 fn build_headless_init_request(
     rules: Option<&str>,
     system_prompt_override: Option<&str>,
+    channels: &[String],
 ) -> acp::InitializeRequest {
     let mut meta = serde_json::json!({
         "clientType": HEADLESS_CLIENT_TYPE,
@@ -572,6 +576,7 @@ fn build_headless_init_request(
         "nonInteractive": true,
         "skipGitStatus": true,
         "skipProjectLayout": true,
+        "channels": channels,
     });
 
     acp::InitializeRequest::new(acp::ProtocolVersion::V1)
@@ -946,6 +951,7 @@ pub async fn run_single_turn(
     let init_req = build_headless_init_request(
         options.rules.as_deref(),
         options.system_prompt_override.as_deref(),
+        &options.channels,
     );
     let init_resp: acp::InitializeResponse = match acp_send(init_req, &acp_tx).await {
         Ok(r) => r,

@@ -1,5 +1,6 @@
 pub mod acp_types;
 pub mod announcement_state;
+pub mod channels;
 pub mod commands;
 pub mod compaction_config;
 pub mod handle;

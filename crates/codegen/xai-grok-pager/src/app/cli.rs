@@ -453,6 +453,12 @@ pub struct PagerArgs {
         value_delimiter = ','
     )]
     pub deny_rules: Vec<String>,
+    /// Enable channels for this session: MCP servers allowed to push
+    /// events into the running conversation. Entries are
+    /// `server:<mcp-server-name>` or `plugin:<name>@<marketplace>`;
+    /// repeat the flag or separate entries with commas.
+    #[arg(long = "channels", value_name = "SPEC", value_delimiter = ',')]
+    pub channels: Vec<String>,
     /// Single-turn prompt. Prints the response to stdout and exits.
     #[clap(
         short = 'p',

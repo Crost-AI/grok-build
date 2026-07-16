@@ -131,6 +131,28 @@ pub(super) async fn run_session(
             .await;
         });
     }
+    // ── Channels (experimental) ─────────────────────────────────────
+    // Resolve `--channels` opt-ins and wire the inbound-event pipe
+    // BEFORE the MCP init task below spawns any server process, so the
+    // credential env merge is visible to the spawn and the very first
+    // notification a fast server pushes post-handshake finds a sender.
+    if !session.startup_hints.is_subagent
+        && !session.startup_hints.channels.is_empty()
+        && session.setup_channels().await
+    {
+        let (channel_tx, channel_rx) = tokio::sync::mpsc::unbounded_channel::<
+            xai_grok_mcp::channel::ChannelInboundEvent,
+        >();
+        {
+            let mut mcp_state = session.mcp_state.lock().await;
+            mcp_state.set_channel_event_tx(Some(channel_tx));
+        }
+        SessionActor::spawn_channel_forwarder(
+            session.clone(),
+            completion_tx.clone(),
+            channel_rx,
+        );
+    }
     let session_for_mcp = session.clone();
     let completion_tx_for_mcp = completion_tx.clone();
     tokio::task::spawn_local(async move {
@@ -380,8 +402,13 @@ pub(super) async fn run_session(
             SessionCommand::InjectNotification { prompt_id, prompt_blocks, priority,
             source } => { let is_turn_active = session.tool_context.is_turn_active
             .as_ref().map(| f | f.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or(false); if is_turn_active && priority ==
-            NotificationPriority::Next { if let Some(buffer) = & session.tool_context
+            .unwrap_or(false);
+            // The mid-turn buffer is task-keyed, so only task-sourced
+            // notifications may route into it; task-less sources
+            // (channel events — which are always `Later` anyway) take
+            // the pending_notifications path below.
+            if is_turn_active && priority ==
+            NotificationPriority::Next && source.task_id().is_some() { if let Some(buffer) = & session.tool_context
             .monitor_event_buffer { let non_text_count = prompt_blocks.iter().filter(| b
             | ! matches!(b, acp::ContentBlock::Text(_))).count(); if non_text_count > 0 {
             tracing::debug!(non_text_count,
@@ -389,7 +416,7 @@ pub(super) async fn run_session(
             event_text = prompt_blocks.iter().filter_map(| b | { if let
             acp::ContentBlock::Text(t) = b { Some(t.text.clone()) } else { None } })
             .collect::< Vec < _ >> ().join("\n"); let task_id = source.task_id()
-            .to_owned(); const MAX_BUFFER_EVENTS : usize = 50; buffer
+            .map(String::from).unwrap_or_default(); const MAX_BUFFER_EVENTS : usize = 50; buffer
             .push_capped(xai_grok_tools::implementations::grok_build::task::types::MonitorEventNotification
             { task_id : task_id.clone(), event_text, owner_session_id : Some(session
             .session_info.id.0.to_string(),), }, MAX_BUFFER_EVENTS,);

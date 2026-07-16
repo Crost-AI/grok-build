@@ -143,6 +143,10 @@ pub struct ConnectFlags {
     /// Seed agent sessions with auto (classifier) permission mode.
     /// Ignored when `default_yolo_mode` is true.
     pub default_auto_mode: bool,
+    /// Channel opt-in entries from `--channels`
+    /// (`server:<name>` / `plugin:<name>@<marketplace>`). Forwarded to
+    /// the agent as `startupHints.channels`.
+    pub channels: Vec<String>,
 }
 
 /// Connect to an agent: spawn, initialize, authenticate.
@@ -451,6 +455,9 @@ fn build_initialize_meta(flags: &ConnectFlags) -> serde_json::Value {
     }
     if let Some(rules) = &flags.rules {
         meta["rules"] = serde_json::Value::String(rules.clone());
+    }
+    if !flags.channels.is_empty() {
+        meta["startupHints"] = serde_json::json!({ "channels": flags.channels });
     }
     meta
 }

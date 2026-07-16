@@ -12,6 +12,8 @@ For example, a GitHub MCP server might expose tools like `create_issue`, `list_p
 
 See the [MCP specification](https://modelcontextprotocol.io) for protocol details.
 
+MCP servers can also register as **channels** — servers allowed to *push* events (chat messages, webhooks, alerts) into a running session instead of only answering queries. See [25-channels.md](25-channels.md).
+
 ---
 
 ## Configuration

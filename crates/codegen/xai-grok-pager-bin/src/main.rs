@@ -1832,6 +1832,7 @@ async fn async_main() -> Result<()> {
                 disable_web_search: args.disable_web_search,
                 allow_rules: args.allow_rules.clone(),
                 deny_rules: args.deny_rules.clone(),
+                channels: args.channels.clone(),
                 max_turns: args.max_turns,
                 permission_mode_flag: args.permission_mode_flag.clone(),
                 reasoning_effort: args.reasoning_effort.clone(),

@@ -611,6 +611,12 @@ pub struct StartupHints {
     /// parent emits (which also key off the task type, not the resolved agent name).
     #[serde(default)]
     pub subagent_type: Option<String>,
+    /// Channel opt-in entries for this session, verbatim from
+    /// `--channels` (`server:<name>` / `plugin:<name>@<marketplace>`).
+    /// Resolved against the MCP server list and the `[channels]` config
+    /// gate by `SessionActor::setup_channels`; empty = no channels.
+    #[serde(default)]
+    pub channels: Vec<String>,
     /// Set on a fork spawn so `install_system_prompt` does NOT overwrite the
     /// inherited System at `conversation[0]`: the verbatim parent copy already
     /// holds the parent's System and overwriting it would bust the cache prefix.

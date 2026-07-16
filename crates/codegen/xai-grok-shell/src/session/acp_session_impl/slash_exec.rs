@@ -274,6 +274,11 @@ impl SessionActor {
                 self.send_slash_command_output(&text).await;
                 ok_end_turn(0, None)
             }
+            BuiltinAction::ChannelsStatus => {
+                let text = self.build_channels_status().await;
+                self.send_slash_command_output(&text).await;
+                ok_end_turn(0, None)
+            }
             BuiltinAction::PluginsReload => {
                 match &self.plugin_registry_handle {
                     Some(handle) => {

@@ -17,8 +17,8 @@ use tokio::{
 use rmcp::{
     ClientHandler, ServiceExt,
     model::{
-        CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation,
-        PaginatedRequestParams,
+        CallToolRequestParams, ClientCapabilities, ClientInfo, CustomNotification,
+        Implementation, PaginatedRequestParams,
     },
     service::{
         ClientInitializeError, NotificationContext, RoleClient, RunningService, ServiceError,
@@ -402,6 +402,13 @@ pub struct McpState {
     /// dropping `tools/list_changed`, `Ready`, and `HandshakeFailed`
     /// emits for them. Read access is via [`Self::client_event_tx`].
     client_event_tx: Option<tokio::sync::mpsc::UnboundedSender<McpClientEvent>>,
+    /// Sender wired by the session actor to its channel-event
+    /// forwarder task. Fanned into every owned client's `channel_tx`
+    /// slot by [`Self::set_channel_event_tx`]; same ownership rules
+    /// and the same "private on purpose" contract as
+    /// [`Self::client_event_tx`] (shared/subagent clients are never
+    /// wired — channels deliver to the parent session only).
+    channel_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::channel::ChannelInboundEvent>>,
 }
 
 impl McpState {
@@ -425,6 +432,7 @@ impl McpState {
             disabled_tool_registrations: HashMap::new(),
             event_writer: xai_file_utils::events::EventWriter::noop(),
             client_event_tx: None,
+            channel_event_tx: None,
         }
     }
 
@@ -465,6 +473,30 @@ impl McpState {
     /// `client_event_tx` cannot be bypassed by a direct assignment.
     pub fn client_event_tx(&self) -> Option<tokio::sync::mpsc::UnboundedSender<McpClientEvent>> {
         self.client_event_tx.clone()
+    }
+
+    /// Wire the inbound channel-event sender into the state and every
+    /// existing owned client — the channel twin of
+    /// [`Self::set_client_event_tx`], with the same contract: clients
+    /// added later must be wired by the caller (via
+    /// [`McpClient::set_channel_event_tx`]), and shared/subagent
+    /// clients are intentionally not touched.
+    pub fn set_channel_event_tx(
+        &mut self,
+        tx: Option<tokio::sync::mpsc::UnboundedSender<crate::channel::ChannelInboundEvent>>,
+    ) {
+        self.channel_event_tx = tx.clone();
+        for client in self.owned_clients.values() {
+            client.set_channel_event_tx(tx.clone());
+        }
+    }
+
+    /// Read-only access to the installed channel-event sender, or
+    /// `None` when the session has no channels opted in.
+    pub fn channel_event_tx(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedSender<crate::channel::ChannelInboundEvent>> {
+        self.channel_event_tx.clone()
     }
 
     pub fn set_event_writer(&mut self, writer: xai_file_utils::events::EventWriter) {
@@ -2542,6 +2574,17 @@ pub struct McpClient {
     /// `.await`, and the handler's `emit` path is short and
     /// allocation-free.
     notify_tx: SharedEventTx,
+    /// Sink for inbound channel events
+    /// ([`crate::channel::ChannelInboundEvent`]) pushed by servers that
+    /// registered as channels via the `grok/channel` experimental
+    /// capability. Same shared-slot contract as [`Self::notify_tx`]
+    /// (wired post-handshake via [`Self::set_channel_event_tx`],
+    /// observed by the live handler on the next notification). Kept
+    /// separate from `notify_tx` on purpose: status events are
+    /// coalesced by the session dispatcher (last-write-wins per
+    /// server+kind), which would silently drop distinct channel
+    /// payloads that share a key.
+    channel_tx: crate::channel::SharedChannelEventTx,
     /// RAII handle for the per-client transport-liveness poller.
     ///
     /// `Some` after [`Self::arm_liveness_watcher`] succeeds; `None`
@@ -2677,6 +2720,7 @@ impl McpClient {
             warn_budget: crate::mcp_http_client::WarnBudget::default(),
             reconnect,
             notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+            channel_tx: Arc::new(parking_lot::Mutex::new(None)),
             liveness_handle: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
@@ -3480,6 +3524,7 @@ impl McpClient {
             info: Self::make_client_info(&self.server_name),
             server_name: self.server_name.clone(),
             notify_tx: Arc::clone(&self.notify_tx),
+            channel_tx: Arc::clone(&self.channel_tx),
         }
     }
 
@@ -3492,6 +3537,40 @@ impl McpClient {
     /// session-wide on the next event.
     pub fn set_event_tx(&self, tx: Option<tokio::sync::mpsc::UnboundedSender<McpClientEvent>>) {
         *self.notify_tx.lock() = tx;
+    }
+
+    /// Wire a sender for inbound channel events pushed by this server
+    /// (`notifications/grok/channel`). Same shared-slot semantics as
+    /// [`Self::set_event_tx`]: the mutation is observed by the live
+    /// [`GrokClientHandler`] on its next notification, so wiring after
+    /// the handshake is supported.
+    pub fn set_channel_event_tx(
+        &self,
+        tx: Option<tokio::sync::mpsc::UnboundedSender<crate::channel::ChannelInboundEvent>>,
+    ) {
+        *self.channel_tx.lock() = tx;
+    }
+
+    /// Snapshot the current channel-event sender, if any.
+    pub fn channel_event_tx_clone(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedSender<crate::channel::ChannelInboundEvent>> {
+        self.channel_tx.lock().clone()
+    }
+
+    /// Whether the server declared the `grok/channel` experimental
+    /// capability in its initialize result — i.e. registered itself as
+    /// a channel. `false` before a successful handshake.
+    pub async fn declares_channel_capability(&self) -> bool {
+        match &*self.state.lock().await {
+            ClientState::Ready(service) => service
+                .peer_info()
+                .and_then(|info| info.capabilities.experimental.clone())
+                .is_some_and(|experimental| {
+                    experimental.contains_key(crate::channel::CHANNEL_CAPABILITY_KEY)
+                }),
+            _ => false,
+        }
     }
 
     /// Snapshot the current event sender, if any.
@@ -4347,6 +4426,14 @@ pub struct GrokClientHandler {
     /// post-handshake is supported without restarting the rmcp
     /// service loop.
     notify_tx: SharedEventTx,
+    /// **Shared** channel-event sink — same contract as
+    /// [`Self::notify_tx`], wired via
+    /// [`McpClient::set_channel_event_tx`]. `None` for sessions that
+    /// did not opt any server in as a channel; inbound
+    /// `notifications/grok/channel` notifications are then dropped
+    /// silently (the documented contract: no error is returned to the
+    /// server).
+    channel_tx: crate::channel::SharedChannelEventTx,
 }
 
 impl GrokClientHandler {
@@ -4358,6 +4445,19 @@ impl GrokClientHandler {
     /// methods short.
     fn emit(&self, ev: McpClientEvent) {
         let sender = self.notify_tx.lock().clone();
+        if let Some(tx) = sender {
+            let _ = tx.send(ev);
+        }
+    }
+
+    /// Best-effort inbound-channel-event emit — the channel-flavored
+    /// twin of [`Self::emit`]. Reads the shared `channel_tx` slot on
+    /// every call and drops the event when no sink is wired (session
+    /// without `--channels`) or the receiver is gone. rmcp must never
+    /// see an error from a notification handler, so both cases are
+    /// silent by design.
+    fn emit_channel_event(&self, ev: crate::channel::ChannelInboundEvent) {
+        let sender = self.channel_tx.lock().clone();
         if let Some(tx) = sender {
             let _ = tx.send(ev);
         }
@@ -4382,6 +4482,30 @@ impl ClientHandler for GrokClientHandler {
         self.emit(McpClientEvent::ResourcesChanged {
             server: self.server_name.clone(),
         });
+    }
+
+    // `notifications/grok/channel` is a Grok extension method, so it
+    // arrives as rmcp's catch-all `CustomNotification`. Other custom
+    // methods are ignored (same silent contract as an unwired sink).
+    // NOTE: RPIT like the methods above — do not add `#[async_trait]`.
+    async fn on_custom_notification(
+        &self,
+        notification: CustomNotification,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        if notification.method != crate::channel::CHANNEL_NOTIFICATION_METHOD {
+            return;
+        }
+        match crate::channel::parse_channel_notification(
+            &self.server_name,
+            notification.params.as_ref(),
+        ) {
+            Some(ev) => self.emit_channel_event(ev),
+            None => tracing::debug!(
+                server = %self.server_name,
+                "dropping malformed channel notification (missing/non-string content)"
+            ),
+        }
     }
 
     fn get_info(&self) -> ClientInfo {
@@ -6691,6 +6815,7 @@ mod tests {
                 info: McpClient::make_client_info("dead"),
                 server_name: "dead".to_string(),
                 notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+                channel_tx: Arc::new(parking_lot::Mutex::new(None)),
             };
             let transport = rmcp::transport::async_rw::AsyncRwTransport::<RoleClient, _, _>::new(
                 client_read,
@@ -7429,6 +7554,7 @@ mod tests {
             info: McpClient::make_client_info("test"),
             server_name: "test".to_string(),
             notify_tx: Arc::new(parking_lot::Mutex::new(Some(tx))),
+            channel_tx: Arc::new(parking_lot::Mutex::new(None)),
         };
         handler.emit(McpClientEvent::ToolsChanged {
             server: handler.server_name.clone(),
@@ -7449,6 +7575,7 @@ mod tests {
             info: McpClient::make_client_info("test"),
             server_name: "test".to_string(),
             notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+            channel_tx: Arc::new(parking_lot::Mutex::new(None)),
         };
         handler.emit(McpClientEvent::ToolsChanged {
             server: "test".to_string(),
@@ -7464,6 +7591,7 @@ mod tests {
             info: info.clone(),
             server_name: "test-srv".to_string(),
             notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+            channel_tx: Arc::new(parking_lot::Mutex::new(None)),
         };
         let got = handler.get_info();
         // ClientInfo doesn't derive PartialEq; check the visible

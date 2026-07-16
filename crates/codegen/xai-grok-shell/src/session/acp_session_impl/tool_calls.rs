@@ -1915,9 +1915,11 @@ impl SessionActor {
             })
             .len();
         let before_notifications = state.pending_notifications.len();
-        state
-            .pending_notifications
-            .retain(|n| !consumed_ids.contains(&n.source.task_id()));
+        state.pending_notifications.retain(|n| {
+            !n.source
+                .task_id()
+                .is_some_and(|id| consumed_ids.contains(&id))
+        });
         let dropped_notifications = before_notifications - state.pending_notifications.len();
         if dropped_inputs > 0 || dropped_notifications > 0 {
             tracing::info!(

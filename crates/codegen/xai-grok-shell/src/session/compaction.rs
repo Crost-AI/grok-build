@@ -2228,6 +2228,7 @@ mod inline_auto_compact_flow_tests {
             file_state_tracker: Arc::new(FileStateTracker::new()),
             rewind_pending_prompt: std::sync::Mutex::new(None),
             startup_hints: StartupHints::default(),
+            channel_registry: Default::default(),
             forked_tool_override: None,
             compaction: crate::session::compaction_config::CompactionConfig {
                 threshold_percent: std::cell::Cell::new(threshold_percent),

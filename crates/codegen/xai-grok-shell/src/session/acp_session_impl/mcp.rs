@@ -884,7 +884,7 @@ impl SessionActor {
     /// SIGKILLs the spawned child — and returns an explicit error so
     /// the auto-restart loop can emit `Reason::Disabled`.
     pub(crate) async fn respawn_stdio(&self, server: &str) -> Result<(), String> {
-        let (server_config, meta_config, event_tx) = {
+        let (server_config, meta_config, event_tx, channel_tx) = {
             let mcp_state = self.mcp_state.lock().await;
             let server_config = mcp_state
                 .configs
@@ -899,7 +899,8 @@ impl SessionActor {
                 .ok_or_else(|| format!("no stdio config entry for server '{server}'"))?;
             let meta_config = mcp_state.meta_config_map.get(server).cloned();
             let event_tx = mcp_state.client_event_tx();
-            (server_config, meta_config, event_tx)
+            let channel_tx = mcp_state.channel_event_tx();
+            (server_config, meta_config, event_tx, channel_tx)
         };
         let cwd = std::path::Path::new(&self.session_info.cwd);
         let session_id = self.session_info.id.0.as_ref();
@@ -960,6 +961,9 @@ impl SessionActor {
             let _ = tx.send(xai_grok_mcp::servers::McpClientEvent::ToolsChanged {
                 server: server.to_string(),
             });
+        }
+        if let Some(tx) = channel_tx {
+            new_client.set_channel_event_tx(Some(tx));
         }
         let arc_client = std::sync::Arc::new(new_client);
         let _ = arc_client
@@ -1299,7 +1303,10 @@ impl SessionActor {
         let init_total_bg = init_total;
         tokio::task::spawn_local(async move {
             let handshake_start = std::time::Instant::now();
-            let dispatcher_event_tx = mcp_state_bg.lock().await.client_event_tx();
+            let (dispatcher_event_tx, channel_event_tx) = {
+                let state = mcp_state_bg.lock().await;
+                (state.client_event_tx(), state.channel_event_tx())
+            };
             use futures::stream::StreamExt;
             let mut futs = futures::stream::FuturesUnordered::new();
             for client in mcp_clients.iter() {
@@ -1315,6 +1322,7 @@ impl SessionActor {
                     .cloned()
                     .unwrap_or_default();
                 let task_event_tx = dispatcher_event_tx.clone();
+                let task_channel_tx = channel_event_tx.clone();
                 futs.push(async move {
                     let server_name = client.server_name().to_string();
                     let server_start = std::time::Instant::now();
@@ -1327,6 +1335,9 @@ impl SessionActor {
                     });
                     if let Some(tx) = task_event_tx {
                         client.set_event_tx(Some(tx));
+                    }
+                    if let Some(tx) = task_channel_tx {
+                        client.set_channel_event_tx(Some(tx));
                     }
                     let init_budget = std::time::Duration::from_secs(
                         timeout_sec.saturating_mul(2).saturating_add(5),

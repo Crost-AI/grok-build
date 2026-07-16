@@ -309,6 +309,21 @@ MCP servers can also be configured per-project in `.grok/config.toml`. Project-s
 
 Priority for `[mcp_servers]` and `[plugins]`: `.grok/config.toml` (current dir) > `<repo-root>/.grok/config.toml` > `~/.grok/config.toml`. `[permission]` rules are not overridden by priority; they merge across all files with `deny` > `ask` > `allow` (see [22-permissions-and-safety.md](22-permissions-and-safety.md)).
 
+### Channels
+
+Gate which MCP servers may push events into running sessions (see [25-channels.md](25-channels.md)). Channels are opted in per session with `grok --channels <entry>`; this section restricts what those entries may do.
+
+```toml
+[channels]
+enabled = true                        # master switch (default: true)
+allowed = [                           # optional allowlist of --channels entries;
+  "server:webhook",                   # unset = any entry may register,
+  "plugin:telegram@example-market",   # empty list = none may register
+]
+```
+
+`enabled = false` in `requirements.toml` enforces the block for managed deployments; user config cannot override it. The `GROK_CHANNELS_ENABLED` environment variable (`1`/`0`) sits between the requirements and user-config layers. Per-channel credentials live in `~/.grok/channels/<server>/.env` and are injected into that server's environment when it is channel-enabled.
+
 ### Memory
 
 Persist knowledge across sessions (requires `--experimental-memory` or `GROK_MEMORY=1`).
