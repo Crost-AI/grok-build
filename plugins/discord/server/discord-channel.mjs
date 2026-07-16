@@ -494,18 +494,10 @@ function handleDispatch(type, d) {
 function handleMessage(d) {
   if (!d?.author || d.author.bot || d.author.id === selfId) return
 
-  // Sender gate first: identity, not room, decides who may inject text.
-  if (!allowAllUsers && !allowedUsers.has(d.author.id)) {
-    if (allowedUsers.size === 0 && !warnedNoAllowlist) {
-      warnedNoAllowlist = true
-      log(
-        'dropping message: DISCORD_ALLOWED_USER_IDS is not set. Add allowed Discord user ids ' +
-          '(comma-separated) to ~/.grok/channels/discord/.env.',
-      )
-    }
-    return
-  }
-
+  // Room gates first so the sender-gate log below only fires for
+  // messages actually directed at the bot (DMs and mentions) — that
+  // keeps it quiet in busy guilds while making allowlist mistakes
+  // diagnosable from the stderr log.
   const isDM = !d.guild_id
   if (isDM) {
     if (!allowDMs) return
@@ -513,6 +505,25 @@ function handleMessage(d) {
     if (channelIds.size > 0 && !channelIds.has(d.channel_id)) return
     const mentioned = (d.mentions ?? []).some((u) => u.id === selfId)
     if (requireMention && !mentioned) return
+  }
+
+  // Sender gate: identity, not room, decides who may inject text. The
+  // log line includes the sender's id so a misconfigured allowlist can
+  // be fixed by copying the id straight from this file.
+  if (!allowAllUsers && !allowedUsers.has(d.author.id)) {
+    if (allowedUsers.size === 0 && !warnedNoAllowlist) {
+      warnedNoAllowlist = true
+      log(
+        'dropping message: DISCORD_ALLOWED_USER_IDS is not set. Add allowed Discord user ids ' +
+          '(comma-separated) to ~/.grok/channels/discord/.env.',
+      )
+    } else if (allowedUsers.size > 0) {
+      log(
+        `dropping message ${d.id}: sender ${d.author.username ?? '?'} (id ${d.author.id}) ` +
+          'is not in DISCORD_ALLOWED_USER_IDS',
+      )
+    }
+    return
   }
 
   // Strip the leading bot mention so "@grok fix the build" arrives as

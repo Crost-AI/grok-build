@@ -220,7 +220,11 @@ async function main() {
     },
     stdio: ['pipe', 'pipe', 'pipe'],
   })
-  child.stderr.on('data', (d) => process.env.TEST_VERBOSE && process.stderr.write(d))
+  let stderrBuf = ''
+  child.stderr.on('data', (d) => {
+    stderrBuf += d
+    if (process.env.TEST_VERBOSE) process.stderr.write(d)
+  })
 
   // stdout: newline-delimited JSON-RPC from the bridge.
   const fromBridge = []
@@ -374,6 +378,10 @@ async function main() {
     forwarded.length === 2 &&
       !forwarded.some((m) => ['m2', 'm3'].includes(m.params.meta.message_id)),
     'disallowed sender and unmentioned guild message were dropped',
+  )
+  check(
+    stderrBuf.includes('(id 666)') && stderrBuf.includes('not in DISCORD_ALLOWED_USER_IDS'),
+    'sender-gate drop is logged to stderr with the sender id',
   )
 
   console.log('heartbeat')
