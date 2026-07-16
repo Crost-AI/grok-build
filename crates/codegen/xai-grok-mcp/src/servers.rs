@@ -17,8 +17,8 @@ use tokio::{
 use rmcp::{
     ClientHandler, ServiceExt,
     model::{
-        CallToolRequestParams, ClientCapabilities, ClientInfo, CustomNotification,
-        Implementation, PaginatedRequestParams,
+        CallToolRequestParams, ClientCapabilities, ClientInfo, CustomNotification, Implementation,
+        PaginatedRequestParams,
     },
     service::{
         ClientInitializeError, NotificationContext, RoleClient, RunningService, ServiceError,
@@ -408,7 +408,8 @@ pub struct McpState {
     /// and the same "private on purpose" contract as
     /// [`Self::client_event_tx`] (shared/subagent clients are never
     /// wired — channels deliver to the parent session only).
-    channel_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::channel::ChannelInboundEvent>>,
+    channel_event_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::channel::ChannelInboundEvent>>,
 }
 
 impl McpState {

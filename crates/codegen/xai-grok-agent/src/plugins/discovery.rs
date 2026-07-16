@@ -98,6 +98,24 @@ pub enum PluginOrigin {
     ConfigPath,
 }
 
+impl PluginOrigin {
+    /// Whether this origin is a Claude-compat discovery source (mirrored
+    /// from `~/.claude/` state) rather than a Grok-native one. Used as a
+    /// name-conflict tie-break within a scope: something the user set up
+    /// through Grok itself (a `grok plugin install`, a `$GROK_HOME/plugins`
+    /// dir) expresses intent for Grok sessions and must not be shadowed
+    /// by a same-named plugin mirrored from another tool's config.
+    pub fn is_claude_compat(&self) -> bool {
+        matches!(
+            self,
+            Self::ProjectClaude
+                | Self::UserClaude
+                | Self::ClaudeMarketplace { .. }
+                | Self::ClaudeInstalled { .. }
+        )
+    }
+}
+
 /// Stable internal identity for a plugin.
 ///
 /// Format: `<scope>/<hex8>/<name>`
@@ -392,9 +410,7 @@ pub fn discover_plugins(
         );
     }
 
-    // 5c. Installed plugins (~/.claude/plugins/installed_plugins.json).
-    // installPath entries (nested under cache/<marketplace>/<plugin>/<version>/).
-    // scope wins. Within same scope, first-found (alphabetical by canonical
+    // 5c. Installed plugins (~/.claude/plugins/installed_plugins.json),
     // with explicit installPath entries (nested under cache/<marketplace>/<plugin>/<version>/).
     // The plugin name is extracted from the JSON key ("name@marketplace").
     if let Some(home) = dirs::home_dir() {
@@ -727,27 +743,34 @@ fn collect_plugin(
 
 /// Resolve plugin_name conflicts across scopes.
 ///
-/// Within each name group, keep only the highest-priority candidate
-/// (lowest scope ordinal). Log warnings for dropped duplicates.
+/// Within each name group, keep only the highest-priority candidate:
+/// lowest scope ordinal first; within the same scope, Grok-native
+/// origins beat Claude-compat ones (see
+/// [`PluginOrigin::is_claude_compat`]); otherwise first-collected wins.
+/// Log warnings for dropped duplicates.
 fn resolve_name_conflicts(candidates: &mut Vec<DiscoveredPlugin>) {
     let mut name_map: HashMap<String, usize> = HashMap::new();
     let mut to_remove: Vec<usize> = Vec::new();
     // (winner_idx, conflict message) pairs to apply after the scan.
     let mut conflict_msgs: Vec<(usize, String)> = Vec::new();
 
+    // Priority key: lower sorts first. Ties go to the earlier candidate.
+    fn priority(p: &DiscoveredPlugin) -> (u8, u8) {
+        (p.scope as u8, u8::from(p.origin.is_claude_compat()))
+    }
+
     for (idx, candidate) in candidates.iter().enumerate() {
         let name = candidate.manifest.name.clone();
         match name_map.get(&name) {
             Some(&existing_idx) => {
                 let existing = &candidates[existing_idx];
-                // Lower scope ordinal = higher priority
-                if (candidate.scope as u8) < (existing.scope as u8) {
+                if priority(candidate) < priority(existing) {
                     // New candidate wins
                     tracing::warn!(
                         plugin_name = %name,
                         winner = %candidate.root.display(),
                         loser = %existing.root.display(),
-                        "plugin name collision resolved by scope precedence"
+                        "plugin name collision resolved by scope/origin precedence"
                     );
                     let msg = format!(
                         "Name collision: shadowing \"{}\" from {}",
@@ -763,7 +786,7 @@ fn resolve_name_conflicts(candidates: &mut Vec<DiscoveredPlugin>) {
                         plugin_name = %name,
                         winner = %existing.root.display(),
                         loser = %candidate.root.display(),
-                        "plugin name collision resolved by scope precedence"
+                        "plugin name collision resolved by scope/origin precedence"
                     );
                     let msg = format!(
                         "Name collision: shadowing \"{}\" from {}",
@@ -1393,6 +1416,81 @@ mod tests {
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].scope, PluginScope::CliOverride);
+    }
+
+    #[test]
+    fn grok_native_origin_beats_claude_compat_within_same_scope() {
+        // A `grok plugin install`ed plugin and a Claude-compat mirrored
+        // plugin share a name at User scope. The Grok-native one must
+        // win regardless of collection order (compat sources are
+        // collected first in discover_plugins).
+        let tmp = tempfile::tempdir().unwrap();
+        let compat_dir = make_manifest_plugin(&tmp.path().join("claude-mp"), "discord");
+        let grok_dir = make_manifest_plugin(&tmp.path().join("grok-installed"), "discord");
+
+        let trust = TrustStore::load_from(tmp.path().join("trust"));
+        let mut seen = HashSet::new();
+        let mut candidates = Vec::new();
+        // Compat marketplace plugin collected FIRST (as in discover_plugins).
+        collect_plugin(
+            &compat_dir,
+            PluginScope::User,
+            PluginOrigin::ClaudeMarketplace {
+                marketplace: "claude-plugins-official".into(),
+            },
+            &trust,
+            false,
+            &mut seen,
+            &mut candidates,
+        );
+        collect_plugin(
+            &grok_dir,
+            PluginScope::User,
+            PluginOrigin::MarketplaceInstall {
+                source_name: Some("grok-build".into()),
+                git_url: None,
+            },
+            &trust,
+            false,
+            &mut seen,
+            &mut candidates,
+        );
+
+        resolve_name_conflicts(&mut candidates);
+
+        assert_eq!(candidates.len(), 1);
+        assert!(
+            matches!(
+                candidates[0].origin,
+                PluginOrigin::MarketplaceInstall { .. }
+            ),
+            "grok-native install must shadow the claude-compat plugin, got {:?}",
+            candidates[0].origin
+        );
+        assert!(
+            candidates[0].conflict.is_some(),
+            "winner records the collision"
+        );
+
+        // And two grok-native sources still resolve first-collected-wins.
+        let a = make_manifest_plugin(&tmp.path().join("a"), "tool");
+        let b = make_manifest_plugin(&tmp.path().join("b"), "tool");
+        let mut seen = HashSet::new();
+        let mut candidates = Vec::new();
+        for dir in [&a, &b] {
+            collect_plugin(
+                dir,
+                PluginScope::User,
+                PluginOrigin::UserGrok,
+                &trust,
+                false,
+                &mut seen,
+                &mut candidates,
+            );
+        }
+        resolve_name_conflicts(&mut candidates);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].root, a);
     }
 
     #[test]

@@ -44,8 +44,10 @@ pub enum ChannelSpec {
     /// matched by exact server name.
     Server { name: String },
     /// `plugin:<name>@<marketplace>` — every MCP server contributed by
-    /// the named plugin. The marketplace segment is kept for display
-    /// and allowlist matching; plugin resolution matches on name.
+    /// the named plugin. The marketplace segment is part of the
+    /// identity: the active plugin's provenance must match it (see
+    /// [`plugin_origin_marketplace`]), so a same-named plugin from a
+    /// different source can't silently satisfy the opt-in.
     Plugin { name: String, marketplace: String },
 }
 
@@ -166,6 +168,51 @@ pub enum ChannelState {
     /// plugin without MCP servers, or server not configured for this
     /// project).
     Unmatched,
+    /// A plugin with the requested name is active, but it comes from a
+    /// different source than the `@<marketplace>` the spec names —
+    /// typically a same-named plugin from another marketplace or a
+    /// compat directory shadowed the one the user opted into. Carries
+    /// a human-readable description of the active plugin's source.
+    MarketplaceMismatch { active_source: String },
+}
+
+/// Marketplace qualifier of a plugin origin — the name that must match
+/// the `@<marketplace>` segment of a `plugin:` channel spec. `None` for
+/// origins with no marketplace (plain plugin dirs, CLI overrides, ...),
+/// which can never match a qualified spec.
+pub fn plugin_origin_marketplace(origin: &xai_grok_agent::plugins::PluginOrigin) -> Option<&str> {
+    use xai_grok_agent::plugins::PluginOrigin;
+    match origin {
+        PluginOrigin::MarketplaceInstall { source_name, .. } => source_name.as_deref(),
+        PluginOrigin::ClaudeMarketplace { marketplace } => Some(marketplace),
+        PluginOrigin::ClaudeInstalled { marketplace } => marketplace.as_deref(),
+        _ => None,
+    }
+}
+
+/// Human-readable source of an active plugin, for the
+/// [`ChannelState::MarketplaceMismatch`] diagnostic.
+pub fn describe_plugin_origin(origin: &xai_grok_agent::plugins::PluginOrigin) -> String {
+    use xai_grok_agent::plugins::PluginOrigin;
+    match origin {
+        PluginOrigin::CliOverride => "a --plugin-dir override".to_string(),
+        PluginOrigin::ProjectGrok => "the project .grok/plugins directory".to_string(),
+        PluginOrigin::ProjectClaude => "the project .claude/plugins directory".to_string(),
+        PluginOrigin::UserGrok => "the user plugins directory".to_string(),
+        PluginOrigin::UserClaude => "~/.claude/plugins (Claude compat)".to_string(),
+        PluginOrigin::ClaudeMarketplace { marketplace } => {
+            format!("marketplace '{marketplace}' (Claude compat)")
+        }
+        PluginOrigin::ClaudeInstalled { marketplace } => match marketplace {
+            Some(m) => format!("a Claude Code install from marketplace '{m}'"),
+            None => "a Claude Code install".to_string(),
+        },
+        PluginOrigin::MarketplaceInstall { source_name, .. } => match source_name {
+            Some(m) => format!("marketplace '{m}'"),
+            None => "a direct git/local install".to_string(),
+        },
+        PluginOrigin::ConfigPath => "a [plugins].paths config entry".to_string(),
+    }
 }
 
 /// One `--channels` entry with its resolution result.
@@ -449,6 +496,61 @@ mod tests {
         let out = format_channel_event(&ev);
         assert!(out.contains(TRUNCATION_MARKER));
         assert!(out.len() < big.len() + 200);
+    }
+
+    // ── Plugin origin → marketplace qualifier ──────────────────────
+
+    #[test]
+    fn origin_marketplace_qualifiers() {
+        use xai_grok_agent::plugins::PluginOrigin;
+        assert_eq!(
+            plugin_origin_marketplace(&PluginOrigin::MarketplaceInstall {
+                source_name: Some("grok-build".into()),
+                git_url: None,
+            }),
+            Some("grok-build")
+        );
+        assert_eq!(
+            plugin_origin_marketplace(&PluginOrigin::ClaudeMarketplace {
+                marketplace: "claude-plugins-official".into(),
+            }),
+            Some("claude-plugins-official")
+        );
+        assert_eq!(
+            plugin_origin_marketplace(&PluginOrigin::ClaudeInstalled { marketplace: None }),
+            None
+        );
+        // No marketplace provenance → can never match a qualified spec.
+        assert_eq!(plugin_origin_marketplace(&PluginOrigin::UserGrok), None);
+        assert_eq!(
+            plugin_origin_marketplace(&PluginOrigin::MarketplaceInstall {
+                source_name: None,
+                git_url: Some("https://example.com/x.git".into()),
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn origin_descriptions_name_the_source() {
+        use xai_grok_agent::plugins::PluginOrigin;
+        assert_eq!(
+            describe_plugin_origin(&PluginOrigin::ClaudeMarketplace {
+                marketplace: "claude-plugins-official".into(),
+            }),
+            "marketplace 'claude-plugins-official' (Claude compat)"
+        );
+        assert_eq!(
+            describe_plugin_origin(&PluginOrigin::UserClaude),
+            "~/.claude/plugins (Claude compat)"
+        );
+        assert_eq!(
+            describe_plugin_origin(&PluginOrigin::MarketplaceInstall {
+                source_name: Some("grok-build".into()),
+                git_url: None,
+            }),
+            "marketplace 'grok-build'"
+        );
     }
 
     // ── Registry gate ──────────────────────────────────────────────

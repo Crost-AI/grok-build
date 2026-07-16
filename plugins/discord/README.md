@@ -74,6 +74,12 @@ All via environment variables (put them in the `.env` file above):
 
 Inbound events follow standard channel delivery: an idle session wakes immediately; a busy session receives queued events together at the end of the current turn.
 
+## Troubleshooting
+
+- **`/channels` says the server "does NOT declare the grok/channel capability"** or the entry is blocked with a marketplace mismatch: another plugin named `discord` (for example Claude Code's Discord plugin, discovered through the `~/.claude/plugins` compat layer) is shadowing this one. Grok-native installs take precedence over compat-discovered plugins, so `grok plugin install discord@grok-build --trust` normally wins; check `grok plugin details discord` to see which plugin is active and where it came from.
+- **Messages are silently ignored**: the sender's id isn't in `DISCORD_ALLOWED_USER_IDS`, or you forgot to @mention the bot in a server channel. The bridge logs every drop reason to stderr (visible in Grok's MCP logs).
+- **Guild messages arrive empty / `4014 disallowed intents` in the logs**: enable **Message Content Intent** in the developer portal (Bot → Privileged Gateway Intents) and save.
+
 ## Security
 
 - **Sender allowlist is mandatory.** With `DISCORD_ALLOWED_USER_IDS` unset, every inbound message is dropped (and the server logs why). The gate is on the *sender's id*, not the room — anyone else in an allowed channel is still ignored.

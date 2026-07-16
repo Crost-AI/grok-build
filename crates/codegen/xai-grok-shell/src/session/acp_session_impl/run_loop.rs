@@ -140,18 +140,13 @@ pub(super) async fn run_session(
         && !session.startup_hints.channels.is_empty()
         && session.setup_channels().await
     {
-        let (channel_tx, channel_rx) = tokio::sync::mpsc::unbounded_channel::<
-            xai_grok_mcp::channel::ChannelInboundEvent,
-        >();
+        let (channel_tx, channel_rx) =
+            tokio::sync::mpsc::unbounded_channel::<xai_grok_mcp::channel::ChannelInboundEvent>();
         {
             let mut mcp_state = session.mcp_state.lock().await;
             mcp_state.set_channel_event_tx(Some(channel_tx));
         }
-        SessionActor::spawn_channel_forwarder(
-            session.clone(),
-            completion_tx.clone(),
-            channel_rx,
-        );
+        SessionActor::spawn_channel_forwarder(session.clone(), completion_tx.clone(), channel_rx);
     }
     let session_for_mcp = session.clone();
     let completion_tx_for_mcp = completion_tx.clone();

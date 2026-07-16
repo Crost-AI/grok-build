@@ -118,7 +118,9 @@ Channels (2 entries):
 Events from active channels inject into this session as <channel> messages.
 ```
 
-States you may see: `active`, `blocked: [channels] enabled = false`, `blocked: not in the [channels] allowed list`, `invalid: <parse error>`, and `matched no configured MCP server`.
+States you may see: `active`, `blocked: [channels] enabled = false`, `blocked: not in the [channels] allowed list`, `invalid: <parse error>`, `matched no configured MCP server`, and a marketplace-mismatch state (below).
+
+For a `plugin:<name>@<marketplace>` entry, the marketplace is part of the identity: if the active plugin with that name actually comes from somewhere else — plugins share one namespace, and a same-named plugin from another marketplace or a Claude-compat directory can win the name — the entry is blocked with a message naming the real source rather than silently channel-enabling a server you didn't point at. Grok-native installs (`grok plugin install`) take precedence over Claude-compat plugins of the same name, so this mostly comes up when the shadowing plugin is also Grok-installed; `/plugins` shows who won and why.
 
 ---
 

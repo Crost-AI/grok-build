@@ -93,12 +93,18 @@ pub enum NotificationPriority {
 }
 #[derive(Debug, Clone)]
 pub enum NotificationSource {
-    MonitorEvent { task_id: String },
-    BashTaskCompleted { task_id: String },
+    MonitorEvent {
+        task_id: String,
+    },
+    BashTaskCompleted {
+        task_id: String,
+    },
     /// Inbound event from an opted-in channel MCP server (see
     /// `crate::session::channels`). Carries the server name; the
     /// prompt blocks already hold the rendered `<channel>` envelope.
-    ChannelEvent { server: String },
+    ChannelEvent {
+        server: String,
+    },
 }
 impl NotificationSource {
     /// Background-task id for task-sourced notifications; `None` for

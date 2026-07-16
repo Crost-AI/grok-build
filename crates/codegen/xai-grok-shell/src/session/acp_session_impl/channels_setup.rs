@@ -13,7 +13,8 @@
 use super::*;
 use crate::session::channels::{
     ChannelEntry, ChannelRegistry, ChannelSpec, ChannelState, channel_env_dir,
-    format_channel_event, load_channel_env_file, resolve_channels_policy,
+    describe_plugin_origin, format_channel_event, load_channel_env_file, plugin_origin_marketplace,
+    resolve_channels_policy,
 };
 
 impl SessionActor {
@@ -37,12 +38,12 @@ impl SessionActor {
         // Server name → owning plugin name, for `plugin:` specs. Reuses
         // the sourced merge so plugin attribution matches what the MCP
         // config loader actually did.
+        let plugin_registry = self.plugin_registry.borrow().clone();
         let plugin_servers: Vec<(String, String)> = {
-            let registry = self.plugin_registry.borrow().clone();
-            match registry {
+            match &plugin_registry {
                 Some(reg) => crate::session::managed_mcp::merge_managed_mcp_servers_sourced(
                     std::path::Path::new(&self.session_info.cwd),
-                    Some(&reg),
+                    Some(reg),
                     &self.rebuild_spec.compat,
                 )
                 .into_iter()
@@ -110,6 +111,33 @@ impl SessionActor {
                     state: ChannelState::BlockedNotAllowed,
                 });
                 continue;
+            }
+            // For plugin specs, the `@<marketplace>` qualifier is part of
+            // the identity: a same-named plugin from another source (e.g.
+            // a Claude-compat mirror) must not silently satisfy the
+            // opt-in — the user would be channel-enabling a server they
+            // did not point at.
+            if let ChannelSpec::Plugin { name, marketplace } = &spec {
+                let active = plugin_registry
+                    .as_ref()
+                    .and_then(|reg| reg.get(name))
+                    .filter(|p| p.enabled && p.trusted);
+                if let Some(plugin) = active
+                    && plugin_origin_marketplace(&plugin.origin) != Some(marketplace.as_str())
+                {
+                    let active_source = describe_plugin_origin(&plugin.origin);
+                    tracing::warn!(
+                        entry = %canonical, %active_source,
+                        "channel entry names a marketplace, but the active plugin with \
+                         that name comes from a different source (name shadowing?)"
+                    );
+                    registry.entries.push(ChannelEntry {
+                        raw,
+                        servers: Vec::new(),
+                        state: ChannelState::MarketplaceMismatch { active_source },
+                    });
+                    continue;
+                }
             }
             let servers: Vec<String> = match &spec {
                 ChannelSpec::Server { name } => {
@@ -270,6 +298,12 @@ impl SessionActor {
                 ChannelState::Unmatched => lines.push(format!(
                     "  {} — matched no configured MCP server (check the name and your MCP config)",
                     entry.raw
+                )),
+                ChannelState::MarketplaceMismatch { active_source } => lines.push(format!(
+                    "  {} — blocked: the active plugin with this name comes from {}, not the \
+                     marketplace you named (a same-named plugin is shadowing the one you opted \
+                     into; check /plugins and disable or uninstall the other one)",
+                    entry.raw, active_source
                 )),
             }
         }
