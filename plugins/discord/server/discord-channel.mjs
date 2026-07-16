@@ -28,7 +28,7 @@
 
 import process from 'node:process'
 
-const VERSION = '0.1.0'
+const VERSION = '0.1.1'
 const API_BASE = process.env.DISCORD_API_BASE ?? 'https://discord.com/api/v10'
 const GATEWAY_URL =
   process.env.DISCORD_GATEWAY_URL ?? 'wss://gateway.discord.gg/?v=10&encoding=json'
