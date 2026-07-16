@@ -62,6 +62,7 @@ All via environment variables (put them in the `.env` file above):
 |----------|----------|---------|---------|
 | `DISCORD_BOT_TOKEN` | yes | — | Bot token from the developer portal |
 | `DISCORD_ALLOWED_USER_IDS` | to receive | *(none — everything dropped)* | Comma-separated Discord user ids allowed to push messages into the session. `*` allows everyone (not recommended) |
+| `DISCORD_ALLOWED_BOT_IDS` | no | *(bots ignored)* | Comma-separated bot user ids allowed to trigger the session. Bots are ignored by default; see [Listening to other bots](#listening-to-other-bots) |
 | `DISCORD_CHANNEL_IDS` | no | all visible channels | Comma-separated guild channel ids to listen to; others are ignored (does not affect DMs) |
 | `DISCORD_ALLOW_DMS` | no | `true` | Set `false` to ignore direct messages |
 | `DISCORD_REQUIRE_MENTION` | no | `true` | Set `false` to forward guild messages that don't @mention the bot |
@@ -73,6 +74,14 @@ All via environment variables (put them in the `.env` file above):
 - **`read_messages`** — fetch recent history from a channel for context that wasn't forwarded.
 
 Inbound events follow standard channel delivery: an idle session wakes immediately; a busy session receives queued events together at the end of the current turn.
+
+## Listening to other bots
+
+By default the bridge ignores every bot-authored message. To let another agent's bot (say, a Claude Code Discord bot in the same server) talk to your session, add its bot user id (Developer Mode → right-click the bot → Copy User ID) to `DISCORD_ALLOWED_BOT_IDS`. Its messages then pass the sender gate and arrive marked `bot="true"`, and the agent is instructed to keep bot-to-bot replies terse and purposeful.
+
+Practical setup for two coordinating agents: a dedicated channel, `DISCORD_CHANNEL_IDS=<that channel>`, and `DISCORD_REQUIRE_MENTION=false` — bots rarely emit *real* mention entities (plain-text "@grok" in a bot's message is not a mention and won't pass the mention gate), so a mention requirement usually silences them.
+
+**Mind the loop.** Two agents that each respond to the other can ping-pong forever, burning tokens on both sides. Safest is one-directional listening (your session hears the other bot, but the other bot doesn't allowlist yours). If you enable both directions, make sure at least one side replies only when addressed or has its own loop guard.
 
 ## Troubleshooting
 

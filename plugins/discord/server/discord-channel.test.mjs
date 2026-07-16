@@ -217,6 +217,7 @@ async function main() {
       DISCORD_GATEWAY_URL: `ws://127.0.0.1:${gateway.port}/`,
       DISCORD_API_BASE: `http://127.0.0.1:${rest.port}/api/v10`,
       DISCORD_ALLOWED_USER_IDS: '42',
+      DISCORD_ALLOWED_BOT_IDS: '777',
     },
     stdio: ['pipe', 'pipe', 'pipe'],
   })
@@ -402,11 +403,39 @@ async function main() {
     'channel notification for role-mentioned guild message',
   )
   check(roleEv.params.content === 'status?', 'role mention counts and is stripped from content')
+  // Bot senders: dropped unless in DISCORD_ALLOWED_BOT_IDS.
+  gw.send({
+    op: 0,
+    s: 7,
+    t: 'MESSAGE_CREATE',
+    d: {
+      id: 'm6',
+      channel_id: 'dm-chan',
+      content: 'unlisted bot',
+      author: { id: '888', username: 'otherbot', bot: true },
+    },
+  })
+  gw.send({
+    op: 0,
+    s: 8,
+    t: 'MESSAGE_CREATE',
+    d: {
+      id: 'm7',
+      channel_id: 'dm-chan',
+      content: 'claude checking in',
+      author: { id: '777', username: 'claude', bot: true },
+    },
+  })
+  const botEv = await expectStdout(
+    (m) => m.method === 'notifications/grok/channel' && m.params.meta.message_id === 'm7',
+    'channel notification for allowlisted bot',
+  )
+  check(botEv.params.meta.bot === 'true', 'bot senders are marked with bot="true" meta')
   const forwarded = fromBridge.filter((m) => m.method === 'notifications/grok/channel')
   check(
-    forwarded.length === 3 &&
-      !forwarded.some((m) => ['m2', 'm3'].includes(m.params.meta.message_id)),
-    'disallowed sender and unmentioned guild message were dropped',
+    forwarded.length === 4 &&
+      !forwarded.some((m) => ['m2', 'm3', 'm6'].includes(m.params.meta.message_id)),
+    'disallowed sender, unmentioned guild message, and unlisted bot were dropped',
   )
   check(
     stderrBuf.includes('(id 666)') && stderrBuf.includes('not in DISCORD_ALLOWED_USER_IDS'),
