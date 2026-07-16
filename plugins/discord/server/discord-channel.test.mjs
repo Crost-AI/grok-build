@@ -310,6 +310,14 @@ async function main() {
     t: 'READY',
     d: { session_id: 'sess-1', resume_gateway_url: '', user: { id: 'BOT', username: 'grok' } },
   })
+  // Discord sends one GUILD_CREATE per guild after READY; it carries the
+  // bot's managed role, which the mention gate must honor.
+  gw.send({
+    op: 0,
+    s: 2,
+    t: 'GUILD_CREATE',
+    d: { id: 'g1', roles: [{ id: 'R1', name: 'grok', tags: { bot_id: 'BOT' } }] },
+  })
 
   console.log('inbound message gating')
   gw.send({
@@ -373,9 +381,30 @@ async function main() {
   )
   check(guildEv.params.content === 'fix the build', 'bot mention stripped from content')
   check(guildEv.params.meta.guild_id === 'g1', 'meta carries guild_id')
+  // Mentioning the bot's managed ROLE (what Discord's picker often
+  // inserts for "@botname") must count as a mention too.
+  gw.send({
+    op: 0,
+    s: 6,
+    t: 'MESSAGE_CREATE',
+    d: {
+      id: 'm5',
+      guild_id: 'g1',
+      channel_id: 'c1',
+      content: '<@&R1> status?',
+      author: { id: '42', username: 'karl' },
+      mentions: [],
+      mention_roles: ['R1'],
+    },
+  })
+  const roleEv = await expectStdout(
+    (m) => m.method === 'notifications/grok/channel' && m.params.meta.message_id === 'm5',
+    'channel notification for role-mentioned guild message',
+  )
+  check(roleEv.params.content === 'status?', 'role mention counts and is stripped from content')
   const forwarded = fromBridge.filter((m) => m.method === 'notifications/grok/channel')
   check(
-    forwarded.length === 2 &&
+    forwarded.length === 3 &&
       !forwarded.some((m) => ['m2', 'm3'].includes(m.params.meta.message_id)),
     'disallowed sender and unmentioned guild message were dropped',
   )

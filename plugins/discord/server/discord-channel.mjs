@@ -28,7 +28,7 @@
 
 import process from 'node:process'
 
-const VERSION = '0.1.1'
+const VERSION = '0.1.2'
 const API_BASE = process.env.DISCORD_API_BASE ?? 'https://discord.com/api/v10'
 const GATEWAY_URL =
   process.env.DISCORD_GATEWAY_URL ?? 'wss://gateway.discord.gg/?v=10&encoding=json'
@@ -332,6 +332,11 @@ let selfId = null
 let reconnectAttempt = 0
 let warnedNoAllowlist = false
 let warnedNoContent = false
+// guild id → the bot's managed role id in that guild. Discord's mention
+// picker often inserts the bot's ROLE (same name as the bot) instead of
+// the bot user; both render identically, so a role mention must satisfy
+// the mention gate too.
+const botRoleByGuild = new Map()
 
 // Close codes after which reconnecting cannot help.
 const FATAL_CLOSE_CODES = new Map([
@@ -483,6 +488,11 @@ function handleDispatch(type, d) {
       reconnectAttempt = 0
       log('gateway session resumed')
       break
+    case 'GUILD_CREATE': {
+      const role = (d.roles ?? []).find((r) => r.tags?.bot_id === selfId)
+      if (role) botRoleByGuild.set(d.id, role.id)
+      break
+    }
     case 'MESSAGE_CREATE':
       handleMessage(d)
       break
@@ -503,7 +513,9 @@ function handleMessage(d) {
     if (!allowDMs) return
   } else {
     if (channelIds.size > 0 && !channelIds.has(d.channel_id)) return
-    const mentioned = (d.mentions ?? []).some((u) => u.id === selfId)
+    const mentioned =
+      (d.mentions ?? []).some((u) => u.id === selfId) ||
+      (d.mention_roles ?? []).includes(botRoleByGuild.get(d.guild_id))
     if (requireMention && !mentioned) return
   }
 
@@ -526,10 +538,12 @@ function handleMessage(d) {
     return
   }
 
-  // Strip the leading bot mention so "@grok fix the build" arrives as
+  // Strip the leading bot mention (user form `<@id>`/`<@!id>` or the
+  // managed-role form `<@&id>`) so "@grok fix the build" arrives as
   // "fix the build".
+  const mentionIds = [selfId, botRoleByGuild.get(d.guild_id)].filter(Boolean).join('|')
   let content = (d.content ?? '')
-    .replace(new RegExp(`^\\s*<@!?${selfId}>\\s*`), '')
+    .replace(new RegExp(`^\\s*<@[!&]?(?:${mentionIds})>\\s*`), '')
     .trim()
   for (const a of d.attachments ?? []) {
     content += `${content ? '\n' : ''}[attachment: ${a.url}]`
