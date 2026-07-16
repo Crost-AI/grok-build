@@ -218,6 +218,7 @@ async function main() {
       DISCORD_API_BASE: `http://127.0.0.1:${rest.port}/api/v10`,
       DISCORD_ALLOWED_USER_IDS: '42',
       DISCORD_ALLOWED_BOT_IDS: '777',
+      DISCORD_MENTION_WINDOW_SECONDS: '2',
     },
     stdio: ['pipe', 'pipe', 'pipe'],
   })
@@ -383,7 +384,8 @@ async function main() {
   check(guildEv.params.content === 'fix the build', 'bot mention stripped from content')
   check(guildEv.params.meta.guild_id === 'g1', 'meta carries guild_id')
   // Mentioning the bot's managed ROLE (what Discord's picker often
-  // inserts for "@botname") must count as a mention too.
+  // inserts for "@botname") must count as a mention too. Fresh channel
+  // (c2) so m4's continuation window can't mask a broken role gate.
   gw.send({
     op: 0,
     s: 6,
@@ -391,7 +393,7 @@ async function main() {
     d: {
       id: 'm5',
       guild_id: 'g1',
-      channel_id: 'c1',
+      channel_id: 'c2',
       content: '<@&R1> status?',
       author: { id: '42', username: 'karl' },
       mentions: [],
@@ -431,11 +433,82 @@ async function main() {
     'channel notification for allowlisted bot',
   )
   check(botEv.params.meta.bot === 'true', 'bot senders are marked with bot="true" meta')
+
+  console.log('addressed-without-mention paths')
+  // A Discord reply to one of the bot's messages counts as addressing it.
+  gw.send({
+    op: 0,
+    s: 9,
+    t: 'MESSAGE_CREATE',
+    d: {
+      id: 'm8',
+      guild_id: 'g1',
+      channel_id: 'c3',
+      content: 'replying to your last answer',
+      author: { id: '42', username: 'karl' },
+      mentions: [],
+      referenced_message: { id: 'old-bot-msg', author: { id: 'BOT' } },
+    },
+  })
+  await expectStdout(
+    (m) => m.method === 'notifications/grok/channel' && m.params.meta.message_id === 'm8',
+    'reply-to-bot forwarded without a mention',
+  )
+  check(true, 'reply to a bot message counts as addressing the bot')
+  // Continuation window: after a mentioned message, the same sender's
+  // unmentioned follow-up in the same channel flows (split-message case).
+  gw.send({
+    op: 0,
+    s: 10,
+    t: 'MESSAGE_CREATE',
+    d: {
+      id: 'm9a',
+      guild_id: 'g1',
+      channel_id: 'c1',
+      content: '<@BOT> part 1 of a long briefing',
+      author: { id: '42', username: 'karl' },
+      mentions: [{ id: 'BOT' }],
+    },
+  })
+  gw.send({
+    op: 0,
+    s: 11,
+    t: 'MESSAGE_CREATE',
+    d: {
+      id: 'm9b',
+      guild_id: 'g1',
+      channel_id: 'c1',
+      content: 'part 2, no mention',
+      author: { id: '42', username: 'karl' },
+      mentions: [],
+    },
+  })
+  await expectStdout(
+    (m) => m.method === 'notifications/grok/channel' && m.params.meta.message_id === 'm9b',
+    'continuation chunk forwarded within the window',
+  )
+  check(true, 'unmentioned follow-up within the window is forwarded')
+  // After the window expires, unmentioned messages drop again.
+  await new Promise((r) => setTimeout(r, 2600))
+  gw.send({
+    op: 0,
+    s: 12,
+    t: 'MESSAGE_CREATE',
+    d: {
+      id: 'm10',
+      guild_id: 'g1',
+      channel_id: 'c1',
+      content: 'late, no mention',
+      author: { id: '42', username: 'karl' },
+      mentions: [],
+    },
+  })
+  await new Promise((r) => setTimeout(r, 300))
   const forwarded = fromBridge.filter((m) => m.method === 'notifications/grok/channel')
   check(
-    forwarded.length === 4 &&
-      !forwarded.some((m) => ['m2', 'm3', 'm6'].includes(m.params.meta.message_id)),
-    'disallowed sender, unmentioned guild message, and unlisted bot were dropped',
+    forwarded.length === 7 &&
+      !forwarded.some((m) => ['m2', 'm3', 'm6', 'm10'].includes(m.params.meta.message_id)),
+    'disallowed sender, unmentioned guild message, unlisted bot, and expired-window follow-up were dropped',
   )
   check(
     stderrBuf.includes('(id 666)') && stderrBuf.includes('not in DISCORD_ALLOWED_USER_IDS'),

@@ -26,12 +26,17 @@
 //   DISCORD_ALLOW_DMS         optional; "false" to ignore direct messages
 //   DISCORD_REQUIRE_MENTION   optional; "false" to forward guild messages
 //                             that don't @mention the bot
+//   DISCORD_MENTION_WINDOW_SECONDS  optional; after a sender's message is
+//                             forwarded, their follow-ups in the same channel
+//                             pass without a mention for this long (default
+//                             60; 0 disables). Covers messages split by the
+//                             2000-char limit and natural follow-ups.
 //
 // DISCORD_API_BASE and DISCORD_GATEWAY_URL exist for tests only.
 
 import process from 'node:process'
 
-const VERSION = '0.1.3'
+const VERSION = '0.1.4'
 const API_BASE = process.env.DISCORD_API_BASE ?? 'https://discord.com/api/v10'
 const GATEWAY_URL =
   process.env.DISCORD_GATEWAY_URL ?? 'wss://gateway.discord.gg/?v=10&encoding=json'
@@ -61,6 +66,8 @@ const channelIds = new Set(
 )
 const allowDMs = process.env.DISCORD_ALLOW_DMS !== 'false'
 const requireMention = process.env.DISCORD_REQUIRE_MENTION !== 'false'
+const mentionWindowMs =
+  Math.max(0, Number(process.env.DISCORD_MENTION_WINDOW_SECONDS ?? '60') || 0) * 1000
 
 // Everything diagnostic goes to stderr; stdout is the MCP transport.
 function log(...args) {
@@ -346,6 +353,12 @@ let warnedNoContent = false
 // the bot user; both render identically, so a role mention must satisfy
 // the mention gate too.
 const botRoleByGuild = new Map()
+// `${channel_id}:${author_id}` → epoch ms of that sender's last forwarded
+// message. Implements the mention continuation window: a sender who just
+// addressed the bot keeps the floor briefly, so messages split by the
+// 2000-char limit (only the first carries the mention) and quick
+// follow-ups aren't dropped by the mention gate.
+const lastForwardedAt = new Map()
 
 // Close codes after which reconnecting cannot help.
 const FATAL_CLOSE_CODES = new Map([
@@ -526,10 +539,19 @@ function handleMessage(d) {
     if (!allowDMs) return
   } else {
     if (channelIds.size > 0 && !channelIds.has(d.channel_id)) return
+    // "Addressed to the bot" means: a user/role mention, a Discord reply
+    // to one of the bot's messages, or a continuation — another message
+    // from a sender whose message was forwarded within the window (long
+    // content split across messages only mentions in the first chunk).
     const mentioned =
       (d.mentions ?? []).some((u) => u.id === selfId) ||
-      (d.mention_roles ?? []).includes(botRoleByGuild.get(d.guild_id))
-    if (requireMention && !mentioned) return
+      (d.mention_roles ?? []).includes(botRoleByGuild.get(d.guild_id)) ||
+      d.referenced_message?.author?.id === selfId
+    const withinWindow =
+      mentionWindowMs > 0 &&
+      Date.now() - (lastForwardedAt.get(`${d.channel_id}:${d.author.id}`) ?? 0) <=
+        mentionWindowMs
+    if (requireMention && !mentioned && !withinWindow) return
   }
 
   // Sender gate: identity, not room, decides who may inject text. The
@@ -580,6 +602,9 @@ function handleMessage(d) {
     ...(isDM ? { dm: 'true' } : { guild_id: d.guild_id }),
     ...(d.author.bot ? { bot: 'true' } : {}),
   }
+  // Sliding continuation window: any forwarded message keeps this
+  // sender's floor open in this channel.
+  lastForwardedAt.set(`${d.channel_id}:${d.author.id}`, Date.now())
   log(`forwarding message ${d.id} from ${meta.author} (channel ${d.channel_id})`)
   pushChannelEvent(content, meta)
 }

@@ -66,6 +66,9 @@ All via environment variables (put them in the `.env` file above):
 | `DISCORD_CHANNEL_IDS` | no | all visible channels | Comma-separated guild channel ids to listen to; others are ignored (does not affect DMs) |
 | `DISCORD_ALLOW_DMS` | no | `true` | Set `false` to ignore direct messages |
 | `DISCORD_REQUIRE_MENTION` | no | `true` | Set `false` to forward guild messages that don't @mention the bot |
+| `DISCORD_MENTION_WINDOW_SECONDS` | no | `60` | After a sender's message is forwarded, their follow-ups in the same channel pass the mention gate for this long (sliding). Covers content split by the 2000-char limit — only the first chunk carries the mention — and quick follow-ups. `0` disables |
+
+With the mention requirement on, a guild message is treated as addressed to the bot if it @mentions the bot (user **or** its managed role), is a Discord **reply** to one of the bot's messages, or falls inside the sender's continuation window above. Sender allowlists always apply regardless.
 
 ## What the agent can do
 
