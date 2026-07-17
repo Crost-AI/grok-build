@@ -144,6 +144,8 @@ grok --channels plugin:discord@grok-build
 
 Only allowlisted sender ids are forwarded; guild messages additionally require @mentioning the bot by default. The agent gets `send_message`, `add_reaction`, and `read_messages` tools for the return path. Bot creation, intents, invites, and all options are covered in the [plugin's README](../../../../../plugins/discord/README.md).
 
+A **Slack** sibling ships alongside it — same gating model, connected over Socket Mode (no public URL needed), with thread-aware replies: `grok plugin install slack@grok-build --trust`, credentials in `~/.grok/channels/slack/.env`, then `grok --channels plugin:slack@grok-build`. Setup is covered in the [slack plugin's README](../../../../../plugins/slack/README.md).
+
 ---
 
 ## Security
