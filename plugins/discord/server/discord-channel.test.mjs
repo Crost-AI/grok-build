@@ -92,6 +92,11 @@ function startMockGateway() {
       frameDecoder(
         (text) => {
           const payload = JSON.parse(text)
+          // ACK heartbeats (op 1) so the bridge does not recycle mid-suite
+          // during long waits (mention-window expiry is 2s+; HELLO interval is 150ms).
+          if (payload.op === 1) {
+            client.send({ op: 11 })
+          }
           received.push(payload)
           for (const [i, w] of waiters.entries()) {
             if (w.predicate(payload)) {
@@ -163,7 +168,17 @@ function startMockRest() {
         auth: req.headers.authorization,
         body: body ? JSON.parse(body) : null,
       })
-      if (req.method === 'POST' && /\/channels\/[^/]+\/messages$/.test(req.url)) {
+      if (req.method === 'POST' && /\/channels\/[^/]+\/threads$/.test(req.url)) {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(
+          JSON.stringify({
+            id: 'thr-new',
+            parent_id: req.url.match(/\/channels\/([^/]+)\/threads/)?.[1] ?? null,
+            name: body ? JSON.parse(body).name : 'thread',
+            type: 11,
+          }),
+        )
+      } else if (req.method === 'POST' && /\/channels\/[^/]+\/messages$/.test(req.url)) {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ id: 'msg-999' }))
       } else if (req.method === 'PUT' && req.url.includes('/reactions/')) {
@@ -181,6 +196,18 @@ function startMockRest() {
               attachments: [],
             },
           ]),
+        )
+      } else if (req.method === 'GET' && /\/channels\/[^/]+$/.test(req.url)) {
+        // Channel/thread lookup for allowlist inheritance fallback.
+        const id = req.url.split('/').pop()
+        const parents = { thr1: 'c1', thr2: 'c-other', 'thr-new': 'c1' }
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(
+          JSON.stringify({
+            id,
+            parent_id: parents[id] ?? null,
+            type: parents[id] ? 11 : 0,
+          }),
         )
       } else {
         res.writeHead(404)
@@ -210,15 +237,22 @@ async function main() {
   const gateway = await startMockGateway()
   const rest = await startMockRest()
 
+  // Explicit env — do NOT inherit host DISCORD_* (a live Grok session often
+  // exports DISCORD_REQUIRE_MENTION=false / real channel ids, which break the suite).
   const child = spawn(process.execPath, [BRIDGE], {
     env: {
-      ...process.env,
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
       DISCORD_BOT_TOKEN: TOKEN,
       DISCORD_GATEWAY_URL: `ws://127.0.0.1:${gateway.port}/`,
       DISCORD_API_BASE: `http://127.0.0.1:${rest.port}/api/v10`,
       DISCORD_ALLOWED_USER_IDS: '42',
       DISCORD_ALLOWED_BOT_IDS: '777',
+      DISCORD_REQUIRE_MENTION: 'true',
       DISCORD_MENTION_WINDOW_SECONDS: '2',
+      // Allowlisted parents/channels used by the suite. Threads inherit via
+      // parent (thr1 under c1 ok; thr2 under c-other drops).
+      DISCORD_CHANNEL_IDS: 'c1,c2,c3',
     },
     stdio: ['pipe', 'pipe', 'pipe'],
   })
@@ -293,8 +327,15 @@ async function main() {
   const tools = await request('tools/list', {})
   const toolNames = (tools.result?.tools ?? []).map((t) => t.name).sort()
   check(
-    JSON.stringify(toolNames) === JSON.stringify(['add_reaction', 'read_messages', 'send_message']),
-    `tools/list returns the three tools (got: ${toolNames.join(', ')})`,
+    JSON.stringify(toolNames) ===
+      JSON.stringify([
+        'add_reaction',
+        'create_poll',
+        'create_thread',
+        'read_messages',
+        'send_message',
+      ]),
+    `tools/list returns the five tools (got: ${toolNames.join(', ')})`,
   )
 
   console.log('gateway handshake')
@@ -505,14 +546,78 @@ async function main() {
   })
   await new Promise((r) => setTimeout(r, 300))
   const forwarded = fromBridge.filter((m) => m.method === 'notifications/grok/channel')
+  const forwardedIds = forwarded.map((m) => m.params.meta.message_id)
+  // Assert the drops by id (not a brittle total count — suite grows with tools).
   check(
-    forwarded.length === 7 &&
-      !forwarded.some((m) => ['m2', 'm3', 'm6', 'm10'].includes(m.params.meta.message_id)),
+    !forwardedIds.some((id) => ['m2', 'm3', 'm6', 'm10'].includes(id)),
     'disallowed sender, unmentioned guild message, unlisted bot, and expired-window follow-up were dropped',
   )
   check(
     stderrBuf.includes('(id 666)') && stderrBuf.includes('not in DISCORD_ALLOWED_USER_IDS'),
     'sender-gate drop is logged to stderr with the sender id',
+  )
+
+  console.log('thread inheritance under DISCORD_CHANNEL_IDS')
+  // Parent c1 is allowlisted; thread thr1 is not listed but parent is c1.
+  // Unique message ids (m11+) — earlier suite already used m8/m9*.
+  gw.send({
+    op: 0,
+    s: 20,
+    t: 'THREAD_CREATE',
+    d: { id: 'thr1', parent_id: 'c1', guild_id: 'g1', name: 'test-thread' },
+  })
+  // Let THREAD_CREATE land before MESSAGE_CREATE (map + message chain).
+  await new Promise((r) => setTimeout(r, 50))
+  gw.send({
+    op: 0,
+    s: 21,
+    t: 'MESSAGE_CREATE',
+    d: {
+      id: 'm11',
+      guild_id: 'g1',
+      channel_id: 'thr1',
+      content: '<@BOT> testing in thread',
+      author: { id: '42', username: 'karl' },
+      mentions: [{ id: 'BOT' }],
+    },
+  })
+  const thrEv = await expectStdout(
+    (m) => m.method === 'notifications/grok/channel' && m.params.meta.message_id === 'm11',
+    'channel notification for thread under allowlisted parent',
+  )
+  check(thrEv.params.content === 'testing in thread', 'thread mention stripped')
+  check(thrEv.params.meta.channel_id === 'thr1', 'meta channel_id is the thread id')
+  check(
+    thrEv.params.meta.parent_channel_id === 'c1',
+    'meta carries parent_channel_id for thread messages',
+  )
+  // Thread under a non-allowlisted parent must drop.
+  gw.send({
+    op: 0,
+    s: 22,
+    t: 'THREAD_CREATE',
+    d: { id: 'thr2', parent_id: 'c-other', guild_id: 'g1', name: 'other-thread' },
+  })
+  gw.send({
+    op: 0,
+    s: 23,
+    t: 'MESSAGE_CREATE',
+    d: {
+      id: 'm12',
+      guild_id: 'g1',
+      channel_id: 'thr2',
+      content: '<@BOT> should drop',
+      author: { id: '42', username: 'karl' },
+      mentions: [{ id: 'BOT' }],
+    },
+  })
+  await new Promise((r) => setTimeout(r, 150))
+  check(
+    !fromBridge.some(
+      (m) =>
+        m.method === 'notifications/grok/channel' && m.params.meta.message_id === 'm12',
+    ),
+    'thread under non-allowlisted parent was dropped',
   )
 
   console.log('heartbeat')
@@ -563,6 +668,104 @@ async function main() {
   check(
     readRes.result?.content?.[0]?.text?.includes('earlier message'),
     'read_messages returns simplified history',
+  )
+
+  const pollRes = await request('tools/call', {
+    name: 'create_poll',
+    arguments: {
+      channel_id: 'c1',
+      question: 'Ship the tip feature tonight?',
+      answers: [
+        { text: 'Yes', emoji: '✅' },
+        'No',
+        { text: 'Later', emoji: 'clock:123' },
+      ],
+      duration: 48,
+      allow_multiselect: false,
+      content: 'quick vote',
+    },
+  })
+  check(
+    pollRes.result?.content?.[0]?.text?.includes('poll created') &&
+      pollRes.result?.content?.[0]?.text?.includes('msg-999'),
+    'create_poll returns the posted message id',
+  )
+  const pollPost = rest.requests
+    .filter((r) => r.method === 'POST' && r.url === '/api/v10/channels/c1/messages')
+    .find((r) => r.body?.poll)
+  check(Boolean(pollPost), 'create_poll hit the channel messages endpoint with a poll body')
+  check(pollPost?.body?.content === 'quick vote', 'create_poll optional caption attached')
+  check(pollPost?.body?.poll?.question?.text === 'Ship the tip feature tonight?', 'poll question set')
+  check(pollPost?.body?.poll?.duration === 48, 'poll duration in hours')
+  check(pollPost?.body?.poll?.allow_multiselect === false, 'poll multiselect default/false')
+  check(pollPost?.body?.poll?.answers?.length === 3, 'poll has three answers')
+  check(
+    pollPost?.body?.poll?.answers?.[0]?.poll_media?.emoji?.name === '✅' &&
+      pollPost?.body?.poll?.answers?.[2]?.poll_media?.emoji?.id === '123',
+    'poll answer emojis normalized (unicode + custom name:id)',
+  )
+
+  const badPoll = await request('tools/call', {
+    name: 'create_poll',
+    arguments: { channel_id: 'c1', question: 'only one?', answers: ['A'] },
+  })
+  check(
+    badPoll.result?.isError === true &&
+      badPoll.result?.content?.[0]?.text?.includes('2–10'),
+    'create_poll rejects fewer than 2 answers',
+  )
+
+  console.log('create_thread')
+  const thrRes = await request('tools/call', {
+    name: 'create_thread',
+    arguments: {
+      parent_channel_id: 'c1',
+      name: 'PR · #700 · test <@999> @everyone',
+      message: 'workstream open',
+    },
+  })
+  const thrText = thrRes.result?.content?.[0]?.text ?? ''
+  check(
+    thrText.includes('thread created') && thrText.includes('thr-new'),
+    'create_thread returns new thread id',
+  )
+  check(
+    thrText.includes('parent c1') && thrText.includes('first message id msg-999'),
+    'create_thread posts optional first message',
+  )
+  const thrPost = rest.requests.find(
+    (r) => r.method === 'POST' && r.url === '/api/v10/channels/c1/threads',
+  )
+  check(Boolean(thrPost), 'create_thread hit parent /threads endpoint')
+  check(thrPost?.body?.type === 11, 'public thread type 11')
+  check(thrPost?.body?.auto_archive_duration === 1440, '24h auto-archive (1440 min)')
+  check(
+    thrPost?.body?.name === 'PR · #700 · test',
+    `thread name sanitized (got ${JSON.stringify(thrPost?.body?.name)})`,
+  )
+  const thrMsg = rest.requests.find(
+    (r) => r.method === 'POST' && r.url === '/api/v10/channels/thr-new/messages',
+  )
+  check(thrMsg?.body?.content === 'workstream open', 'first message posted into new thread')
+
+  const thrDenied = await request('tools/call', {
+    name: 'create_thread',
+    arguments: { parent_channel_id: 'c-other', name: 'nope' },
+  })
+  check(
+    thrDenied.result?.isError === true &&
+      thrDenied.result?.content?.[0]?.text?.includes('DISCORD_CHANNEL_IDS'),
+    'create_thread rejects non-allowlisted parent',
+  )
+
+  const thrEmpty = await request('tools/call', {
+    name: 'create_thread',
+    arguments: { parent_channel_id: 'c1', name: '<@123> @everyone' },
+  })
+  check(
+    thrEmpty.result?.isError === true &&
+      thrEmpty.result?.content?.[0]?.text?.includes('non-empty name'),
+    'create_thread rejects empty name after mention strip',
   )
 
   console.log('teardown')
