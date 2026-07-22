@@ -18,7 +18,7 @@ you, on Discord:            (the reply arrives in the same Discord channel)
 1. Open the [Discord developer portal](https://discord.com/developers/applications) → **New Application**.
 2. Under **Bot**, click **Reset Token** and copy the token — this is `DISCORD_BOT_TOKEN`.
 3. Still under **Bot → Privileged Gateway Intents**, enable **Message Content Intent** (without it, guild messages arrive with empty text and are dropped).
-4. Invite the bot to your server: **OAuth2 → URL Generator**, scope `bot`, permissions **View Channels**, **Send Messages**, **Read Message History**, **Add Reactions**; open the generated URL. (DMs also require sharing at least one server with the bot.)
+4. Invite the bot to your server: **OAuth2 → URL Generator**, scope `bot`, permissions **View Channels**, **Send Messages**, **Read Message History**, **Add Reactions**, **Attach Files** (for `send_file`), and **Create Public Threads** (for `create_thread`); open the generated URL. (DMs also require sharing at least one server with the bot.)
 
 ### 2. Find your Discord user id
 
@@ -77,6 +77,8 @@ With the mention requirement on, a guild message is treated as addressed to the 
 - **`read_messages`** — fetch recent history from a channel for context that wasn't forwarded.
 - **`create_poll`** — post a native Discord poll (`POST /channels/{id}/messages` with a `poll` body). Question ≤300 chars; 2–10 answers ≤55 chars each; `duration` is hours (1–768, default 24); optional caption, multiselect, and per-answer emoji. Poll messages cannot be edited after posting.
 - **`create_thread`** — open a public workstream thread under an allowlisted parent text channel (`POST /channels/{id}/threads`, type 11). Name is sanitized (mentions stripped, max 100 chars); **24h auto-archive**; optional first message. Parent must be in `DISCORD_CHANNEL_IDS` when that allowlist is set. New threads inherit parent allowlist for inbound (v0.1.5+).
+- **`send_file`** — upload a file from the machine as a Discord attachment (10 MB bot limit), with an optional caption. Requires the **Attach Files** permission on the bot (see the invite step).
+- **`read_attachment`** — download an incoming attachment (the `[attachment ...: url]` lines in forwarded messages) to a temp file under the OS temp dir and return its path, so the agent can read images, logs, or documents you drop in the chat. Restricted to Discord's CDN hosts; 25 MB cap; CDN links expire after a while, so old attachments may need re-sending.
 
 Inbound events follow standard channel delivery: an idle session wakes immediately; a busy session receives queued events together at the end of the current turn.
 

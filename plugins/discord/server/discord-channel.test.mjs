@@ -162,13 +162,24 @@ function startMockRest() {
     let body = ''
     req.on('data', (c) => (body += c))
     req.on('end', () => {
+      let parsed = null
+      try {
+        parsed = body ? JSON.parse(body) : null
+      } catch {
+        /* multipart or non-JSON body — keep raw only */
+      }
       requests.push({
         method: req.method,
         url: req.url,
         auth: req.headers.authorization,
-        body: body ? JSON.parse(body) : null,
+        contentType: req.headers['content-type'] ?? '',
+        body: parsed,
+        raw: body,
       })
-      if (req.method === 'POST' && /\/channels\/[^/]+\/threads$/.test(req.url)) {
+      if (req.method === 'GET' && req.url.startsWith('/cdn/')) {
+        res.writeHead(200, { 'Content-Type': 'text/plain' })
+        res.end('attachment-bytes-123')
+      } else if (req.method === 'POST' && /\/channels\/[^/]+\/threads$/.test(req.url)) {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(
           JSON.stringify({
@@ -250,6 +261,7 @@ async function main() {
       DISCORD_ALLOWED_BOT_IDS: '777',
       DISCORD_REQUIRE_MENTION: 'true',
       DISCORD_MENTION_WINDOW_SECONDS: '2',
+      DISCORD_ATTACHMENT_HOSTS: '127.0.0.1',
       // Allowlisted parents/channels used by the suite. Threads inherit via
       // parent (thr1 under c1 ok; thr2 under c-other drops).
       DISCORD_CHANNEL_IDS: 'c1,c2,c3',
@@ -332,10 +344,12 @@ async function main() {
         'add_reaction',
         'create_poll',
         'create_thread',
+        'read_attachment',
         'read_messages',
+        'send_file',
         'send_message',
       ]),
-    `tools/list returns the five tools (got: ${toolNames.join(', ')})`,
+    `tools/list returns the seven tools (got: ${toolNames.join(', ')})`,
   )
 
   console.log('gateway handshake')
@@ -766,6 +780,61 @@ async function main() {
     thrEmpty.result?.isError === true &&
       thrEmpty.result?.content?.[0]?.text?.includes('non-empty name'),
     'create_thread rejects empty name after mention strip',
+  )
+
+  console.log('file attachments')
+  const { writeFile: writeTmp, readFile: readTmp } = await import('node:fs/promises')
+  const osmod = await import('node:os')
+  const tmpFile = path.join(osmod.tmpdir(), `discord-sendfile-test-${process.pid}.txt`)
+  await writeTmp(tmpFile, 'hello attachment content')
+  const fileRes = await request('tools/call', {
+    name: 'send_file',
+    arguments: { channel_id: 'c1', file_path: tmpFile, caption: 'here you go' },
+  })
+  check(
+    fileRes.result?.content?.[0]?.text?.includes('msg-999'),
+    `send_file returns the posted message id (got: ${fileRes.result?.content?.[0]?.text})`,
+  )
+  const upload = api_last_multipart()
+  function api_last_multipart() {
+    return rest.requests.findLast(
+      (r) => r.method === 'POST' && r.contentType.startsWith('multipart/form-data'),
+    )
+  }
+  check(Boolean(upload), 'send_file posts multipart/form-data')
+  check(
+    Boolean(upload) &&
+      upload.raw.includes('payload_json') &&
+      upload.raw.includes('here you go') &&
+      upload.raw.includes('discord-sendfile-test-'),
+    'multipart body carries payload_json, caption, and filename',
+  )
+  const readRes2 = await request('tools/call', {
+    name: 'read_attachment',
+    arguments: { url: `http://127.0.0.1:${rest.port}/cdn/incoming-log.txt` },
+  })
+  let saved = null
+  try {
+    saved = JSON.parse(readRes2.result?.content?.[0]?.text ?? '')
+  } catch {
+    /* checked below */
+  }
+  check(
+    saved && saved.bytes === 'attachment-bytes-123'.length,
+    `read_attachment reports the downloaded size (got: ${readRes2.result?.content?.[0]?.text})`,
+  )
+  check(
+    saved && (await readTmp(saved.path, 'utf8')) === 'attachment-bytes-123',
+    'read_attachment saves the attachment content to the reported path',
+  )
+  const blocked = await request('tools/call', {
+    name: 'read_attachment',
+    arguments: { url: 'http://evil.example/x.txt' },
+  })
+  check(
+    blocked.result?.isError === true &&
+      blocked.result?.content?.[0]?.text?.includes('only fetches Discord CDN'),
+    'read_attachment refuses non-CDN hosts',
   )
 
   console.log('teardown')

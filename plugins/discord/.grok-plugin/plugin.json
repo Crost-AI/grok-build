@@ -1,6 +1,6 @@
 {
   "name": "discord",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Discord channel for Grok Build: forwards Discord messages into a running session and lets the agent reply, react, create polls/threads, and read history through the Discord API.",
   "author": { "name": "xAI" },
   "repository": "https://github.com/lakerfan901/grok-build",

@@ -8,7 +8,7 @@ Message your Grok Build session from Slack. This plugin is a [channel](../../cra
 
 1. Open [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → *From scratch*, pick your workspace.
 2. **Socket Mode** (left sidebar) → enable it. When prompted, create an app-level token with the `connections:write` scope — the `xapp-...` value is your `SLACK_APP_TOKEN`.
-3. **OAuth & Permissions → Bot Token Scopes**, add: `chat:write`, `reactions:write`, `channels:history`, `groups:history`, `im:history`, `users:read`.
+3. **OAuth & Permissions → Bot Token Scopes**, add: `chat:write`, `reactions:write`, `channels:history`, `groups:history`, `im:history`, `users:read`, `files:write` (for `send_file`), `files:read` (for `read_attachment`).
 4. **Event Subscriptions** → enable, and under *Subscribe to bot events* add: `message.channels`, `message.groups`, `message.im`. (Don't also add `app_mention` — the bridge ignores it to avoid double delivery.)
 5. **Install App** → install to your workspace → copy the **Bot User OAuth Token** (`xoxb-...`) — your `SLACK_BOT_TOKEN`.
 6. Invite the bot to the channels it should hear: `/invite @grok` in each.
@@ -64,6 +64,8 @@ With the mention requirement on, a channel message is treated as addressed to th
 - **`send_message`** — post to a channel or DM; pass `thread_ts` (from the incoming tag) to reply in-thread. Content is split at ~4,000 characters into consecutive messages.
 - **`add_reaction`** — emoji-react to a message (`thumbsup`, `eyes`, `white_check_mark`, ...).
 - **`read_messages`** — fetch recent channel history for context that wasn't forwarded.
+- **`send_file`** — upload a file from the machine into a channel or DM (Slack's external-upload flow), with an optional caption. Needs the `files:write` scope.
+- **`read_attachment`** — download an incoming Slack file (the `[attachment: url]` lines in forwarded messages) to a temp file and return its path, so the agent can read what you drop in the chat. Authenticates with the bot token (`files:read`), restricted to Slack's file hosts, 25 MB cap.
 
 Delivery semantics are standard channels behavior: an idle session wakes immediately; a busy one receives queued events together at the end of the current turn.
 

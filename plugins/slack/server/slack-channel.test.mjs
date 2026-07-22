@@ -153,17 +153,45 @@ function startMockWebApi(wsPort) {
     let body = ''
     req.on('data', (c) => (body += c))
     req.on('end', () => {
-      const method = req.url.replace(/^\/api\//, '')
+      const [method, query = ''] = req.url.replace(/^\/api\//, '').split('?')
+      let parsed = null
+      try {
+        parsed = body ? JSON.parse(body) : null
+      } catch {
+        /* raw byte upload — keep raw only */
+      }
       const record = {
         method,
+        query,
         auth: req.headers.authorization,
-        body: body ? JSON.parse(body) : null,
+        body: parsed,
+        raw: body,
       }
       requests.push(record)
+      if (method === 'files-serve/log.txt') {
+        res.writeHead(200, { 'Content-Type': 'text/plain' })
+        res.end('slack-file-bytes')
+        return
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' })
       switch (method) {
         case 'apps.connections.open':
           res.end(JSON.stringify({ ok: true, url: `ws://127.0.0.1:${wsPort}/` }))
+          break
+        case 'files.getUploadURLExternal':
+          res.end(
+            JSON.stringify({
+              ok: true,
+              upload_url: `http://127.0.0.1:${server.address().port}/api/upload-bytes`,
+              file_id: 'F-NEW',
+            }),
+          )
+          break
+        case 'upload-bytes':
+          res.end(JSON.stringify({ ok: true }))
+          break
+        case 'files.completeUploadExternal':
+          res.end(JSON.stringify({ ok: true, files: [{ id: 'F-NEW' }] }))
           break
         case 'auth.test':
           res.end(JSON.stringify({ ok: true, user_id: 'UBOT', user: 'grok' }))
@@ -226,6 +254,7 @@ async function main() {
       SLACK_ALLOWED_USER_IDS: 'U42',
       SLACK_ALLOWED_BOT_IDS: 'B77',
       SLACK_MENTION_WINDOW_SECONDS: '2',
+      SLACK_FILE_HOSTS: '127.0.0.1',
     },
     stdio: ['pipe', 'pipe', 'pipe'],
   })
@@ -299,8 +328,9 @@ async function main() {
   const tools = await request('tools/list', {})
   const toolNames = (tools.result?.tools ?? []).map((t) => t.name).sort()
   check(
-    JSON.stringify(toolNames) === JSON.stringify(['add_reaction', 'read_messages', 'send_message']),
-    `tools/list returns the three tools (got: ${toolNames.join(', ')})`,
+    JSON.stringify(toolNames) ===
+      JSON.stringify(['add_reaction', 'read_attachment', 'read_messages', 'send_file', 'send_message']),
+    `tools/list returns the five tools (got: ${toolNames.join(', ')})`,
   )
 
   console.log('socket mode handshake')
@@ -484,6 +514,62 @@ async function main() {
     forwarded.length === 5 &&
       !forwarded.some((m) => ['2.001', '5.001', '7.001', '9.501'].includes(m.params.meta.message_ts)),
     'unmentioned, unlisted-bot, disallowed-sender, and expired-window messages were dropped',
+  )
+
+  console.log('file attachments')
+  const { writeFile: writeTmp, readFile: readTmp } = await import('node:fs/promises')
+  const osmod = await import('node:os')
+  const tmpFile = path.join(osmod.tmpdir(), `slack-sendfile-test-${process.pid}.txt`)
+  await writeTmp(tmpFile, 'slack upload payload')
+  const fileRes = await request('tools/call', {
+    name: 'send_file',
+    arguments: { channel_id: 'C1', file_path: tmpFile, caption: 'build log attached' },
+  })
+  check(
+    fileRes.result?.content?.[0]?.text?.includes('F-NEW'),
+    `send_file returns the file id (got: ${fileRes.result?.content?.[0]?.text})`,
+  )
+  const ticketReq = api.requests.find((r) => r.method === 'files.getUploadURLExternal')
+  check(
+    Boolean(ticketReq) &&
+      ticketReq.query.includes('slack-sendfile-test-') &&
+      ticketReq.query.includes(`length=${'slack upload payload'.length}`) &&
+      ticketReq.auth === 'Bearer xoxb-test',
+    'getUploadURLExternal carries filename, length, and the bot token',
+  )
+  const bytesReq = api.requests.find((r) => r.method === 'upload-bytes')
+  check(bytesReq?.raw === 'slack upload payload', 'file bytes posted to the one-time upload URL')
+  const completeReq = api.requests.find((r) => r.method === 'files.completeUploadExternal')
+  check(
+    completeReq?.body?.channel_id === 'C1' &&
+      completeReq?.body?.files?.[0]?.id === 'F-NEW' &&
+      completeReq?.body?.initial_comment === 'build log attached',
+    'completeUploadExternal shares into the channel with the caption',
+  )
+  const readRes2 = await request('tools/call', {
+    name: 'read_attachment',
+    arguments: { url: `http://127.0.0.1:${api.port}/api/files-serve/log.txt` },
+  })
+  let saved = null
+  try {
+    saved = JSON.parse(readRes2.result?.content?.[0]?.text ?? '')
+  } catch {
+    /* checked below */
+  }
+  check(
+    saved && (await readTmp(saved.path, 'utf8')) === 'slack-file-bytes',
+    `read_attachment saves the file content to the reported path (got: ${readRes2.result?.content?.[0]?.text})`,
+  )
+  const fileGet = api.requests.find((r) => r.method === 'files-serve/log.txt')
+  check(fileGet?.auth === 'Bearer xoxb-test', 'read_attachment authenticates with the bot token')
+  const blocked = await request('tools/call', {
+    name: 'read_attachment',
+    arguments: { url: 'https://evil.example/f.txt' },
+  })
+  check(
+    blocked.result?.isError === true &&
+      blocked.result?.content?.[0]?.text?.includes('only fetches Slack file hosts'),
+    'read_attachment refuses non-Slack hosts',
   )
 
   console.log('teardown')

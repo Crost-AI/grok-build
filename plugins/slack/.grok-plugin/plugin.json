@@ -1,6 +1,6 @@
 {
   "name": "slack",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Slack channel for Grok Build: forwards Slack messages into a running session over Socket Mode and lets the agent reply (thread-aware), react, and read history through the Slack Web API.",
   "author": { "name": "xAI" },
   "repository": "https://github.com/lakerfan901/grok-build",

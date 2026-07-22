@@ -5,7 +5,7 @@
   "plugins": [
     {
       "name": "discord",
-      "version": "0.1.6",
+      "version": "0.1.7",
       "description": "Discord channel: forwards Discord messages into a running session and lets the agent reply, react, and read history.",
       "category": "productivity",
       "source": "./plugins/discord",
@@ -14,7 +14,7 @@
     },
     {
       "name": "slack",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "description": "Slack channel: forwards Slack messages into a running session over Socket Mode and lets the agent reply (thread-aware), react, and read history.",
       "category": "productivity",
       "source": "./plugins/slack",
