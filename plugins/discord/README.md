@@ -70,6 +70,8 @@ All via environment variables (put them in the `.env` file above):
 
 With the mention requirement on, a guild message is treated as addressed to the bot if it @mentions the bot (user **or** its managed role), is a Discord **reply** to one of the bot's messages, or falls inside the sender's continuation window above. Sender allowlists always apply regardless.
 
+**Listening without the mention requirement** (`DISCORD_REQUIRE_MENTION=false`): every allowed sender's message in allowed channels flows in, and messages not directed at the bot carry an `addressed` attribute — `addressed="other"` (someone else was mentioned or replied to) or `addressed="none"` (open chatter). The agent is instructed to read those for context but stay silent unless it can correct a clear factual error or something urgent needs attention. Pair this mode with `DISCORD_CHANNEL_IDS` so the bot only listens where it's wanted.
+
 ## What the agent can do
 
 - **`send_message`** — post to a channel (used to reply; content over Discord's 2000-character limit is split automatically, and it can attach the reply to a specific message).

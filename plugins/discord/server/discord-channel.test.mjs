@@ -837,6 +837,121 @@ async function main() {
     'read_attachment refuses non-CDN hosts',
   )
 
+  console.log('addressed-awareness (mention requirement off)')
+  const clientsBefore = gateway.clients.length
+  const child3 = spawn(process.execPath, [BRIDGE], {
+    env: {
+      ...process.env,
+      DISCORD_BOT_TOKEN: TOKEN,
+      DISCORD_GATEWAY_URL: `ws://127.0.0.1:${gateway.port}/`,
+      DISCORD_API_BASE: `http://127.0.0.1:${rest.port}/api/v10`,
+      DISCORD_ALLOWED_USER_IDS: '42',
+      DISCORD_REQUIRE_MENTION: 'false',
+      DISCORD_MENTION_WINDOW_SECONDS: '0',
+    },
+    stdio: ['pipe', 'pipe', 'ignore'],
+  })
+  const fromChild3 = []
+  const child3Waiters = []
+  let out3 = ''
+  child3.stdout.on('data', (data) => {
+    out3 += data
+    let nl
+    while ((nl = out3.indexOf('\n')) !== -1) {
+      const line = out3.slice(0, nl)
+      out3 = out3.slice(nl + 1)
+      if (!line.trim()) continue
+      const msg = JSON.parse(line)
+      fromChild3.push(msg)
+      for (const [i, w] of child3Waiters.entries()) {
+        if (w.predicate(msg)) {
+          child3Waiters.splice(i, 1)
+          w.resolve(msg)
+          break
+        }
+      }
+    }
+  })
+  function expectChild3(predicate, label, timeoutMs = 3000) {
+    const already = fromChild3.find(predicate)
+    if (already) return Promise.resolve(already)
+    return new Promise((res, rej) => {
+      const timer = setTimeout(
+        () => rej(new Error(`timed out waiting for child3: ${label}`)),
+        timeoutMs,
+      )
+      child3Waiters.push({
+        predicate,
+        resolve: (m) => {
+          clearTimeout(timer)
+          res(m)
+        },
+      })
+    })
+  }
+  child3.stdin.write(
+    JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't3', version: '0' } },
+    }) + '\n',
+  )
+  await expectChild3((m) => m.id === 1, 'initialize response')
+  {
+    const deadline = Date.now() + 3000
+    while (gateway.clients.length <= clientsBefore) {
+      if (Date.now() > deadline) throw new Error('timed out waiting for child3 gateway connection')
+      await new Promise((r) => setTimeout(r, 50))
+    }
+  }
+  const gw3 = gateway.clients[gateway.clients.length - 1]
+  gw3.send({ op: 10, d: { heartbeat_interval: 5000 } })
+  await new Promise((r) => setTimeout(r, 150)) // let child3's IDENTIFY flow
+  gw3.send({
+    op: 0,
+    s: 1,
+    t: 'READY',
+    d: { session_id: 'sess-3', resume_gateway_url: '', user: { id: 'BOT', username: 'grok' } },
+  })
+  // Open chatter (no mentions): forwarded with addressed="none".
+  gw3.send({
+    op: 0,
+    s: 2,
+    t: 'MESSAGE_CREATE',
+    d: { id: 'a1', guild_id: 'g1', channel_id: 'c1', content: 'thinking out loud', author: { id: '42', username: 'karl' }, mentions: [] },
+  })
+  const chatter = await expectChild3(
+    (m) => m.method === 'notifications/grok/channel' && m.params.meta.message_id === 'a1',
+    'chatter forwarded',
+  )
+  check(chatter.params.meta.addressed === 'none', 'open chatter carries addressed="none"')
+  // Message @ someone else: addressed="other".
+  gw3.send({
+    op: 0,
+    s: 3,
+    t: 'MESSAGE_CREATE',
+    d: { id: 'a2', guild_id: 'g1', channel_id: 'c1', content: '<@555> can you check this?', author: { id: '42', username: 'karl' }, mentions: [{ id: '555' }] },
+  })
+  const toOther = await expectChild3(
+    (m) => m.method === 'notifications/grok/channel' && m.params.meta.message_id === 'a2',
+    'other-addressed forwarded',
+  )
+  check(toOther.params.meta.addressed === 'other', 'message @ someone else carries addressed="other"')
+  // Message @ the bot: no addressed attribute (directed at you).
+  gw3.send({
+    op: 0,
+    s: 4,
+    t: 'MESSAGE_CREATE',
+    d: { id: 'a3', guild_id: 'g1', channel_id: 'c1', content: '<@BOT> and you?', author: { id: '42', username: 'karl' }, mentions: [{ id: 'BOT' }] },
+  })
+  const toYou = await expectChild3(
+    (m) => m.method === 'notifications/grok/channel' && m.params.meta.message_id === 'a3',
+    'bot-addressed forwarded',
+  )
+  check(toYou.params.meta.addressed === undefined, 'bot-directed message has no addressed attribute')
+  child3.kill('SIGKILL')
+
   console.log('teardown')
   child.stdin.end()
   const exited = await new Promise((resolve) => {
