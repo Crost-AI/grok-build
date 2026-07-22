@@ -16,7 +16,7 @@ use crate::terminal::AsyncTerminalRunner;
 use crate::tools::ToolContext;
 use crate::upload::trace::{
     GCS_SCHEMA_VERSION, PromptMetadata, SubagentSpawnedRef, TurnResultMetadata,
-    local_sandbox_telemetry, upload_config, upload_metadata, upload_session_state,
+    local_sandbox_telemetry, upload_metadata, upload_session_state,
     upload_subagent_metadata, upload_turn_result,
 };
 use crate::upload::turn::{PromptTraceContext, complete_prompt_trace};
@@ -37,6 +37,9 @@ impl SubagentCoordinator {
     /// - `None` — ID not found in active, completed, or pending maps.
     pub(crate) fn lookup(&self, id: &str) -> Option<SnapshotLookup> {
         if let Some(tracker) = self.active.get(id) {
+            if tracker.owner.is_workflow() {
+                return None;
+            }
             return Some(
                 SnapshotLookup::NeedsSignals(RunningSnapshotSeed {
                     subagent_id: tracker.subagent_id.clone(),
@@ -50,13 +53,25 @@ impl SubagentCoordinator {
             );
         }
         if let Some(completed) = self.completed.get(id) {
+            if completed.owner.is_workflow() {
+                return None;
+            }
             let status = if completed.result.cancelled {
                 SubagentSnapshotStatus::Cancelled {
                     reason: completed.result.error.clone(),
                 }
             } else if completed.result.success {
+                let output = match &completed.persisted_output_dir {
+                    Some(dir) => {
+                        read_subagent_output(dir)
+                            .unwrap_or_else(|| {
+                                OUTPUT_UNAVAILABLE_PLACEHOLDER.to_string()
+                            })
+                    }
+                    None => completed.result.output.to_string(),
+                };
                 SubagentSnapshotStatus::Completed {
-                    output: completed.result.output.to_string(),
+                    output,
                     tool_calls: completed.result.tool_calls,
                     turns: completed.result.turns,
                     worktree_path: completed.result.worktree_path.clone(),
@@ -83,6 +98,9 @@ impl SubagentCoordinator {
             );
         }
         if let Some(pending) = self.pending.get(id) {
+            if pending.owner.is_workflow() {
+                return None;
+            }
             return Some(
                 SnapshotLookup::Ready(SubagentSnapshot {
                     subagent_id: pending.subagent_id.clone(),
@@ -96,6 +114,19 @@ impl SubagentCoordinator {
             );
         }
         None
+    }
+    /// Parent session of the running subagent whose child session is
+    /// `child_session_id`. Used to re-parent spawn requests that originate
+    /// inside a child session (e.g. a loop iteration spawning its own
+    /// subagent) to the root session that owns it.
+    pub(crate) fn parent_of_child_session(
+        &self,
+        child_session_id: &str,
+    ) -> Option<String> {
+        self.active
+            .values()
+            .find(|t| t.child_session_id.0.as_ref() == child_session_id)
+            .map(|t| t.parent_session_id.clone())
     }
     /// Return `(parent_session_id, child_session_id)` for a given subagent.
     ///
@@ -209,7 +240,7 @@ impl SubagentCoordinator {
     /// to a different parent session (prevents cross-session context bleed).
     ///
     /// Fast path: checks the in-memory `completed` map first. When that
-    /// misses (e.g. after TTL eviction), falls back to on-disk metadata
+    /// misses (e.g. after cap eviction), falls back to on-disk metadata
     /// in `{parent_session_dir}/subagents/{id}/meta.json`.
     pub(crate) fn resumable_source_for(
         &self,
@@ -269,6 +300,27 @@ impl SubagentCoordinator {
     pub(crate) fn is_active_or_pending(&self, id: &str) -> bool {
         self.active.contains_key(id) || self.pending.contains_key(id)
     }
+    pub(crate) fn record_loop_owner(&mut self, subagent_id: &str, task_id: &str) {
+        self.loop_owned.insert(subagent_id.to_string(), task_id.to_string());
+    }
+    pub(crate) fn remove_loop_owner(&mut self, subagent_id: &str) {
+        self.loop_owned.remove(subagent_id);
+    }
+    pub(crate) fn loop_task_id_of_child_session(
+        &self,
+        child_session_id: &str,
+    ) -> Option<String> {
+        let subagent_id = self
+            .active
+            .values()
+            .find(|t| t.child_session_id.0.as_ref() == child_session_id)?
+            .subagent_id
+            .clone();
+        self.loop_owned.get(&subagent_id).cloned()
+    }
+    pub(crate) fn loop_unit_active(&self, task_id: &str) -> bool {
+        self.loop_owned.values().any(|t| t == task_id)
+    }
     /// The terminal `SubagentFinished` for an id the coordinator already holds in
     /// `completed`, else `None`. Lets orphan reconcile re-emit a subagent's real
     /// outcome when only its terminal meta write was lost (reconnect race: entry
@@ -293,14 +345,28 @@ impl SubagentCoordinator {
             will_wake: false,
         })
     }
-    /// TTL cleanup: remove completed entries older than 30 minutes.
-    pub fn evict_stale_completed(&mut self) {
-        let cutoff = std::time::Duration::from_secs(30 * 60);
-        self.completed.retain(|_, entry| entry.completed_at.elapsed() < cutoff);
+    /// Lifecycle-map entry counts as `(pending, active, completed)`.
+    pub(crate) fn registry_snapshot(&self) -> (usize, usize, usize) {
+        (self.pending.len(), self.active.len(), self.completed.len())
+    }
+    /// Oldest completions are evicted first; their `output.json` stays on disk.
+    pub fn enforce_completed_cap(&mut self) {
+        if self.completed.len() <= MAX_COMPLETED_ENTRIES {
+            return;
+        }
+        let excess = self.completed.len() - MAX_COMPLETED_ENTRIES;
+        let mut by_age: Vec<(std::time::Instant, String)> = self
+            .completed
+            .iter()
+            .map(|(id, e)| (e.completed_at, id.clone()))
+            .collect();
+        by_age.sort_unstable_by_key(|(completed_at, _)| *completed_at);
+        for (_, id) in by_age.into_iter().take(excess) {
+            self.completed.remove(&id);
+        }
     }
     /// Snapshot all currently-running subagents for compaction state context.
     ///
-    /// Returns one `ActiveSubagentSummary` per entry in the `active` map.
     /// Completed/failed/cancelled subagents are NOT included — they live in
     /// the `completed` map and are irrelevant for post-compaction reminders
     /// (the model already saw their tool results before compaction).
@@ -310,7 +376,11 @@ impl SubagentCoordinator {
     /// compaction since it happens once and the reminder is static.
     #[cfg(test)]
     pub fn active_summaries(&self) -> Vec<ActiveSubagentSummary> {
-        self.active.values().map(tracker_to_summary).collect()
+        self.active
+            .values()
+            .filter(|t| !t.owner.is_workflow())
+            .map(tracker_to_summary)
+            .collect()
     }
     pub fn active_summaries_for(
         &self,
@@ -318,11 +388,12 @@ impl SubagentCoordinator {
     ) -> Vec<ActiveSubagentSummary> {
         self.active
             .values()
-            .filter(|t| t.parent_session_id == parent_session_id)
+            .filter(|t| {
+                t.parent_session_id == parent_session_id && !t.owner.is_workflow()
+            })
             .map(tracker_to_summary)
             .collect()
     }
-    /// Return seeds for all running subagents belonging to `parent_session_id`.
     ///
     /// Each seed carries copied identity metadata plus a cloned
     /// `SessionSignalsHandle` so the caller can resolve live progress
@@ -338,7 +409,9 @@ impl SubagentCoordinator {
     ) -> Vec<RunningSubagentListSeed> {
         self.active
             .values()
-            .filter(|t| t.parent_session_id == parent_session_id)
+            .filter(|t| {
+                t.parent_session_id == parent_session_id && !t.owner.is_workflow()
+            })
             .map(|t| RunningSubagentListSeed {
                 subagent_id: t.subagent_id.clone(),
                 parent_session_id: t.parent_session_id.clone(),

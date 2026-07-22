@@ -57,7 +57,13 @@ impl AgentView {
                     return InputOutcome::Changed;
                 }
                 if self.hit_goal_status.contains(mouse.column, mouse.row) {
-                    if self.goal_state.is_some() {
+                    if !self.workflow_runs.is_empty() {
+                        self.show_workflows = !self.show_workflows;
+                        if self.show_workflows {
+                            self.workflows_view.reset();
+                            self.show_goal_detail = false;
+                        }
+                    } else if self.goal_state.is_some() {
                         self.show_goal_detail = !self.show_goal_detail;
                     }
                     return InputOutcome::Changed;
@@ -337,6 +343,19 @@ impl AgentView {
                     self.apply_scrollbar_click(mouse.row);
                     return InputOutcome::Changed;
                 }
+                if let Some(rail) = self.timeline_rail.as_ref()
+                    && rail.rect.contains((mouse.column, mouse.row).into())
+                {
+                    let target = rail
+                        .hit(mouse.column, mouse.row)
+                        .and_then(|hit| crate::views::timeline::chevron_target(rail, hit));
+                    if let Some(turn_idx) = target {
+                        self.set_active_pane(AgentPane::Scrollback, false);
+                        self.scrollback.jump_to_turn(turn_idx);
+                        return InputOutcome::Changed;
+                    }
+                    return InputOutcome::Unchanged;
+                }
                 if self.hit_sb_copy.contains(mouse.column, mouse.row) {
                     return InputOutcome::Action(Action::CopyBlockContent);
                 }
@@ -357,7 +376,7 @@ impl AgentView {
                         && let Some(link) = self.visible_link_map.link_at(mouse.column, mouse.row)
                     {
                         self.pending_link_click = app_should_open_link_on_click(link)
-                            .then(|| (mouse.column, mouse.row, link.url.to_string()));
+                            .then(|| (mouse.column, mouse.row, link.target.clone()));
                         self.pending_scrollback_click = None;
                         return InputOutcome::Changed;
                     }
@@ -412,11 +431,9 @@ impl AgentView {
                         }
                         if let Some(id) = self.queue.send_now_click(mouse.column, mouse.row)
                             && self.session.state.is_turn_running()
+                            && let InputOutcome::Action(action) = self.force_interject_queue_row(id)
                         {
-                            if let InputOutcome::Action(action) = self.force_interject_queue_row(id)
-                            {
-                                return InputOutcome::Action(action);
-                            }
+                            return InputOutcome::Action(action);
                         }
                         self.set_active_pane(AgentPane::Queue, false);
                         self.queue.handle_mouse(
@@ -481,6 +498,13 @@ impl AgentView {
                                             tid.clone(),
                                         ));
                                     }
+                                    TaskEntryId::Workflow(name) => {
+                                        return InputOutcome::Action(
+                                            Action::SendSlashCommandPreservingDraft(format!(
+                                                "/workflow stop {name}"
+                                            )),
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -530,7 +554,26 @@ impl AgentView {
                                             return InputOutcome::Changed;
                                         }
                                     }
-                                    TaskEntryId::Scheduled(_) => {}
+                                    TaskEntryId::Scheduled(tid) => {
+                                        if let Some(sid) = self
+                                            .session
+                                            .scheduled_tasks
+                                            .get(tid)
+                                            .and_then(|info| info.last_subagent_id.clone())
+                                            && let Some(child_sid) = self
+                                                .subagent_sessions
+                                                .iter()
+                                                .find(|(_, info)| {
+                                                    info.subagent_id.as_ref() == sid.as_str()
+                                                })
+                                                .map(|(k, _)| k.clone())
+                                            && self.subagent_views.contains_key(&child_sid)
+                                        {
+                                            self.open_subagent_fullscreen(child_sid);
+                                            return InputOutcome::Changed;
+                                        }
+                                    }
+                                    TaskEntryId::Workflow(_) => {}
                                 }
                             }
                         }
@@ -575,6 +618,16 @@ impl AgentView {
                                 self.last_bg_click = None;
                                 return InputOutcome::Changed;
                             }
+                            if let Some(crate::views::tasks_pane::TaskEntry::Workflow {
+                                name,
+                                ..
+                            }) = self.tasks.selected_entry()
+                            {
+                                let name = name.clone();
+                                self.open_workflow_detail(&name);
+                                self.last_bg_click = None;
+                                return InputOutcome::Changed;
+                            }
                         }
                         self.last_bg_click = Some(now);
                         InputOutcome::Changed
@@ -605,7 +658,7 @@ impl AgentView {
                                 self.visible_link_map.link_at(mouse.column, mouse.row)
                         {
                             self.pending_link_click = app_should_open_link_on_click(link)
-                                .then(|| (mouse.column, mouse.row, link.url.to_string()));
+                                .then(|| (mouse.column, mouse.row, link.target.clone()));
                             self.pending_scrollback_click = None;
                             return InputOutcome::Changed;
                         }
@@ -684,11 +737,11 @@ impl AgentView {
                 }
                 let had_pending_text_drag = self.pending_text_drag.take().is_some();
                 let _had_pending_block_drag = self.pending_block_drag.take().is_some();
-                if let Some((lc, lr, url)) = self.pending_link_click.take()
+                if let Some((lc, lr, target)) = self.pending_link_click.take()
                     && mouse.column == lc
                     && mouse.row == lr
                 {
-                    return InputOutcome::Action(Action::OpenUrl(url));
+                    return InputOutcome::Action(Action::OpenLink(target));
                 }
                 if self.active_pane == AgentPane::Scrollback {
                     if let Some((click_col, click_row)) = self.pending_scrollback_click.take() {
@@ -780,10 +833,7 @@ impl AgentView {
                                         surface: xai_grok_telemetry::events::CreditLimitUpsellSurface::InlineCard,
                                         choice,
                                     });
-                                    crate::app::link_opener::open_url_if_safe(
-                                        &url,
-                                        crate::terminal::hyperlinks::SchemeFilter::Standard,
-                                    );
+                                    self.open_url_or_show(&url);
                                     self.last_click = None;
                                     return InputOutcome::Changed;
                                 }
@@ -882,7 +932,15 @@ impl AgentView {
                     || self.block_drag_selection.is_some()
                     || self.deferred_text_press.is_some();
                 let hit = self.pane_areas.hit_test(mouse.column, mouse.row);
-                let new_hover = if suppress_scrollback_hover {
+                let on_rail = self
+                    .timeline_rail
+                    .as_ref()
+                    .is_some_and(|r| r.rect.contains((mouse.column, mouse.row).into()));
+                let new_timeline_hover = self
+                    .timeline_rail
+                    .as_ref()
+                    .and_then(|r| r.hit(mouse.column, mouse.row));
+                let new_hover = if on_rail || suppress_scrollback_hover {
                     None
                 } else {
                     hit.and_then(|pane| match pane {
@@ -926,6 +984,11 @@ impl AgentView {
                 }
                 self.hovered_entry = new_hover;
                 self.hovered_prompt = new_prompt_hover;
+                if new_timeline_hover != self.timeline_hover {
+                    self.timeline_hover = new_timeline_hover;
+                    self.sync_timeline_hover_preview();
+                    changed = true;
+                }
                 changed |= self
                     .set_hovered_follow_up_chip(self.follow_up_chip_at(mouse.column, mouse.row));
                 changed |= self.hit_badge.update_hover(mouse.column, mouse.row);

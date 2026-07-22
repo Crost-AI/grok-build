@@ -20,7 +20,7 @@ const SLEEP_SECS: &str = "600";
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "PTY e2e; run with cargo test -p xai-grok-pager --test pty_e2e -- --ignored"]
+#[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn background_task_reaped_on_quit() {
     let content = ContentController::start().await.expect("start content");
     let pidfile = content.home().join("orphan_bg.pid");
@@ -42,21 +42,7 @@ async fn background_task_reaped_on_quit() {
         "is_background": true
     })
     .to_string();
-    content.enqueue_response(
-        "/v1/responses",
-        ScriptedResponse::sse(responses_api_tool_call_events(
-            "call_bg",
-            "run_terminal_command",
-            &args,
-        )),
-    );
-    content.enqueue_response(
-        "/v1/chat/completions",
-        ScriptedResponse::sse(chat_completions_tool_call_events(
-            "run_terminal_command",
-            &args,
-        )),
-    );
+    let _background_turn = expect_tool_turn(&content, "call_bg", "run_terminal_command", args);
     // Follow-up turns settle to plain text so the session goes idle.
     content.set_response("BG_TASK_STARTED");
 

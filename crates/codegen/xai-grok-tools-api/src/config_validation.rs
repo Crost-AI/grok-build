@@ -171,7 +171,8 @@ mod tests {
         let err = parse_params_json(0, "t", Some("{not json")).unwrap_err();
         assert!(matches!(
             err.kind,
-            ToolConfigEntryErrorKind::ParamsJsonParse { raw, .. } if raw == "{not json"
+            ToolConfigEntryErrorKind::ParamsJsonParse { raw, .. }
+if raw == "{not json"
         ));
     }
 
@@ -207,7 +208,8 @@ mod tests {
             assert!(
                 matches!(
                     &err.kind,
-                    ToolConfigEntryErrorKind::NameOverrideInvalid { name: n, .. } if n == name
+                    ToolConfigEntryErrorKind::NameOverrideInvalid { name: n, .. }
+if n == name
                 ),
                 "name={name:?} kind={:?}",
                 err.kind

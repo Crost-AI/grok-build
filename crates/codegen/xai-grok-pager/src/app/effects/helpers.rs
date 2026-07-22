@@ -7,9 +7,10 @@ use super::actions::{PermissionModePersist, SubagentKillOutcome, TaskResult};
 use super::agent::AgentId;
 use crate::unified_log as ulog;
 use xai_grok_shell::sampling::error::{
-    RATE_LIMITED_ERROR_CODE, rate_limited_user_message,
+    RATE_LIMITED_ERROR_CODE, error_detail_from_data, format_rate_limited_user_message,
 };
 use xai_grok_shell::session::ExtMethodResult;
+use xai_grok_shell::session::unified_list::ListScope;
 /// Typed progress message for session restore.
 /// Keeps the progress channel from accepting arbitrary `TaskResult` variants.
 pub(crate) struct RestoreProgressMsg {
@@ -81,18 +82,19 @@ pub(super) async fn fetch_plugin_cta_mcps(
     }
 }
 /// Convert an ACP error to a user-friendly string for display.
-/// Rate-limit errors get auth-aware copy instead of the raw server error.
+/// Rate-limit errors: free-usage paywall, else server detail (with API-key
+/// rewrite when the body pushes personal SuperGrok), else auth-aware fallback
+/// (see [`format_rate_limited_user_message`]).
 /// All other errors are sanitized to remove internal service names and jargon.
 pub(super) fn format_acp_error(err: &acp::Error, is_api_key_auth: bool) -> String {
     if i32::from(err.code) == RATE_LIMITED_ERROR_CODE {
-        if super::dispatch::acp_error_is_free_usage_exhausted(err) {
-            return super::dispatch::FREE_USAGE_USER_MESSAGE.into();
-        }
-        return rate_limited_user_message(is_api_key_auth).into();
+        let detail = err.data.as_ref().and_then(error_detail_from_data);
+        return sanitize_user_error(
+            &format_rate_limited_user_message(detail.as_deref(), is_api_key_auth),
+        );
     }
     if err.code == acp::ErrorCode::InvalidParams && let Some(data) = &err.data
-        && let Some(msg) = xai_grok_shell::sampling::error::error_detail_from_data(data)
-        && !msg.is_empty()
+        && let Some(msg) = error_detail_from_data(data) && !msg.is_empty()
     {
         return msg;
     }
@@ -339,6 +341,9 @@ pub(crate) struct EffectMeta {
     /// install this into `AppView.auth_state` if the current auth state
     /// still matches the sequence.
     pub auth_abort_handle: Option<(u64, tokio::task::AbortHandle)>,
+    /// Auth URL poll abort handle + request sequence (installed on
+    /// `AppView.auth_url_poll_handle` when the seq still matches).
+    pub auth_url_poll_handle: Option<(u64, tokio::task::AbortHandle)>,
 }
 /// Extract the first user prompt text from a session's `chat_history.jsonl`.
 ///
@@ -441,6 +446,18 @@ pub(super) fn parse_session_list_partial(
             _ => ConversationsPartial::Error,
         },
     )
+}
+/// Reads `_meta["x.ai/listScope"]` from a session-list payload.
+pub(super) fn parse_session_list_scope(payload: &serde_json::Value) -> ListScope {
+    match payload
+        .get("_meta")
+        .and_then(|m| m.get("x.ai/listScope"))
+        .and_then(|v| v.as_str())
+    {
+        Some("repo") => ListScope::Repo,
+        Some("all") => ListScope::All,
+        _ => ListScope::Cwd,
+    }
 }
 /// Parse the `x.ai/session/list` response payload (the unwrapped
 /// `{ "sessions": [...] }` object) into [`SessionPickerEntry`] rows.
@@ -639,6 +656,23 @@ pub(super) async fn send_logout(tx: &AcpAgentTx) {
         tracing::warn!(error = % e, "logout failed");
     }
 }
+/// Best-effort `x.ai/auth/cancel`: stops the shell's device/loopback wait so a
+/// later login is single-flight. Errors are ignored — UI already left
+/// `Authenticating`. `request_seq` scopes the cancel to the abandoned attempt.
+pub(super) async fn send_auth_cancel(tx: &AcpAgentTx, request_seq: u64) -> TaskResult {
+    let req = acp::ExtRequest::new(
+        "x.ai/auth/cancel",
+        serde_json::value::to_raw_value(
+                &serde_json::json!({ "request_seq" : request_seq }),
+            )
+            .expect("serialize auth/cancel params")
+            .into(),
+    );
+    if let Err(e) = acp_send(req, tx).await {
+        tracing::debug!(error = % e, "auth cancel ext request failed (ignored)");
+    }
+    TaskResult::AuthCancelComplete
+}
 pub(super) async fn send_check_subscription(
     tx: &AcpAgentTx,
     verify: Option<u64>,
@@ -713,7 +747,9 @@ pub(super) async fn send_authenticate(
     use_oauth: bool,
     force_interactive: bool,
 ) -> TaskResult {
-    let mut meta = serde_json::json!({ "use_oauth" : use_oauth });
+    let mut meta = serde_json::json!(
+        { "use_oauth" : use_oauth, "request_seq" : request_seq, }
+    );
     if force_interactive {
         meta["force_interactive"] = serde_json::json!(true);
     }
@@ -766,6 +802,30 @@ pub(crate) async fn persist_setting(
                 return Err(kind_mismatch("show_timestamps", "Bool", &value));
             };
             xai_grok_shell::util::config::set_show_timestamps(b)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        "page_flip_on_send" => {
+            let SettingValue::Bool(b) = value else {
+                return Err(kind_mismatch("page_flip_on_send", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_page_flip_on_send(b)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        "combine_queued_prompts" => {
+            let SettingValue::Bool(b) = value else {
+                return Err(kind_mismatch("combine_queued_prompts", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_combine_queued_prompts(b)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        "show_timeline" => {
+            let SettingValue::Bool(b) = value else {
+                return Err(kind_mismatch("show_timeline", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_show_timeline(b)
                 .await
                 .map_err(|e| e.to_string())
         }
@@ -828,6 +888,14 @@ pub(crate) async fn persist_setting(
                 );
             };
             xai_grok_shell::util::config::set_contextual_hint_word_select(b)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        "contextual_hints.ssh_wrap" => {
+            let SettingValue::Bool(b) = value else {
+                return Err(kind_mismatch("contextual_hints.ssh_wrap", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_contextual_hint_ssh_wrap(b)
                 .await
                 .map_err(|e| e.to_string())
         }
@@ -1019,6 +1087,14 @@ pub(crate) async fn persist_setting(
                 return Err(kind_mismatch("hunk_tracker_mode", "Enum", &value));
             };
             xai_grok_shell::util::config::set_hunk_tracker_mode(s.to_string())
+                .await
+                .map_err(|e| e.to_string())
+        }
+        "screen_mode" => {
+            let SettingValue::Enum(s) = value else {
+                return Err(kind_mismatch("screen_mode", "Enum", &value));
+            };
+            xai_grok_shell::util::config::set_screen_mode(s.to_string())
                 .await
                 .map_err(|e| e.to_string())
         }

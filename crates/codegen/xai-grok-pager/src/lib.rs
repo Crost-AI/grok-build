@@ -11,6 +11,7 @@ mod config_toml_edit;
 pub mod diagnostics;
 pub mod diff;
 pub mod docs;
+pub mod doctor_cmd;
 pub mod export_cmd;
 pub mod git_info;
 pub mod headless;
@@ -53,6 +54,8 @@ pub mod startup;
 pub mod tips;
 pub mod wrap_clipboard_image;
 pub mod wrap_cmd;
+pub(crate) mod wrap_filter;
+pub(crate) mod wrap_restore;
 
 pub mod tool_usage;
 

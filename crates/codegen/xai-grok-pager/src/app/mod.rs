@@ -27,7 +27,14 @@ mod dispatch;
 /// Display-refresh probe + motion cadence + terminal telemetry at startup.
 mod display_refresh_startup;
 mod effects;
+pub mod roster;
+pub mod session_startup;
+pub mod status_blocks;
+pub mod subagent;
+pub mod subscription;
+pub(crate) use effects::sanitize_user_error;
 mod event_loop;
+pub(crate) mod external_editor;
 mod foreign_sessions;
 mod inline_edit;
 #[cfg(all(test, unix))]
@@ -35,19 +42,14 @@ mod leader_cluster;
 mod modals;
 mod mouse;
 mod queue_edit;
-pub mod roster;
 pub(crate) mod screen_mode_relaunch;
-pub mod session_startup;
-mod signal_handler;
-pub mod status_blocks;
-pub mod subagent;
-pub mod subscription;
+pub mod signal_handler;
 mod turn_completion;
 mod xt_filter;
 pub(crate) use crate::terminal::kitty_flags_pushed;
 pub use cli::{
-    AgentArgs, AgentCmd, Command, HeadlessArgs, LeaderArgs, LeaderTargetArgs, OutputFormat,
-    PagerArgs, ServeArgs, WrapArgs,
+    AgentArgs, AgentCmd, Command, HeadlessArgs, LeaderArgs, LeaderMgmtArgs, LeaderMgmtCommand,
+    LeaderTargetArgs, OutputFormat, PagerArgs, ServeArgs, WrapArgs,
 };
 pub use cli::{WorkspaceMgmtArgs, WorkspaceMgmtCommand, WorkspaceStartArgs};
 use crossterm::cursor::{self, SetCursorStyle};
@@ -56,7 +58,6 @@ use crossterm::execute;
 use crossterm::terminal::{
     self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
 };
-pub(crate) use dispatch::{FREE_USAGE_USER_MESSAGE, acp_error_is_free_usage_exhausted};
 pub use foreign_sessions::ForeignScanCoordinator;
 pub(crate) use foreign_sessions::{
     badge_for_picker_source, foreign_tool_display_label, is_foreign_picker_source,
@@ -107,6 +108,15 @@ static MINIMAL_AUTO_SET_FOR_MOUSE_LEAK: AtomicBool = AtomicBool::new(false);
 pub fn minimal_auto_set_for_mouse_leak() -> bool {
     MINIMAL_AUTO_SET_FOR_MOUSE_LEAK.load(Ordering::Acquire)
 }
+/// Set after a `/minimal` re-exec that actually stayed minimal (idle-status cue).
+static MINIMAL_SHOW_SWITCH_BACK_TO_FULLSCREEN: AtomicBool = AtomicBool::new(false);
+pub fn minimal_show_switch_back_to_fullscreen() -> bool {
+    MINIMAL_SHOW_SWITCH_BACK_TO_FULLSCREEN.load(Ordering::Acquire)
+}
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_minimal_show_switch_back_to_fullscreen_for_test(on: bool) {
+    MINIMAL_SHOW_SWITCH_BACK_TO_FULLSCREEN.store(on, Ordering::Release);
+}
 /// Whether startup actually applied a forced cursor style. Teardown (and the
 /// panic hook, which can't thread parameters) resets the style only when
 /// true: under inherit, `0 q` would clobber a shell-chosen style.
@@ -145,56 +155,90 @@ pub(crate) static MOUSE_REPORTING_TOGGLE_ENABLED: AtomicBool = AtomicBool::new(f
 pub(crate) fn mouse_reporting_toggle_enabled() -> bool {
     MOUSE_REPORTING_TOGGLE_ENABLED.load(Ordering::Acquire)
 }
-/// Whether voice mode is available (GA default on; remote/`GROK_VOICE_MODE` can
-/// kill or force). Mirrored from
-/// [`crate::app::app_view::AppView::apply_voice_mode_enabled`] so view-layer
-/// code that has no `AppView` handle — the shortcuts cheatsheet — can hide
-/// voice UI when the kill switch is active. Kept in sync on every gate change
-/// (startup + remote settings updates).
-///
-/// Only `apply_voice_mode_enabled` writes it, so tests that gate UI on voice
-/// must drive the flag through that method — setting `AppView::voice_mode_enabled`
-/// directly leaves this stale.
+/// Process-global voice gate for view code without an `AppView`.
+/// Written only by [`crate::app::app_view::AppView::apply_voice_mode_enabled`].
 pub(crate) static VOICE_MODE_ENABLED: AtomicBool = AtomicBool::new(false);
-/// Read the cached voice-mode gate (see [`VOICE_MODE_ENABLED`]).
 pub(crate) fn voice_mode_enabled() -> bool {
     VOICE_MODE_ENABLED.load(Ordering::Acquire)
 }
-/// Resolve whether voice mode is enabled from layered sources.
+/// Test helper for the process-global voice gate.
+pub fn set_voice_mode_enabled_for_test(on: bool) {
+    VOICE_MODE_ENABLED.store(on, Ordering::Release);
+}
+/// `[features] voice_mode` from merged `requirements.toml`.
+pub(crate) fn voice_mode_requirement_pin() -> Option<bool> {
+    xai_grok_config::load_merged_requirements().and_then(|req| {
+        req.get("features")
+            .and_then(|f| f.get("voice_mode"))
+            .and_then(|v| v.as_bool())
+    })
+}
+/// `[features] voice_mode` from effective config (user + managed).
+pub(crate) fn voice_mode_config_value() -> Option<bool> {
+    xai_grok_shell::config::load_effective_config()
+        .ok()
+        .and_then(|cfg| {
+            cfg.get("features")
+                .and_then(|f| f.get("voice_mode"))
+                .and_then(|v| v.as_bool())
+        })
+}
+/// Resolve voice availability.
 ///
-/// Precedence: `env` override (`GROK_VOICE_MODE`) > `remote` (`voice_mode_enabled`)
-/// > default **on**. Remote `Some(false)` is a kill switch; `None` means GA
-/// default (on). Free-tier SuperGrok upsell for `/voice` / Ctrl+Space is a
-/// separate gate (`is_voice_tier_restricted`).
-pub(crate) fn resolve_voice_mode_enabled(env: Option<bool>, remote: Option<bool>) -> bool {
-    env.or(remote).unwrap_or(true)
+/// Precedence: requirements > `GROK_VOICE_MODE` > config/managed
+/// `[features] voice_mode` > remote `voice_mode_enabled` > default on.
+///
+/// When `is_api_key` and the only off-source is remote, force on. Requirement /
+/// env / config `false` still wins.
+pub(crate) fn resolve_voice_mode_enabled(
+    requirement: Option<bool>,
+    config: Option<bool>,
+    remote: Option<bool>,
+    is_api_key: bool,
+) -> bool {
+    use xai_grok_shell::agent::config::{BoolFlag, ConfigSource};
+    let resolved = BoolFlag::env("GROK_VOICE_MODE")
+        .requirement(requirement)
+        .config(config)
+        .feature_flag(remote)
+        .default(true)
+        .resolve();
+    if resolved.value {
+        return true;
+    }
+    is_api_key && resolved.source == ConfigSource::Remote
+}
+/// Resolve from live policy + env + remote + API-key state.
+pub(crate) fn resolve_voice_mode_live(remote: Option<bool>, is_api_key: bool) -> bool {
+    resolve_voice_mode_enabled(
+        voice_mode_requirement_pin(),
+        voice_mode_config_value(),
+        remote,
+        is_api_key,
+    )
 }
 #[cfg(test)]
 mod voice_gate_tests {
     use super::resolve_voice_mode_enabled;
     #[test]
-    fn voice_defaults_on_when_env_and_remote_absent() {
-        assert!(resolve_voice_mode_enabled(None, None));
+    fn api_key_force_on_over_remote_kill_only() {
+        assert!(resolve_voice_mode_enabled(None, None, Some(false), true));
+        assert!(!resolve_voice_mode_enabled(None, None, Some(false), false));
     }
     #[test]
-    fn voice_remote_false_is_kill_switch() {
-        assert!(!resolve_voice_mode_enabled(None, Some(false)));
-    }
-    #[test]
-    fn voice_remote_true_enables() {
-        assert!(resolve_voice_mode_enabled(None, Some(true)));
-    }
-    #[test]
-    fn voice_env_overrides_remote_kill_switch() {
-        assert!(resolve_voice_mode_enabled(Some(true), Some(false)));
-    }
-    #[test]
-    fn voice_env_force_off_overrides_remote_true() {
-        assert!(!resolve_voice_mode_enabled(Some(false), Some(true)));
-    }
-    #[test]
-    fn voice_env_force_off_overrides_default_on() {
-        assert!(!resolve_voice_mode_enabled(Some(false), None));
+    fn policy_false_outranks_api_key_force_on() {
+        assert!(!resolve_voice_mode_enabled(
+            Some(false),
+            Some(true),
+            Some(true),
+            true
+        ));
+        assert!(!resolve_voice_mode_enabled(
+            None,
+            Some(false),
+            Some(false),
+            true
+        ));
     }
 }
 /// Sticky banner shown while mouse reporting is off, telling the user how to
@@ -303,6 +347,20 @@ fn finish_theme_after_probe(requested_minimal: bool, effective_mode: ScreenMode)
 pub(crate) struct ExitInfo {
     pub session_id: String,
     pub minimal: bool,
+    /// Glanceable session tail; `Some` exactly when it should print. The
+    /// presence policy lives at the sole construction site, `make_run_result`.
+    pub summary: Option<ExitSummary>,
+}
+/// Session tail printed above the resume command on fullscreen quits.
+///
+/// Invariant: every field is a pre-sanitized single line (built from the
+/// `views::session_title` helpers), so the printer only width-truncates.
+pub(crate) struct ExitSummary {
+    /// Display title (rename > generated > first prompt).
+    pub title: String,
+    pub last_prompt: Option<String>,
+    /// `None` when the newest prompt is still unanswered.
+    pub last_response: Option<String>,
 }
 /// Resolve leader mode → `(use_leader, policy_disable_reason)`.
 ///
@@ -605,24 +663,9 @@ pub async fn run(
         screen_mode.is_minimal() && explicit_minimal.is_none() && screen_mode_override.is_none(),
         Ordering::Release,
     );
-    if args.minimal || args.fullscreen {
-        let want = if args.minimal {
-            "minimal"
-        } else {
-            "fullscreen"
-        };
-        if config_screen_mode != Some(want) {
-            tokio::spawn(async move {
-                if let Err(e) =
-                    xai_grok_shell::util::config::set_screen_mode(want.to_string()).await
-                {
-                    tracing::warn!("failed to persist screen mode preference: {e}");
-                }
-            });
-        }
-    }
     let minimal = screen_mode.is_minimal();
     let relaunched_into_minimal = screen_mode_override == Some(ScreenMode::Minimal);
+    let relaunched_into_fullscreen = screen_mode_override == Some(ScreenMode::Fullscreen);
     tracing::info!(
         use_alt_screen = screen_mode.is_fullscreen(), minimal = screen_mode.is_minimal(),
         mouse_capture = ! screen_mode.is_minimal(), minimal_live_rows = config_watcher
@@ -634,7 +677,8 @@ pub async fn run(
     );
     engage_startup_theme(screen_mode);
     let minimal_live_rows = config_watcher.current().minimal_live_rows;
-    let (frame_tx, writer_sync, writer_thread) = crate::render::draw::spawn_writer_thread();
+    let (frame_tx, writer_sync, writer_event_rx, writer_thread) =
+        crate::render::draw::spawn_writer_thread();
     let cursor_blink = event_loop::load_initial_ui_config().cursor_blink;
     let (mut terminal, screen_mode) = init_terminal(
         screen_mode,
@@ -644,6 +688,10 @@ pub async fn run(
         writer_sync,
         cursor_blink,
     )?;
+    MINIMAL_SHOW_SWITCH_BACK_TO_FULLSCREEN.store(
+        relaunched_into_minimal && screen_mode.is_minimal(),
+        Ordering::Release,
+    );
     apply_screen_mode_globals(screen_mode);
     finish_theme_after_probe(minimal, screen_mode);
     if let Some(ref t) = session_title {
@@ -661,6 +709,7 @@ pub async fn run(
         is_control_mode,
         screen_mode,
         relaunched_into_minimal,
+        relaunched_into_fullscreen,
         initial_theme: crate::theme::cache::current_kind(),
     };
     let result = event_loop::run(
@@ -673,12 +722,29 @@ pub async fn run(
         term_state,
         materialized,
         bg_update_rx,
+        writer_event_rx,
     )
     .await;
     crate::unified_log::flush_blocking().await;
-    let _ = restore_terminal(terminal, writer_thread, screen_mode);
+    let restore_result = restore_terminal(terminal, writer_thread, screen_mode);
     cancel.cancel();
     xai_tty_utils::global_process_scope().kill_all();
+    if let Err(cleanup_error) = restore_result {
+        match &result {
+            Ok(_) => {
+                tracing::warn!(
+                    error = % cleanup_error,
+                    "terminal cleanup failed after successful event loop"
+                )
+            }
+            Err(run_error) => {
+                tracing::warn!(
+                    error = % cleanup_error, run_error = % run_error,
+                    "terminal cleanup also failed"
+                )
+            }
+        }
+    }
     match result {
         Ok(run_result) => {
             if run_result.quit_for_update {
@@ -700,22 +766,42 @@ pub async fn run(
                 return Ok(false);
             }
             if let Some(info) = run_result.exit_info {
-                print_exit_resume_hint(&info.session_id, info.minimal, &mut io::stderr());
+                let width = crossterm::terminal::size().map_or(80, |(cols, _)| cols as usize);
+                print_exit_resume_hint(&info, width, &mut io::stderr());
             }
             Ok(false)
         }
-        Err(e) => Err(e),
+        Err(run_error) => Err(run_error),
     }
 }
 /// Plain-quit "Resume this session with…" lines (after terminal restore).
+///
+/// A summary, when present — title, last prompt, last response, one line
+/// each, width-truncated — precedes the command so a glance at the pane
+/// shows which session lives there and where it left off.
 /// Best-effort: closed-pane EIO/BrokenPipe must not panic (`panic = "abort"`).
-fn print_exit_resume_hint(session_id: &str, minimal: bool, w: &mut impl Write) {
+fn print_exit_resume_hint(info: &ExitInfo, max_width: usize, w: &mut impl Write) {
+    use crate::render::line_utils::truncate_str;
     let _ = writeln!(w);
+    if let Some(summary) = &info.summary {
+        let _ = writeln!(w, "{}", truncate_str(&summary.title, max_width));
+        if let Some(prompt) = summary.last_prompt.as_deref() {
+            let _ = writeln!(w, "> {}", truncate_str(prompt, max_width.saturating_sub(2)));
+        }
+        if let Some(response) = summary.last_response.as_deref() {
+            let _ = writeln!(
+                w,
+                "  {}",
+                truncate_str(response, max_width.saturating_sub(2))
+            );
+        }
+        let _ = writeln!(w);
+    }
     let _ = writeln!(w, "Resume this session with:");
-    if minimal {
-        let _ = writeln!(w, "  grok --minimal --resume {session_id}");
+    if info.minimal {
+        let _ = writeln!(w, "  grok --minimal --resume {}", info.session_id);
     } else {
-        let _ = writeln!(w, "  grok --resume {session_id}");
+        let _ = writeln!(w, "  grok --resume {}", info.session_id);
     }
 }
 /// Screen-mode relaunch failure fallback (same quit tail as plain resume).
@@ -983,7 +1069,7 @@ fn init_terminal(
     mode: ScreenMode,
     minimal_live_rows: u16,
     clear_main_screen: bool,
-    frame_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    frame_tx: crate::render::draw::WriterSender,
     writer_sync: crate::render::draw::WriterSync,
     cursor_blink: Option<bool>,
 ) -> io::Result<(PagerTerminal, ScreenMode)> {
@@ -1081,8 +1167,10 @@ fn init_terminal(
         }
         crate::terminal::set_kitty_flags_pushed(use_keyboard_enhancement);
         if mode.is_fullscreen() {
-            let backend =
-                CrosstermBackend::new(crate::render::draw::TermWriter::new(frame_tx, writer_sync));
+            let backend = CrosstermBackend::new(
+                crate::render::draw::TermWriter::new(frame_tx, writer_sync)
+                    .map_err(io::Error::other)?,
+            );
             Ok((
                 xai_ratatui_inline::Terminal::new(backend)?,
                 ScreenMode::Fullscreen,
@@ -1094,10 +1182,10 @@ fn init_terminal(
             } else {
                 rows
             };
-            let probe_backend = CrosstermBackend::new(crate::render::draw::TermWriter::new(
-                frame_tx.clone(),
-                writer_sync.clone(),
-            ));
+            let probe_backend = CrosstermBackend::new(
+                crate::render::draw::TermWriter::new(frame_tx.clone(), writer_sync.clone())
+                    .map_err(io::Error::other)?,
+            );
             if let Ok(term) = xai_ratatui_inline::Terminal::with_options(
                 probe_backend,
                 ratatui::TerminalOptions {
@@ -1121,10 +1209,10 @@ fn init_terminal(
                     execute!(stderr, event::EnableMouseCapture)
                 })?;
                 MOUSE_CAPTURE_ENABLED.store(true, Ordering::Release);
-                let retry_backend = CrosstermBackend::new(crate::render::draw::TermWriter::new(
-                    frame_tx.clone(),
-                    writer_sync.clone(),
-                ));
+                let retry_backend = CrosstermBackend::new(
+                    crate::render::draw::TermWriter::new(frame_tx.clone(), writer_sync.clone())
+                        .map_err(io::Error::other)?,
+                );
                 if let Ok(term) = xai_ratatui_inline::Terminal::with_options(
                     retry_backend,
                     ratatui::TerminalOptions {
@@ -1143,8 +1231,10 @@ fn init_terminal(
                     cursor::MoveTo(0, 0),
                 )
             })?;
-            let backend =
-                CrosstermBackend::new(crate::render::draw::TermWriter::new(frame_tx, writer_sync));
+            let backend = CrosstermBackend::new(
+                crate::render::draw::TermWriter::new(frame_tx, writer_sync)
+                    .map_err(io::Error::other)?,
+            );
             let term = xai_ratatui_inline::Terminal::with_options(
                 backend,
                 ratatui::TerminalOptions {
@@ -1169,9 +1259,9 @@ fn init_terminal(
 fn drain_writer_thread_before_teardown(
     terminal: PagerTerminal,
     writer_thread: crate::render::draw::WriterThread,
-) {
+) -> io::Result<()> {
     drop(terminal);
-    writer_thread.join();
+    writer_thread.join()
 }
 /// Inline teardown escape sequences in the canonical order, shared by
 /// `restore_terminal` and `set_panic_hook` so the on-wire byte order is
@@ -1232,16 +1322,18 @@ fn emit_terminal_teardown_sequences(mode: ScreenMode, inline_cursor_row: Option<
     #[cfg(windows)]
     win_native_selection::restore_stdin_mode();
 }
-/// Consumes `terminal` and `writer_thread`: queues a final clear in
-/// fullscreen mode, drains the writer thread, then emits the inline
-/// teardown sequences. The drain ordering guarantees no late frame can
-/// land after `LeaveAlternateScreen`.
-fn restore_terminal(
+/// Consumes `terminal` and `writer_thread`: queues a final fullscreen clear,
+/// drains every accepted frame, then emits teardown sequences. Teardown still
+/// runs if draining fails, so terminal state is restored before returning that
+/// error. Draining first prevents a late frame after `LeaveAlternateScreen`.
+fn restore_terminal_with(
     mut terminal: PagerTerminal,
     writer_thread: crate::render::draw::WriterThread,
     mode: ScreenMode,
+    drain: impl FnOnce(PagerTerminal, crate::render::draw::WriterThread) -> io::Result<()>,
+    teardown: impl FnOnce(ScreenMode, Option<u16>),
 ) -> io::Result<()> {
-    if mode.is_fullscreen() {
+    if mode.is_fullscreen() && !writer_thread.writer_sync().failed() {
         let _ = terminal.clear();
         {
             use std::io::Write;
@@ -1249,14 +1341,27 @@ fn restore_terminal(
         }
     }
     let inline_cursor_row = (!mode.is_fullscreen()).then(|| terminal.viewport_area().bottom());
-    drain_writer_thread_before_teardown(terminal, writer_thread);
-    emit_terminal_teardown_sequences(mode, inline_cursor_row);
+    let drain_result = drain(terminal, writer_thread);
+    teardown(mode, inline_cursor_row);
     drain_pending_events_with_timeout(std::time::Duration::from_millis(10));
     let _ = terminal::disable_raw_mode();
     signal_handler::mark_restored();
     xai_crash_handler::disable_terminal_escape_restore();
     xai_tty_utils::restore_native_stderr();
-    Ok(())
+    drain_result
+}
+fn restore_terminal(
+    terminal: PagerTerminal,
+    writer_thread: crate::render::draw::WriterThread,
+    mode: ScreenMode,
+) -> io::Result<()> {
+    restore_terminal_with(
+        terminal,
+        writer_thread,
+        mode,
+        drain_writer_thread_before_teardown,
+        emit_terminal_teardown_sequences,
+    )
 }
 pub(crate) fn set_terminal_title(title: &str) {
     let full = terminal_title_string(title);
@@ -1293,6 +1398,39 @@ fn set_panic_hook(mode: ScreenMode) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn restore_runs_teardown_even_when_writer_failed() {
+        use ratatui::{TerminalOptions, Viewport};
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::render::draw::WriterPayload>();
+        let sync = crate::render::draw::WriterSync::new();
+        let backend = CrosstermBackend::new(
+            crate::render::draw::TermWriter::new(tx, sync).expect("single test writer"),
+        );
+        let terminal = xai_ratatui_inline::Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .expect("test terminal");
+        let (writer_tx, _writer_sync, _events, writer_thread) =
+            crate::render::draw::spawn_writer_thread();
+        drop(writer_tx);
+        let teardown_called = std::cell::Cell::new(false);
+        let result = restore_terminal_with(
+            terminal,
+            writer_thread,
+            ScreenMode::Inline,
+            |terminal, writer_thread| {
+                drop(terminal);
+                drop(writer_thread);
+                Err(io::Error::other("injected drain failure"))
+            },
+            |_, _| teardown_called.set(true),
+        );
+        assert!(result.is_err());
+        assert!(teardown_called.get());
+    }
     /// `[ui].cursor_blink` tri-state → startup cursor policy; the `None`
     /// default must be Inherit (emit nothing).
     #[test]
@@ -1736,10 +1874,18 @@ mod tests {
             Err(io::Error::from_raw_os_error(5))
         }
     }
+    /// [`ExitInfo`] with no summary, as built for inline/minimal quits.
+    fn bare_exit_info(session_id: &str, minimal: bool) -> ExitInfo {
+        ExitInfo {
+            session_id: session_id.to_string(),
+            minimal,
+            summary: None,
+        }
+    }
     #[test]
     fn print_exit_resume_hint_writes_expected_lines() {
         let mut buf = Vec::new();
-        print_exit_resume_hint("sess-abc", false, &mut buf);
+        print_exit_resume_hint(&bare_exit_info("sess-abc", false), 80, &mut buf);
         assert_eq!(
             String::from_utf8(buf).unwrap(),
             "\nResume this session with:\n  grok --resume sess-abc\n"
@@ -1748,11 +1894,56 @@ mod tests {
     #[test]
     fn print_exit_resume_hint_includes_minimal_flag() {
         let mut buf = Vec::new();
-        print_exit_resume_hint("sess-abc", true, &mut buf);
+        print_exit_resume_hint(&bare_exit_info("sess-abc", true), 80, &mut buf);
         assert_eq!(
             String::from_utf8(buf).unwrap(),
             "\nResume this session with:\n  grok --minimal --resume sess-abc\n"
         );
+    }
+    #[test]
+    fn print_exit_resume_hint_includes_session_summary() {
+        let info = ExitInfo {
+            session_id: "sess-abc".to_string(),
+            minimal: false,
+            summary: Some(ExitSummary {
+                title: "Fix flaky CI test".to_string(),
+                last_prompt: Some("make the suite deterministic".to_string()),
+                last_response: Some("Pinned the seed; 200 consecutive green runs.".to_string()),
+            }),
+        };
+        let mut buf = Vec::new();
+        print_exit_resume_hint(&info, 80, &mut buf);
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            concat!(
+                "\n",
+                "Fix flaky CI test\n",
+                "> make the suite deterministic\n",
+                "  Pinned the seed; 200 consecutive green runs.\n",
+                "\n",
+                "Resume this session with:\n",
+                "  grok --resume sess-abc\n",
+            )
+        );
+    }
+    #[test]
+    fn print_exit_resume_hint_truncates_summary_to_width() {
+        let info = ExitInfo {
+            session_id: "sess-abc".to_string(),
+            minimal: false,
+            summary: Some(ExitSummary {
+                title: "t".repeat(50),
+                last_prompt: Some("p".repeat(50)),
+                last_response: Some("r".repeat(50)),
+            }),
+        };
+        let mut buf = Vec::new();
+        print_exit_resume_hint(&info, 20, &mut buf);
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains(&format!("\n{}…\n", "t".repeat(19))));
+        assert!(out.contains(&format!("\n> {}…\n", "p".repeat(17))));
+        assert!(out.contains(&format!("\n  {}…\n", "r".repeat(17))));
+        assert!(out.contains("  grok --resume sess-abc\n"));
     }
     #[test]
     fn print_relaunch_failure_hint_writes_expected_lines() {
@@ -1767,11 +1958,23 @@ mod tests {
             )
         );
     }
+    /// [`ExitInfo`] with a full summary, for the failing-writer tests.
+    fn full_exit_info(session_id: &str) -> ExitInfo {
+        ExitInfo {
+            summary: Some(ExitSummary {
+                title: "title".to_string(),
+                last_prompt: Some("prompt".to_string()),
+                last_response: Some("response".to_string()),
+            }),
+            ..bare_exit_info(session_id, false)
+        }
+    }
     #[test]
     fn print_hints_survive_eio() {
         let mut w = AlwaysFailWrite;
-        print_exit_resume_hint("sess-abc", false, &mut w);
-        print_exit_resume_hint("sess-abc", true, &mut w);
+        print_exit_resume_hint(&bare_exit_info("sess-abc", false), 80, &mut w);
+        print_exit_resume_hint(&bare_exit_info("sess-abc", true), 80, &mut w);
+        print_exit_resume_hint(&full_exit_info("sess-abc"), 80, &mut w);
         print_relaunch_failure_hint(&"exec failed", "sess-xyz", true, &mut w);
     }
     /// Close the *read* end so writes on the write end get EPIPE
@@ -1787,8 +1990,9 @@ mod tests {
             libc::close(fds[0]);
         }
         let mut writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
-        print_exit_resume_hint("pipe-sid", false, &mut writer);
-        print_exit_resume_hint("pipe-sid", true, &mut writer);
+        print_exit_resume_hint(&bare_exit_info("pipe-sid", false), 80, &mut writer);
+        print_exit_resume_hint(&bare_exit_info("pipe-sid", true), 80, &mut writer);
+        print_exit_resume_hint(&full_exit_info("pipe-sid"), 80, &mut writer);
         print_relaunch_failure_hint(&"exec failed", "pipe-sid", false, &mut writer);
     }
 }

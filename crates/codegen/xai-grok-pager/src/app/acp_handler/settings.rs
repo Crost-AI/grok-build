@@ -117,12 +117,13 @@ pub(super) fn handle_settings_update(notif: &acp::ExtNotification, app: &mut App
     }
     // Tier before voice: same payload may set "API Key" and voice_mode_enabled=false.
     // Always recompute is_api_key_auth from the tier so a later Free/SuperGrok
-    // stamp does not leave API-key bypass / hidden `/usage` stuck.
+    // stamp does not leave API-key bypass / a hidden billing surface stuck.
     if let Some(v) = update.subscription_tier_display {
         let was_api_key = app.is_api_key_auth;
         let is_key = super::super::app_view::is_api_key_label(&v);
         app.is_api_key_auth = is_key;
         app.usage_visible = !is_key && app.team_name.is_none();
+        app.sync_billing_surface_to_agents();
         app.subscription_tier = Some(v);
         app.apply_tier_restrictions();
         // Leaving API Key → free/X Basic without a voice field: drop force-on.
@@ -141,20 +142,11 @@ pub(super) fn handle_settings_update(notif: &acp::ExtNotification, app: &mut App
         }
     }
     if let Some(remote_v) = update.voice_mode_enabled {
-        // Same resolution as startup: env > remote > default on. API-key sessions
-        // keep voice on (billable STT) even when remote is a kill switch.
-        let v = crate::app::resolve_voice_mode_enabled(
-            xai_grok_config::env_bool("GROK_VOICE_MODE"),
-            Some(remote_v),
-        ) || app.is_api_key_auth;
-        // Kill-switch: tear down capture so a remote false doesn't leave the mic armed
-        // (skipped for API keys via the OR above).
+        let v = crate::app::resolve_voice_mode_live(Some(remote_v), app.is_api_key_auth);
         if !v {
             app.voice_reset();
             app.voice_ui_active = false;
         }
-        // Sync the flag into the execution gate + every slash surface so
-        // `/voice` shows/hides in lockstep with the gate.
         app.apply_voice_mode_enabled(v);
     } else {
         app.ensure_voice_for_api_key();

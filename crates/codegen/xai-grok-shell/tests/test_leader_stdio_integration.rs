@@ -582,7 +582,8 @@ async fn test_runtime_profile_start_status_stop_across_clients() {
         };
         assert!(matches!(
             started,
-            ControlPayload::CpuProfileStarted { svg_path, .. } if svg_path == output_path
+            ControlPayload::CpuProfileStarted { svg_path, .. }
+if svg_path == output_path
         ));
 
         let status = client_b
@@ -602,7 +603,8 @@ async fn test_runtime_profile_start_status_stop_across_clients() {
                 svg_path: Some(path),
                 frequency_hz: Some(200),
                 ..
-            } if path == output_path
+            }
+if path == output_path
         ));
 
         let stopped = client_b
@@ -612,7 +614,8 @@ async fn test_runtime_profile_start_status_stop_across_clients() {
             .unwrap();
         assert!(matches!(
             stopped,
-            ControlPayload::CpuProfileStopped { svg_path, .. } if svg_path == output_path
+            ControlPayload::CpuProfileStopped { svg_path, .. }
+if svg_path == output_path
         ));
         assert!(output_path.exists());
     } else {
@@ -727,7 +730,8 @@ async fn test_runtime_profile_creates_missing_parent_directory_end_to_end() {
         };
         assert!(matches!(
             started,
-            ControlPayload::CpuProfileStarted { svg_path, .. } if svg_path == nested_output
+            ControlPayload::CpuProfileStarted { svg_path, .. }
+if svg_path == nested_output
         ));
 
         let stopped = client
@@ -737,7 +741,8 @@ async fn test_runtime_profile_creates_missing_parent_directory_end_to_end() {
             .unwrap();
         assert!(matches!(
             stopped,
-            ControlPayload::CpuProfileStopped { svg_path, .. } if svg_path == nested_output
+            ControlPayload::CpuProfileStopped { svg_path, .. }
+if svg_path == nested_output
         ));
         assert!(nested_output.exists());
     } else {

@@ -452,7 +452,8 @@ mod tests {
                     output: Some(output),
                     frequency_hz: Some(250),
                 },
-            } if request_id == "req-1" && output == "/tmp/profile.folded"
+            }
+if request_id == "req-1" && output == "/tmp/profile.folded"
         ));
     }
 
@@ -552,7 +553,8 @@ mod tests {
                     workspace_exposure: true,
                     relaunch_v1: true,
                 }),
-            } if profile_formats == vec![ProfileArtifactFormat::Svg]
+            }
+if profile_formats == vec![ProfileArtifactFormat::Svg]
         ));
     }
 
@@ -641,7 +643,8 @@ mod tests {
             ClientMessage::Control {
                 request_id,
                 command: ControlCommand::WorkspaceStart { hub_url: Some(url), cwd },
-            } if request_id == "ws-1"
+            }
+if request_id == "ws-1"
                 && url == "wss://hub.example/v1/tools"
                 && cwd == "/home/u/proj"
         ));
@@ -676,7 +679,8 @@ mod tests {
                 cwd: None,
                 sessions,
                 ..
-            } if state == "none" && sessions.is_empty()
+            }
+if state == "none" && sessions.is_empty()
         ));
     }
 

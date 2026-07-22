@@ -142,6 +142,7 @@ impl ChatStateActor {
             x_grok_deployment_id: None,
             x_grok_user_id: None,
             trace,
+            prompt_cache_key: None,
             reasoning_effort: self.state.sampling_config.reasoning_effort,
             json_schema: None,
         }
@@ -601,7 +602,8 @@ mod tests {
             item,
             ConversationItem::User(u) if u.content.iter().any(|p| matches!(
                 p,
-                ContentPart::Text { text } if text.as_ref() == IMAGE_COMPACT_PLACEHOLDER
+                ContentPart::Text { text }
+if text.as_ref() == IMAGE_COMPACT_PLACEHOLDER
             ))
         )
     }

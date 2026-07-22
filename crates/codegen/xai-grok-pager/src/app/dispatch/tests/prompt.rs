@@ -362,6 +362,153 @@ fn small_screen_trigger_suppressed_when_user_compact_on() {
     assert!(app.tip_seen_counts.is_empty(), "no count burned");
 }
 
+// ── SSH wrap tip (`show_ssh_wrap_tip` + its one-shot trigger) ──
+
+/// `show_ssh_wrap_tip` on a drawable agent shows the tip and increments the
+/// per-session seen count in memory (nothing persisted — the fn returns
+/// nothing, so it cannot raise effects).
+#[test]
+fn show_ssh_wrap_tip_shows_and_counts_in_memory() {
+    use crate::tips::ssh_wrap::{SSH_WRAP_TIP_KEY, SSH_WRAP_TIP_SEEN_KEY};
+    let mut app = test_app_with_agent();
+    app.contextual_hints.ssh_wrap = true;
+    let id = AgentId(0);
+    app.agents.get_mut(&id).unwrap().last_terminal_size = (100, 40);
+
+    crate::app::dispatch::show_ssh_wrap_tip(&mut app);
+    assert_eq!(
+        app.agents[&id].ephemeral_tip.current_key(),
+        Some(SSH_WRAP_TIP_KEY)
+    );
+    assert_eq!(app.tip_seen_counts.get(SSH_WRAP_TIP_SEEN_KEY), Some(&1));
+}
+
+/// `show_ssh_wrap_tip` is a no-op when `contextual_hints.ssh_wrap` is off:
+/// no tip shown, no count burned — even on a drawable agent.
+#[test]
+fn show_ssh_wrap_tip_no_op_when_flag_off() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.agents.get_mut(&id).unwrap().last_terminal_size = (100, 40);
+    app.contextual_hints.ssh_wrap = false;
+
+    crate::app::dispatch::show_ssh_wrap_tip(&mut app);
+    assert!(app.tip_seen_counts.is_empty(), "no count burned");
+    assert!(!app.agents[&id].ephemeral_tip.is_active());
+}
+
+/// The seen cap holds at one show per session even if the show fn re-runs
+/// after the first tip expired or was cleared.
+#[test]
+fn show_ssh_wrap_tip_respects_once_per_session_cap() {
+    use crate::tips::ssh_wrap::SSH_WRAP_TIP_SEEN_KEY;
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.agents.get_mut(&id).unwrap().last_terminal_size = (100, 40);
+
+    crate::app::dispatch::show_ssh_wrap_tip(&mut app);
+    app.agents.get_mut(&id).unwrap().ephemeral_tip.clear_all();
+    crate::app::dispatch::show_ssh_wrap_tip(&mut app);
+    assert!(
+        !app.agents[&id].ephemeral_tip.is_active(),
+        "second show must be seen-gated"
+    );
+    assert_eq!(app.tip_seen_counts.get(SSH_WRAP_TIP_SEEN_KEY), Some(&1));
+}
+
+/// The trigger defers — WITHOUT consuming the one-shot — until the active
+/// view is an agent with a stable, draw-measured size; the first stable
+/// measure with the environment recommending wrap then shows it exactly once.
+#[test]
+fn ssh_wrap_trigger_waits_for_stable_agent_measure_then_fires_once() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+
+    // Welcome view: no evaluation, one-shot not consumed.
+    app.active_view = ActiveView::Welcome;
+    app.maybe_trigger_ssh_wrap_tip_inner(true);
+    assert!(!app.ssh_wrap_tip_evaluated);
+
+    // Agent view, but never drawn (size (0,0)): still deferred.
+    app.active_view = ActiveView::Agent(id);
+    app.maybe_trigger_ssh_wrap_tip_inner(true);
+    assert!(!app.ssh_wrap_tip_evaluated);
+
+    // Pending post-resize re-measure: still deferred.
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.last_terminal_size = (100, 40);
+        agent.terminal_size_stale = true;
+    }
+    app.maybe_trigger_ssh_wrap_tip_inner(true);
+    assert!(!app.ssh_wrap_tip_evaluated);
+
+    // Stable measure + recommending environment: evaluates once and shows.
+    app.agents.get_mut(&id).unwrap().terminal_size_stale = false;
+    app.maybe_trigger_ssh_wrap_tip_inner(true);
+    assert!(app.ssh_wrap_tip_evaluated);
+    assert_eq!(
+        app.agents[&id].ephemeral_tip.current_key(),
+        Some(crate::tips::ssh_wrap::SSH_WRAP_TIP_KEY)
+    );
+
+    // One-shot: later calls are inert.
+    app.agents.get_mut(&id).unwrap().ephemeral_tip.clear_all();
+    app.maybe_trigger_ssh_wrap_tip_inner(true);
+    assert!(!app.agents[&id].ephemeral_tip.is_active());
+}
+
+/// A not-recommending environment (local session, wrap sink already active,
+/// or a VS Code remote) consumes the one-shot without showing — the shape is
+/// process-constant, so there is nothing to re-evaluate later.
+#[test]
+fn ssh_wrap_trigger_env_not_recommending_consumes_without_showing() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.agents.get_mut(&id).unwrap().last_terminal_size = (100, 40);
+
+    app.maybe_trigger_ssh_wrap_tip_inner(false);
+    assert!(app.ssh_wrap_tip_evaluated, "evaluation is consumed");
+    assert!(!app.agents[&id].ephemeral_tip.is_active());
+    assert!(app.tip_seen_counts.is_empty(), "no count burned");
+
+    // The one-shot is spent: even a recommending call stays inert.
+    app.maybe_trigger_ssh_wrap_tip_inner(true);
+    assert!(!app.agents[&id].ephemeral_tip.is_active());
+}
+
+/// A busy tip slot defers WITHOUT consuming — replacing would burn the other
+/// session-load tip's once-per-session show; once the slot frees, the next
+/// draw shows the wrap tip.
+#[test]
+fn ssh_wrap_trigger_defers_while_tip_slot_busy() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    // In the small-screen band so the other session-load tip takes the slot
+    // first (mirrors the real draw order: the small-screen trigger runs
+    // first).
+    app.agents.get_mut(&id).unwrap().last_terminal_size = (100, 24);
+    app.maybe_trigger_small_screen_tip();
+    assert!(app.agents[&id].ephemeral_tip.is_active());
+
+    app.maybe_trigger_ssh_wrap_tip_inner(true);
+    assert!(!app.ssh_wrap_tip_evaluated, "busy slot must defer");
+    assert_eq!(
+        app.agents[&id].ephemeral_tip.current_key(),
+        Some(crate::tips::small_screen::SMALL_SCREEN_TIP_KEY),
+        "the earlier tip keeps the slot"
+    );
+
+    // Slot free (the first tip expired or cleared): the next draw shows it.
+    app.agents.get_mut(&id).unwrap().ephemeral_tip.clear_all();
+    app.maybe_trigger_ssh_wrap_tip_inner(true);
+    assert!(app.ssh_wrap_tip_evaluated);
+    assert_eq!(
+        app.agents[&id].ephemeral_tip.current_key(),
+        Some(crate::tips::ssh_wrap::SSH_WRAP_TIP_KEY)
+    );
+}
+
 #[test]
 fn focus_prompt_switches_pane() {
     let mut app = test_app_with_agent();
@@ -740,6 +887,7 @@ fn turn_end_drains_next_queued_prompt() {
         crate::app::acp_handler::PendingRunningAdoption {
             prompt_id: pid_second.clone(),
             text: Some("second".to_string()),
+            combined_texts: None,
             kind: "prompt".to_string(),
             turn_ended: false,
         },
@@ -773,6 +921,51 @@ fn turn_end_drains_next_queued_prompt() {
     assert!(app.pending_running_adoptions.is_empty());
     // Scrollback: user "first" + "Worked for" + user "second".
     assert_eq!(app.agents[&id].scrollback.len(), 3);
+}
+
+/// PromptResponse FIFO handoff must forward `combined_texts` (one bubble each).
+#[test]
+fn prompt_response_fifo_handoff_paints_multi_bubble_combined() {
+    use crate::scrollback::block::RenderBlock;
+
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    dispatch(Action::SendPrompt("first".into()), &mut app);
+    assert!(app.agents[&id].session.state.is_turn_running());
+
+    app.pending_running_adoptions.insert(
+        id,
+        crate::app::acp_handler::PendingRunningAdoption {
+            prompt_id: "p-combo".into(),
+            text: Some("alpha\n\nbeta".into()),
+            combined_texts: Some(vec!["alpha".into(), "beta".into()]),
+            kind: "prompt".into(),
+            turn_ended: false,
+        },
+    );
+    dispatch(
+        Action::TaskComplete(TaskResult::PromptResponse {
+            agent_id: id,
+            result: Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)),
+            http_status: None,
+            prompt_id: None,
+        }),
+        &mut app,
+    );
+
+    let agent = app.agents.get(&id).unwrap();
+    assert_eq!(agent.session.current_prompt_id.as_deref(), Some("p-combo"));
+    assert!(app.pending_running_adoptions.is_empty());
+    let user_texts: Vec<_> = (0..agent.scrollback.len())
+        .filter_map(|i| agent.scrollback.entry(i))
+        .filter_map(|e| match &e.block {
+            RenderBlock::UserPrompt(ub) => Some(ub.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(user_texts.contains(&"alpha"));
+    assert!(user_texts.contains(&"beta"));
+    assert!(user_texts.iter().all(|t| !t.contains("\n\n")));
 }
 
 #[test]
@@ -1081,6 +1274,7 @@ fn turn_end_with_shared_queue_does_not_fetch_prompt_suggestion() {
                 kind: "prompt".into(),
                 text: "queued server-side".into(),
                 position: 0,
+                combined_texts: None,
             });
     }
 
@@ -1332,6 +1526,7 @@ fn turn_complete_notification_suppressed_when_queue_non_empty() {
         crate::app::acp_handler::PendingRunningAdoption {
             prompt_id: pid_second,
             text: Some("second".to_string()),
+            combined_texts: None,
             kind: "prompt".to_string(),
             turn_ended: false,
         },
@@ -1446,6 +1641,7 @@ fn cancel_hands_queue_to_agent_without_reordering() {
                 kind: "prompt".into(),
                 text: "two".into(),
                 position: 0,
+                combined_texts: None,
             },
             QueueEntryWire {
                 id: "q3".into(),
@@ -1455,9 +1651,14 @@ fn cancel_hands_queue_to_agent_without_reordering() {
                 kind: "prompt".into(),
                 text: "three".into(),
                 position: 1,
+                combined_texts: None,
             },
         ],
         running_prompt_id: Some("q1".into()),
+
+        running_text: None,
+        running_kind: None,
+        running_combined_texts: None,
     });
 
     // Post-broadcast the queue is exactly [q2, q3] in order — q1 is now the
@@ -1502,8 +1703,13 @@ fn rekeyed_broadcast_reconciles_optimistic_echo_by_text() {
             kind: "prompt".into(),
             text: "run the tests".into(),
             position: 0,
+            combined_texts: None,
         }],
         running_prompt_id: None,
+
+        running_text: None,
+        running_kind: None,
+        running_combined_texts: None,
     });
 
     let rows = app.shared_prompt_queue(&sid).cloned().unwrap_or_default();
@@ -1530,13 +1736,22 @@ fn rekeyed_broadcast_reconciles_optimistic_echo_by_text() {
             kind: "prompt".into(),
             text: "second message".into(),
             position: 0,
+            combined_texts: None,
         }],
         running_prompt_id: None,
+
+        running_text: None,
+        running_kind: None,
+        running_combined_texts: None,
     });
     app.apply_queue_changed(QueueChanged {
         session_id: sid.clone(),
         entries: vec![],
         running_prompt_id: Some("shell-id-2".into()),
+
+        running_text: None,
+        running_kind: None,
+        running_combined_texts: None,
     });
     assert!(
         app.shared_prompt_queue(&sid).is_none(),
@@ -1556,14 +1771,23 @@ fn rekeyed_broadcast_reconciles_optimistic_echo_by_text() {
             kind: "prompt".into(),
             text: "third message".into(),
             position: 0,
+            combined_texts: None,
         }],
         running_prompt_id: None,
+
+        running_text: None,
+        running_kind: None,
+        running_combined_texts: None,
     });
     app.push_optimistic_prompt_echo(&sid, "pager-id-3", "third message", "prompt");
     app.apply_queue_changed(QueueChanged {
         session_id: sid.clone(),
         entries: vec![],
         running_prompt_id: Some("shell-id-3".into()),
+
+        running_text: None,
+        running_kind: None,
+        running_combined_texts: None,
     });
     assert!(
         app.shared_prompt_queue(&sid).is_none(),
@@ -1966,6 +2190,67 @@ fn slash_compact_enqueues_command() {
     assert!(matches!(&effects[0], Effect::Compact { .. }));
     // Prompt should be cleared.
     assert!(app.agents[&id].prompt.text().is_empty());
+}
+
+#[test]
+fn edit_prompt_direct_route_preserves_nonempty_draft_and_elements() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.screen_mode = crate::app::ScreenMode::Minimal;
+    app.agents
+        .get_mut(&id)
+        .unwrap()
+        .prompt
+        .set_text("existing draft");
+
+    let effects = dispatch(Action::EditPromptExternal, &mut app);
+    assert!(effects.is_empty());
+    assert_eq!(app.agents[&id].prompt.text(), "existing draft");
+    assert!(matches!(
+        app.pending_editor,
+        Some(crate::app::external_editor::PendingEditorRequest::PromptDraft {
+            ref original_text,
+            ..
+        }) if original_text == "existing draft"
+    ));
+    assert!(app.agents[&id].session.pending_prompts.is_empty());
+
+    app.pending_editor = None;
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.prompt.set_text("");
+    agent.prompt.textarea.insert_element(
+        "@src/lib.rs",
+        crate::views::prompt_widget::KIND_FILE_REF,
+        None,
+    );
+    let chip_text = agent.prompt.text().to_owned();
+    let _ = dispatch(Action::EditPromptExternal, &mut app);
+    assert!(app.pending_editor.is_none());
+    assert_eq!(app.agents[&id].prompt.text(), chip_text);
+    assert!(!app.agents[&id].prompt.textarea.elements().is_empty());
+}
+
+#[test]
+fn typed_edit_prompt_command_opens_only_an_empty_draft() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.screen_mode = crate::app::ScreenMode::Minimal;
+    app.agents
+        .get_mut(&id)
+        .unwrap()
+        .prompt
+        .set_text("/edit-prompt");
+
+    let effects = dispatch(Action::SendPrompt("/edit-prompt".into()), &mut app);
+    assert!(effects.is_empty());
+    assert!(app.agents[&id].prompt.text().is_empty());
+    assert!(matches!(
+        app.pending_editor,
+        Some(crate::app::external_editor::PendingEditorRequest::PromptDraft {
+            ref original_text,
+            ..
+        }) if original_text.is_empty()
+    ));
 }
 
 #[test]
@@ -3051,11 +3336,12 @@ fn local_drain_holds_while_server_row_queued() {
             kind: "prompt".into(),
             text: "server-owned next".into(),
             position: 0,
+            combined_texts: None,
         }];
 
     let agent = app.agents.get_mut(&id).unwrap();
     assert!(agent.session.state.is_idle());
-    let effects = maybe_drain_queue(agent);
+    let effects = maybe_drain_queue(agent).effects;
     assert!(
         effects.is_empty(),
         "local drain must hold while the server owns the next turn, got {effects:?}"
@@ -3070,7 +3356,7 @@ fn local_drain_holds_while_server_row_queued() {
     // turn, not a queued one) — once it's marked running and the turn ends,
     // the local row drains normally.
     agent.session.current_prompt_id = Some("srv-1".into());
-    let effects = maybe_drain_queue(agent);
+    let effects = maybe_drain_queue(agent).effects;
     assert!(
         matches!(effects.as_slice(), [Effect::SendPrompt { .. }]),
         "a running-only shared queue must not hold the local drain, got {effects:?}"

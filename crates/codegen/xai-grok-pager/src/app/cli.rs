@@ -15,6 +15,10 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Check terminal support and configuration without starting Grok
+    Doctor(crate::doctor_cmd::DoctorArgs),
+    /// Manage running leader processes
+    Leader(LeaderMgmtArgs),
     /// Sign out and clear cached credentials
     Logout,
     /// Sign in to Grok
@@ -151,12 +155,36 @@ pub struct WrapArgs {
     )]
     pub command: Vec<String>,
 }
-/// Targets a running leader process by PID (used by `grok workspace`).
+/// Targets a running leader process by PID (used by `grok leader` / `grok workspace`).
 #[derive(Debug, clap::Args, Clone, Default)]
 pub struct LeaderTargetArgs {
-    /// Leader process ID.
+    /// Leader process ID from `grok leader list`.
     #[arg(long)]
     pub pid: Option<u32>,
+}
+#[derive(Debug, clap::Args, Clone)]
+pub struct LeaderMgmtArgs {
+    #[command(subcommand)]
+    pub command: LeaderMgmtCommand,
+}
+#[derive(Debug, Subcommand, Clone)]
+pub enum LeaderMgmtCommand {
+    /// List running leader processes
+    List {
+        /// Emit machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show details for a leader process
+    Info {
+        #[command(flatten)]
+        target: LeaderTargetArgs,
+        /// Emit machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop all running leader processes
+    Kill,
 }
 #[derive(Debug, clap::Args, Clone)]
 pub struct WorkspaceMgmtArgs {
@@ -368,22 +396,10 @@ pub struct LeaderArgs {
     #[command(flatten)]
     pub headless: HeadlessArgs,
 }
-/// Return the version string with channel label for `--version` / `-v` output.
-///
-/// Uses a `OnceLock` so the formatting happens once and the result lives
-/// for `'static` (required by clap's `ArgAction::Version`).
-fn version_with_channel() -> &'static str {
-    use std::sync::OnceLock;
-    static V: OnceLock<String> = OnceLock::new();
-    V.get_or_init(|| {
-        let label = xai_grok_update::channel_label();
-        xai_grok_version::display_version_with_commit(env!("VERSION_WITH_COMMIT"), label)
-    })
-}
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "grok",
-    version = version_with_channel(),
+    version = env!("VERSION_WITH_COMMIT"),
     about = "Grok Build TUI",
     disable_version_flag = true,
     next_display_order = None,
@@ -403,8 +419,8 @@ Commands:
 )]
 pub struct PagerArgs {
     /// Print version
-    #[arg(short = 'v', short_alias = 'V', long = "version", action = ArgAction::Version)]
-    pub version: (),
+    #[arg(short = 'v', short_alias = 'V', long = "version", action = ArgAction::SetTrue)]
+    pub version: bool,
     /// Working directory.
     #[arg(long)]
     pub cwd: Option<PathBuf>,
@@ -621,9 +637,6 @@ pub struct PagerArgs {
     /// Disable web search and web fetch tools.
     #[arg(long = "disable-web-search")]
     pub disable_web_search: bool,
-    /// Append a self-verification loop to the prompt (headless only).
-    #[arg(long = "check", alias = "self-verify", conflicts_with = "no_subagents")]
-    pub self_verify: bool,
     /// Exit as soon as the first agent turn ends, without waiting for pending
     /// background bash/monitor tasks or background subagents (headless only).
     /// Default for all `grok -p` runs is to wait (up to `--background-wait-timeout`)
@@ -647,9 +660,6 @@ pub struct PagerArgs {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub background_wait_timeout_secs: u64,
-    /// Run the task N ways in parallel and pick the best (headless only).
-    #[arg(long = "best-of-n", value_name = "N", conflicts_with = "no_subagents")]
-    pub best_of_n: Option<u32>,
     /// Sandbox profile for filesystem and network access.
     #[arg(long, env = "GROK_SANDBOX", value_name = "PROFILE")]
     pub sandbox: Option<String>,
@@ -691,16 +701,14 @@ pub struct PagerArgs {
     /// Experimental: scrollback-native rendering. Finalized blocks are printed
     /// into the terminal's native scrollback (use the terminal's own scroll /
     /// selection); a small pinned region holds the prompt + running turn.
-    /// Sticky: records `[ui] screen_mode = "minimal"` in ~/.grok/config.toml
-    /// so future plain `grok` invocations open in minimal mode too.
+    /// Session-scoped only — does not write config. To default plain `grok` to
+    /// minimal, set `[ui] screen_mode = "minimal"` in ~/.grok/config.toml.
     #[arg(long = "minimal")]
     pub minimal: bool,
-    /// Open in the standard fullscreen TUI, overriding a sticky minimal
-    /// preference. Sticky counterpart of --minimal: records
-    /// `[ui] screen_mode = "fullscreen"` in ~/.grok/config.toml so future
-    /// plain `grok` invocations open fullscreen again. Fullscreen-vs-inline
-    /// still follows the alt-screen policy (--no-alt-screen, [terminal]
-    /// alt_screen, terminal auto-detection).
+    /// Open in the standard fullscreen TUI for this session, overriding a
+    /// config `[ui] screen_mode = "minimal"` preference. Session-scoped only —
+    /// does not write config. Fullscreen-vs-inline still follows the alt-screen
+    /// policy (--no-alt-screen, [terminal] alt_screen, terminal auto-detection).
     #[arg(long = "fullscreen", conflicts_with = "minimal")]
     pub fullscreen: bool,
     /// Write sampling events to ~/.grok/logs/sampling.jsonl.
@@ -751,9 +759,23 @@ pub enum ResumeTarget {
     /// Not resuming an existing session (new auto or new-with-id).
     None,
 }
+fn anchor_to_launch_dir(path: PathBuf, launch_dir: Option<&std::path::Path>) -> PathBuf {
+    if path.is_absolute() {
+        strip_cur_dir(path)
+    } else if let Some(launch_dir) = launch_dir {
+        strip_cur_dir(launch_dir.join(path))
+    } else {
+        strip_cur_dir(path)
+    }
+}
+fn strip_cur_dir(path: PathBuf) -> PathBuf {
+    path.components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .collect()
+}
 impl PagerArgs {
-    /// Parse CLI arguments and apply `--cwd` if provided.
-    pub fn parse_and_apply_cwd() -> anyhow::Result<Self> {
+    /// Parse CLI arguments without applying side effects.
+    pub fn parse_cli() -> Self {
         let bin_name = std::env::args()
             .next()
             .as_deref()
@@ -763,19 +785,27 @@ impl PagerArgs {
             .filter(|n| *n == "grok" || *n == "agent")
             .unwrap_or("grok")
             .to_owned();
-        let mut args = Self::parse_from(std::iter::once(bin_name).chain(std::env::args().skip(1)));
-        if let Some(socket) = args.leader_socket.take() {
-            args.leader_socket = Some(std::path::absolute(&socket).unwrap_or(socket));
+        Self::parse_from(std::iter::once(bin_name).chain(std::env::args().skip(1)))
+    }
+    /// Apply launch-directory path anchoring and `--cwd` after early commands
+    /// have been dispatched without filesystem or process initialization.
+    pub fn apply_cwd(self) -> anyhow::Result<Self> {
+        let launch_dir = std::env::current_dir().ok();
+        self.apply_cwd_from(launch_dir.as_deref())
+    }
+    fn apply_cwd_from(mut self, launch_dir: Option<&std::path::Path>) -> anyhow::Result<Self> {
+        if let Some(socket) = self.leader_socket.take() {
+            self.leader_socket = Some(anchor_to_launch_dir(socket, launch_dir));
         }
-        if let Some(file) = args.debug_file.take() {
-            args.debug_file = Some(std::path::absolute(&file).unwrap_or(file));
+        if let Some(file) = self.debug_file.take() {
+            self.debug_file = Some(anchor_to_launch_dir(file, launch_dir));
         }
-        if let Some(ref cwd) = args.cwd {
+        if let Some(ref cwd) = self.cwd {
             std::env::set_current_dir(cwd).map_err(|e| {
                 anyhow::anyhow!("Failed to set working directory to {:?}: {}", cwd, e)
             })?;
         }
-        Ok(args)
+        Ok(self)
     }
     /// Optional-flag accessor; always `false` in builds without the optional
     /// feature, so call sites need no `cfg` of their own.
@@ -887,24 +917,65 @@ impl PagerArgs {
 mod tests {
     use super::*;
     #[test]
-    fn version_flag_exits_zero() {
-        let err = PagerArgs::try_parse_from(["grok", "--version"]).unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
-        assert!(
-            err.exit_code() == 0,
-            "--version must exit 0; got {}",
-            err.exit_code()
-        );
+    fn version_flags_parse_as_early_intent_without_exiting() {
+        for flag in ["--version", "-v", "-V"] {
+            let args = PagerArgs::try_parse_from(["grok", flag]).expect("version flag parses");
+            assert!(args.version, "{flag} must set the early version intent");
+            assert!(args.command.is_none());
+        }
     }
     #[test]
-    fn version_short_flag_exits_zero() {
-        let err = PagerArgs::try_parse_from(["grok", "-v"]).unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+    fn ordinary_and_doctor_parsing_do_not_set_version_intent() {
+        assert!(!PagerArgs::try_parse_from(["grok"]).unwrap().version);
         assert!(
-            err.exit_code() == 0,
-            "-v must exit 0; got {}",
-            err.exit_code()
+            !PagerArgs::try_parse_from(["grok", "doctor"])
+                .unwrap()
+                .version
         );
+        assert!(matches!(
+            PagerArgs::try_parse_from(["grok", "version"])
+                .unwrap()
+                .command,
+            Some(Command::Version { json: false })
+        ));
+    }
+    #[test]
+    fn doctor_accepts_report_and_explicit_fix_forms() {
+        let bare = PagerArgs::try_parse_from(["grok", "doctor"]).expect("bare doctor parses");
+        assert!(matches!(
+            bare.command,
+            Some(Command::Doctor(crate::doctor_cmd::DoctorArgs {
+                json: false,
+                command: None,
+            }))
+        ));
+        let json =
+            PagerArgs::try_parse_from(["grok", "doctor", "--json"]).expect("doctor --json parses");
+        assert!(matches!(
+            json.command,
+            Some(Command::Doctor(crate::doctor_cmd::DoctorArgs {
+                json: true,
+                command: None,
+            }))
+        ));
+        let fix =
+            PagerArgs::try_parse_from(["grok", "doctor", "fix", "terminal.ssh-wrap", "--yes"])
+                .expect("doctor fix parses");
+        assert!(
+            matches!(fix.command, Some(Command::Doctor(crate ::doctor_cmd::DoctorArgs {
+            json : false, command : Some(crate ::doctor_cmd::DoctorCommand::Fix(crate
+            ::doctor_cmd::FixArgs { ref id, yes : true })), })) if id ==
+            "terminal.ssh-wrap")
+        );
+        for unsupported in [
+            vec!["grok", "doctor", "fix"],
+            vec!["grok", "doctor", "all"],
+            vec!["grok", "doctor", "--json", "fix", "terminal.ssh-wrap"],
+        ] {
+            let error = PagerArgs::try_parse_from(unsupported)
+                .expect_err("unsupported doctor form must fail");
+            assert_eq!(error.exit_code(), 2);
+        }
     }
     #[test]
     fn resume_target_classifies_flags() {
@@ -1041,6 +1112,41 @@ mod tests {
         );
     }
     #[test]
+    fn launch_directory_anchoring_precedes_cwd_change() {
+        let args = PagerArgs::try_parse_from([
+            "grok",
+            "--leader-socket",
+            "relative.sock",
+            "--debug-file",
+            "relative.log",
+        ])
+        .unwrap()
+        .apply_cwd_from(Some(std::path::Path::new("/launch")))
+        .unwrap();
+        assert_eq!(
+            args.leader_socket.as_deref(),
+            Some(std::path::Path::new("/launch/relative.sock"))
+        );
+        assert_eq!(
+            args.debug_file.as_deref(),
+            Some(std::path::Path::new("/launch/relative.log"))
+        );
+    }
+    #[test]
+    fn launch_directory_anchoring_normalizes_dot_components() {
+        for (input, expected) in [
+            ("./leader.sock", "/launch/leader.sock"),
+            ("logs/../debug.log", "/launch/logs/../debug.log"),
+            ("../leader.sock", "/launch/../leader.sock"),
+        ] {
+            assert_eq!(
+                anchor_to_launch_dir(PathBuf::from(input), Some(std::path::Path::new("/launch"))),
+                PathBuf::from(expected),
+                "input: {input}"
+            );
+        }
+    }
+    #[test]
     fn leader_socket_flag_parses_at_root() {
         let args = PagerArgs::try_parse_from(["grok", "--leader-socket", "/tmp/leader-x.sock"])
             .expect("--leader-socket parses at the root");
@@ -1068,6 +1174,36 @@ mod tests {
     fn leader_socket_flag_defaults_to_none() {
         let args = PagerArgs::try_parse_from(["grok"]).expect("bare grok parses");
         assert!(args.leader_socket.is_none());
+    }
+    #[test]
+    fn leader_mgmt_list_info_kill_parse() {
+        let list = PagerArgs::try_parse_from(["grok", "leader", "list", "--json"])
+            .expect("grok leader list --json");
+        assert!(matches!(
+            list.command,
+            Some(Command::Leader(LeaderMgmtArgs {
+                command: LeaderMgmtCommand::List { json: true },
+            }))
+        ));
+        let info = PagerArgs::try_parse_from(["grok", "leader", "info", "--pid", "42"])
+            .expect("grok leader info --pid");
+        assert!(matches!(
+            info.command,
+            Some(Command::Leader(LeaderMgmtArgs {
+                command: LeaderMgmtCommand::Info {
+                    target: LeaderTargetArgs { pid: Some(42) },
+                    json: false,
+                },
+            }))
+        ));
+        let kill = PagerArgs::try_parse_from(["grok", "leader", "kill"]).expect("grok leader kill");
+        assert!(matches!(
+            kill.command,
+            Some(Command::Leader(LeaderMgmtArgs {
+                command: LeaderMgmtCommand::Kill,
+            }))
+        ));
+        assert!(PagerArgs::try_parse_from(["grok", "leader", "profile"]).is_err());
     }
     #[test]
     fn debug_file_flag_parses_and_is_global() {

@@ -62,25 +62,25 @@ fn resolve_search_tool_enabled(
     env.or(config).or(managed).unwrap_or(true)
 }
 
-const ENV_PERSISTENT_SHELL: &str = "GROK_PERSISTENT_SHELL";
+const ENV_LOGIN_SHELL_CAPTURE: &str = "GROK_LOGIN_ENV";
 
-fn persistent_shell_from_toml(v: Option<&TomlValue>) -> Option<bool> {
+fn login_shell_capture_from_toml(v: Option<&TomlValue>) -> Option<bool> {
     v?.get("toolset")?
         .get("bash")?
-        .get("persistent_shell")?
+        .get("login_shell_capture")?
         .as_bool()
 }
 
-pub fn resolve_persistent_local_shell(remote: Option<bool>) -> bool {
+pub fn resolve_login_shell_capture(remote: Option<bool>) -> bool {
     let requirements = crate::config::load_merged_requirements();
     let layers = match crate::config::ConfigLayers::load() {
         Ok(l) => Some(l),
         Err(e) => {
-            tracing::warn!(error = %e, "persistent_local_shell: failed to load config layers");
+            tracing::warn!(error = %e, "login_shell_capture: failed to load config layers");
             None
         }
     };
-    resolve_persistent_local_shell_tiers(
+    resolve_login_shell_capture_tiers(
         requirements.as_ref(),
         layers.as_ref().map(|l| &l.user),
         layers.as_ref().map(|l| &l.managed),
@@ -89,7 +89,7 @@ pub fn resolve_persistent_local_shell(remote: Option<bool>) -> bool {
     )
 }
 
-fn resolve_persistent_local_shell_tiers(
+fn resolve_login_shell_capture_tiers(
     requirements: Option<&TomlValue>,
     user: Option<&TomlValue>,
     managed: Option<&TomlValue>,
@@ -97,12 +97,12 @@ fn resolve_persistent_local_shell_tiers(
     remote: Option<bool>,
 ) -> bool {
     use crate::agent::config::BoolFlag;
-    BoolFlag::env(ENV_PERSISTENT_SHELL)
-        .requirement(persistent_shell_from_toml(requirements))
-        .config(persistent_shell_from_toml(user))
+    BoolFlag::env(ENV_LOGIN_SHELL_CAPTURE)
+        .requirement(login_shell_capture_from_toml(requirements))
+        .config(login_shell_capture_from_toml(user))
         .managed(
-            persistent_shell_from_toml(managed)
-                .or_else(|| persistent_shell_from_toml(system_managed)),
+            login_shell_capture_from_toml(managed)
+                .or_else(|| login_shell_capture_from_toml(system_managed)),
         )
         .feature_flag(remote)
         .default(true)
@@ -111,38 +111,36 @@ fn resolve_persistent_local_shell_tiers(
 }
 
 #[cfg(test)]
-mod persistent_local_shell_tests {
-    use super::{ENV_PERSISTENT_SHELL, resolve_persistent_local_shell_tiers};
+mod login_shell_capture_tests {
+    use super::{ENV_LOGIN_SHELL_CAPTURE, resolve_login_shell_capture_tiers};
     use toml::Value as TomlValue;
 
-    // GROK_PERSISTENT_SHELL is process-global (the documented kill-switch a dev
-    // may export); serialize and force it unset so these tests can't go flaky.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn guard() -> std::sync::MutexGuard<'static, ()> {
         let g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        unsafe { std::env::remove_var(ENV_PERSISTENT_SHELL) };
+        unsafe { std::env::remove_var(ENV_LOGIN_SHELL_CAPTURE) };
         g
     }
 
-    fn cfg(persistent: bool) -> TomlValue {
+    fn cfg(enabled: bool) -> TomlValue {
         toml::from_str(&format!(
-            "[toolset.bash]\npersistent_shell = {persistent}\n"
+            "[toolset.bash]\nlogin_shell_capture = {enabled}\n"
         ))
         .unwrap()
     }
 
     #[test]
-    fn default_is_true() {
+    fn defaults_on() {
         let _g = guard();
-        assert!(resolve_persistent_local_shell_tiers(
+        assert!(resolve_login_shell_capture_tiers(
             None, None, None, None, None
         ));
     }
 
     #[test]
-    fn remote_false_rolls_back() {
+    fn remote_flag_can_disable() {
         let _g = guard();
-        assert!(!resolve_persistent_local_shell_tiers(
+        assert!(!resolve_login_shell_capture_tiers(
             None,
             None,
             None,
@@ -152,25 +150,129 @@ mod persistent_local_shell_tests {
     }
 
     #[test]
-    fn config_false_rolls_back() {
+    fn user_config_beats_remote() {
         let _g = guard();
-        let off = cfg(false);
-        assert!(!resolve_persistent_local_shell_tiers(
+        assert!(resolve_login_shell_capture_tiers(
             None,
-            Some(&off),
+            Some(&cfg(true)),
             None,
             None,
-            None
+            Some(false)
+        ));
+        assert!(!resolve_login_shell_capture_tiers(
+            None,
+            Some(&cfg(false)),
+            None,
+            None,
+            Some(true)
         ));
     }
 
     #[test]
-    fn config_beats_remote() {
+    fn env_beats_config_and_remote() {
         let _g = guard();
-        let on = cfg(true);
-        assert!(resolve_persistent_local_shell_tiers(
+        unsafe { std::env::set_var(ENV_LOGIN_SHELL_CAPTURE, "0") };
+        let off = resolve_login_shell_capture_tiers(None, Some(&cfg(true)), None, None, Some(true));
+        unsafe { std::env::remove_var(ENV_LOGIN_SHELL_CAPTURE) };
+        assert!(!off);
+    }
+
+    #[test]
+    fn requirements_win_outright() {
+        let _g = guard();
+        unsafe { std::env::set_var(ENV_LOGIN_SHELL_CAPTURE, "1") };
+        let off = resolve_login_shell_capture_tiers(
+            Some(&cfg(false)),
+            Some(&cfg(true)),
             None,
-            Some(&on),
+            None,
+            Some(true),
+        );
+        unsafe { std::env::remove_var(ENV_LOGIN_SHELL_CAPTURE) };
+        assert!(!off);
+    }
+}
+
+const ENV_SCHEDULER_BACKGROUND_LOOPS: &str = "GROK_SCHEDULER_BACKGROUND_LOOPS";
+
+fn scheduler_background_loops_from_toml(v: Option<&TomlValue>) -> Option<bool> {
+    v?.get("scheduler")?.get("background_loops")?.as_bool()
+}
+
+/// Resolve whether scheduled task fires run in background loop subagents.
+///
+/// Precedence: requirements > env (`GROK_SCHEDULER_BACKGROUND_LOOPS`) > user
+/// `config.toml` `[scheduler] background_loops` > managed layers > remote
+/// settings > default `true`.
+pub fn resolve_scheduler_background_loops(remote: Option<bool>) -> bool {
+    let requirements = crate::config::load_merged_requirements();
+    let layers = match crate::config::ConfigLayers::load() {
+        Ok(l) => Some(l),
+        Err(e) => {
+            tracing::warn!(error = %e, "scheduler_background_loops: failed to load config layers");
+            None
+        }
+    };
+    resolve_scheduler_background_loops_tiers(
+        requirements.as_ref(),
+        layers.as_ref().map(|l| &l.user),
+        layers.as_ref().map(|l| &l.managed),
+        layers.as_ref().map(|l| &l.system_managed),
+        remote,
+    )
+}
+
+fn resolve_scheduler_background_loops_tiers(
+    requirements: Option<&TomlValue>,
+    user: Option<&TomlValue>,
+    managed: Option<&TomlValue>,
+    system_managed: Option<&TomlValue>,
+    remote: Option<bool>,
+) -> bool {
+    use crate::agent::config::BoolFlag;
+    BoolFlag::env(ENV_SCHEDULER_BACKGROUND_LOOPS)
+        .requirement(scheduler_background_loops_from_toml(requirements))
+        .config(scheduler_background_loops_from_toml(user))
+        .managed(
+            scheduler_background_loops_from_toml(managed)
+                .or_else(|| scheduler_background_loops_from_toml(system_managed)),
+        )
+        .feature_flag(remote)
+        .default(true)
+        .resolve()
+        .value
+}
+
+#[cfg(test)]
+mod scheduler_background_loops_tests {
+    use super::{ENV_SCHEDULER_BACKGROUND_LOOPS, resolve_scheduler_background_loops_tiers};
+    use toml::Value as TomlValue;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn guard() -> std::sync::MutexGuard<'static, ()> {
+        let g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::remove_var(ENV_SCHEDULER_BACKGROUND_LOOPS) };
+        g
+    }
+
+    fn cfg(enabled: bool) -> TomlValue {
+        toml::from_str(&format!("[scheduler]\nbackground_loops = {enabled}\n")).unwrap()
+    }
+
+    #[test]
+    fn defaults_on() {
+        let _g = guard();
+        assert!(resolve_scheduler_background_loops_tiers(
+            None, None, None, None, None
+        ));
+    }
+
+    #[test]
+    fn remote_flag_can_disable() {
+        let _g = guard();
+        assert!(!resolve_scheduler_background_loops_tiers(
+            None,
+            None,
             None,
             None,
             Some(false)
@@ -178,36 +280,52 @@ mod persistent_local_shell_tests {
     }
 
     #[test]
-    fn requirement_overrides_remote() {
+    fn user_config_beats_remote() {
         let _g = guard();
-        let on = cfg(true);
-        assert!(resolve_persistent_local_shell_tiers(
-            Some(&on),
+        assert!(resolve_scheduler_background_loops_tiers(
             None,
+            Some(&cfg(true)),
             None,
             None,
             Some(false)
         ));
+        assert!(!resolve_scheduler_background_loops_tiers(
+            None,
+            Some(&cfg(false)),
+            None,
+            None,
+            Some(true)
+        ));
     }
 
     #[test]
-    fn managed_and_system_managed_apply_below_config() {
+    fn env_beats_config_and_remote() {
         let _g = guard();
-        let off = cfg(false);
-        assert!(!resolve_persistent_local_shell_tiers(
+        unsafe { std::env::set_var(ENV_SCHEDULER_BACKGROUND_LOOPS, "0") };
+        let off = resolve_scheduler_background_loops_tiers(
+            None,
+            Some(&cfg(true)),
             None,
             None,
-            Some(&off),
+            Some(true),
+        );
+        unsafe { std::env::remove_var(ENV_SCHEDULER_BACKGROUND_LOOPS) };
+        assert!(!off);
+    }
+
+    #[test]
+    fn requirements_win_outright() {
+        let _g = guard();
+        unsafe { std::env::set_var(ENV_SCHEDULER_BACKGROUND_LOOPS, "1") };
+        let off = resolve_scheduler_background_loops_tiers(
+            Some(&cfg(false)),
+            Some(&cfg(true)),
             None,
-            None
-        ));
-        assert!(!resolve_persistent_local_shell_tiers(
             None,
-            None,
-            None,
-            Some(&off),
-            None
-        ));
+            Some(true),
+        );
+        unsafe { std::env::remove_var(ENV_SCHEDULER_BACKGROUND_LOOPS) };
+        assert!(!off);
     }
 }
 

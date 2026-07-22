@@ -11,11 +11,12 @@ use crate::scrollback::blocks::tool::search::{
     SearchFileMatch, SearchInputMeta, SearchLineMatch, SearchOutputMode, SearchToolCallBlock,
 };
 use crate::scrollback::blocks::tool::{
-    DiscoveredTool, EditToolCallBlock, ExecuteToolCallBlock, IntegrationSearchToolCallBlock,
-    LineRange, MemorySearchToolCallBlock, OtherToolCallBlock, ReadMediaKind, ReadToolCallBlock,
-    ToolCallBlock, UseToolCallBlock, WebFetchToolCallBlock, WebSearchToolCallBlock,
+    DiscoveredTool, EditHighlightPhase, EditToolCallBlock, ExecuteToolCallBlock,
+    IntegrationSearchToolCallBlock, LineRange, MemorySearchToolCallBlock, OtherToolCallBlock,
+    ReadMediaKind, ReadToolCallBlock, ToolCallBlock, UseToolCallBlock, WebFetchToolCallBlock,
+    WebSearchToolCallBlock,
 };
-use crate::scrollback::entry::EntryId;
+use crate::scrollback::entry::{EntryId, ScrollbackEntry};
 use crate::scrollback::state::ScrollbackState;
 use crate::scrollback::state::verb_group::verb_group_kind_changed;
 use agent_client_protocol as acp;
@@ -501,7 +502,7 @@ impl AcpUpdateTracker {
     }
     /// Get the tool_call_id of the currently running Execute tool, if any.
     ///
-    /// Used by demotion (Ctrl-G) to know which tool to background.
+    /// Used by demotion (Ctrl+B) to know which tool to background.
     /// Returns None if no Execute tool is currently pending.
     pub fn running_execute_tool_call_id(&self) -> Option<&str> {
         self.pending_tools
@@ -583,6 +584,9 @@ impl AcpUpdateTracker {
     /// clear the running state — the shared tail of every completed-tool path.
     /// Evaluates the predicate before `push_block` consumes the block, so the
     /// entry needs no re-fetch.
+    ///
+    /// The returned id may no longer be in the scrollback: a completed Edit
+    /// can coalesce into an adjacent earlier Edit of the same file.
     fn finish_completed_tool(
         &mut self,
         block: RenderBlock,
@@ -595,7 +599,139 @@ impl AcpUpdateTracker {
             self.pending_edit_hl.push(id);
         }
         scrollback.finish_running(id);
+        self.try_coalesce_edit(id, scrollback, is_replay);
         id
+    }
+    /// The Edit block of `entry` if it qualifies for coalescing with an
+    /// adjacent same-file Edit: completed successfully with hunks, a
+    /// trustworthy one-liner summary, and free of per-entry attachments a
+    /// merge would misplace.
+    fn coalescable_edit(entry: &ScrollbackEntry) -> Option<&EditToolCallBlock> {
+        if entry.is_running || entry.is_pending_user_input || entry.hook_data.is_some() {
+            return None;
+        }
+        let RenderBlock::ToolCall(ToolCallBlock::Edit(edit)) = &entry.block else {
+            return None;
+        };
+        (edit.error.is_none() && !edit.hunks.is_empty() && !edit.summary_untrusted).then_some(edit)
+    }
+    /// Whether the completed Edit entries `earlier` and `later` target the
+    /// same file and may merge into one block.
+    fn edits_can_merge(
+        &self,
+        scrollback: &ScrollbackState,
+        earlier: EntryId,
+        later: EntryId,
+    ) -> bool {
+        if scrollback.is_committed(earlier) || scrollback.is_committed(later) {
+            return false;
+        }
+        let (Some(a), Some(b)) = (
+            scrollback
+                .get_by_id(earlier)
+                .and_then(Self::coalescable_edit),
+            scrollback.get_by_id(later).and_then(Self::coalescable_edit),
+        ) else {
+            return false;
+        };
+        if a.prefix != b.prefix {
+            return false;
+        }
+        let cwd = self.session_cwd.as_deref();
+        let resolve = |p: &str| crate::render::tool_paths::resolve_tool_path_target(p, cwd);
+        match (resolve(&a.path), resolve(&b.path)) {
+            (Some(pa), Some(pb)) => pa == pb,
+            (None, None) => a.path == b.path,
+            _ => false,
+        }
+    }
+    /// Coalesce the just-completed Edit at `entry_id` with strictly adjacent
+    /// completed Edits of the same file, so back-to-back edits render as one
+    /// block with a summed diffstat. The earlier entry always survives.
+    ///
+    /// Checks the previous neighbor (sequential completions) and the next one
+    /// (parallel calls can complete out of push order, so the pair only
+    /// becomes mergeable when the earlier call lands). Loops so runs of 3+
+    /// collapse pairwise.
+    ///
+    /// Ingestion-time only: a later `collapsed_edit_blocks` flip never
+    /// merges or unmerges rows that already landed.
+    fn try_coalesce_edit(
+        &mut self,
+        entry_id: EntryId,
+        scrollback: &mut ScrollbackState,
+        is_replay: bool,
+    ) {
+        if !crate::appearance::cache::load_collapsed_edit_blocks() {
+            return;
+        }
+        if scrollback
+            .get_by_id(entry_id)
+            .and_then(Self::coalescable_edit)
+            .is_none()
+        {
+            return;
+        }
+        let mut survivor = entry_id;
+        loop {
+            let Some(idx) = scrollback.index_of_id(survivor) else {
+                return;
+            };
+            let prev_id = idx
+                .checked_sub(1)
+                .and_then(|i| scrollback.get(i))
+                .map(|e| e.id);
+            if let Some(prev_id) = prev_id
+                && self.edits_can_merge(scrollback, prev_id, survivor)
+            {
+                self.merge_edit_entries(prev_id, survivor, scrollback, is_replay);
+                survivor = prev_id;
+                continue;
+            }
+            let next_id = scrollback.get(idx + 1).map(|e| e.id);
+            if let Some(next_id) = next_id
+                && self.edits_can_merge(scrollback, survivor, next_id)
+            {
+                self.merge_edit_entries(survivor, next_id, scrollback, is_replay);
+                continue;
+            }
+            return;
+        }
+    }
+    /// Append `removed`'s hunks onto `survivor` (the earlier entry) —
+    /// stitching overlapping/adjacent ones into unified hunks — and drop
+    /// `removed` from the scrollback and the edit-HL queue.
+    fn merge_edit_entries(
+        &mut self,
+        survivor: EntryId,
+        removed: EntryId,
+        scrollback: &mut ScrollbackState,
+        is_replay: bool,
+    ) {
+        let (removed_hunks, removed_edit_count) =
+            match scrollback.get_by_id(removed).map(|e| &e.block) {
+                Some(RenderBlock::ToolCall(ToolCallBlock::Edit(edit))) => {
+                    (edit.hunks.clone(), edit.edit_count)
+                }
+                _ => return,
+            };
+        if let Some(entry) = scrollback.get_by_id_mut(survivor) {
+            if let RenderBlock::ToolCall(ToolCallBlock::Edit(edit)) = &mut entry.block {
+                let merged_edit_count = edit.edit_count + removed_edit_count;
+                let mut hunks = std::mem::take(&mut edit.hunks);
+                hunks.extend(removed_hunks);
+                edit.set_hunks(crate::diff::stitch_overlapping_hunks(hunks));
+                edit.edit_count = merged_edit_count;
+                edit.highlight = EditHighlightPhase::HunkOnly;
+            }
+            entry.invalidate_cache();
+        }
+        scrollback.mark_structurally_dirty(survivor);
+        scrollback.remove_entry(removed);
+        self.pending_edit_hl.retain(|id| *id != removed);
+        if !is_replay && !self.pending_edit_hl.contains(&survivor) {
+            self.pending_edit_hl.push(survivor);
+        }
     }
     /// Process a single SessionUpdate, mutating the scrollback.
     ///
@@ -712,6 +848,7 @@ impl AcpUpdateTracker {
         self.retry_activity = None;
         self.suppressed_tools.clear();
         self.blocking_waits.clear();
+        self.orphan_updates.clear();
         self.skip_next_skill_body = false;
     }
     /// Finish the current thinking block, passing elapsed time to the entry.
@@ -854,10 +991,11 @@ impl AcpUpdateTracker {
         self.finish_thinking(scrollback);
         self.current_agent_msg = None;
         if is_todo_tool(&tc)
-            || is_goal_tool(&tc)
             || is_bg_plumbing_tool(&tc)
             || is_task_tool(&tc)
+            || is_goal_tool(&tc)
             || is_scheduler_tool(&tc)
+            || is_workflow_tool(&tc)
         {
             if is_task_tool(&tc) {
                 let is_background = tc
@@ -980,7 +1118,6 @@ impl AcpUpdateTracker {
         );
         let tc_id = tcu.tool_call_id.0.to_string();
         if !is_completed {
-            let mut deferred_visible_change = false;
             let defer_as_bg = if let Some(pending) = self.pending_tools.get_mut(&tc_id) {
                 let bash_output = extract_bash_output_from_value(&tcu.fields.raw_output);
                 pending.base.update(tcu.fields);
@@ -996,10 +1133,9 @@ impl AcpUpdateTracker {
                     let drop_placeholder = entry_placeholder && !has_real_command;
                     let desc = extract_raw_field(&pending.base, "description");
                     if drop_placeholder {
-                        deferred_visible_change = pending
-                            .entry_id
-                            .take()
-                            .is_some_and(|id| scrollback.remove_entry(id));
+                        if let Some(id) = pending.entry_id.take() {
+                            scrollback.remove_entry(id);
+                        }
                         Some((tc_id.clone(), desc, false))
                     } else {
                         if let Some(entry_id) = pending.entry_id {
@@ -1015,7 +1151,6 @@ impl AcpUpdateTracker {
                                 kind_changed = verb_group_kind_changed(&entry.block, &block);
                                 entry.block = block;
                                 entry.invalidate_cache();
-                                deferred_visible_change = true;
                             }
                             if kind_changed {
                                 scrollback.mark_structurally_dirty(entry_id);
@@ -1057,9 +1192,6 @@ impl AcpUpdateTracker {
                     self.pending_tools.remove(&deferred_id);
                 }
                 self.bg_deferred_tools.insert(deferred_id, description);
-                if deferred_visible_change && !is_replay {
-                    self.bump_agent_output_epoch();
-                }
                 return false;
             }
             unreachable!("both branches above return");
@@ -1074,6 +1206,7 @@ impl AcpUpdateTracker {
                     self.queue_edit_hl_if_needed(entry_id, &entry.block, is_replay);
                 }
                 scrollback.finish_running(entry_id);
+                self.try_coalesce_edit(entry_id, scrollback, is_replay);
             } else {
                 self.finish_completed_tool(block, scrollback, is_replay);
             }
@@ -1145,6 +1278,21 @@ impl AcpUpdateTracker {
             .and_then(|m| m.get(user_message_chunk_meta::PROMPT_INDEX))
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
+        if let Some(segments) = combined_display_texts_from_chunk(&chunk) {
+            let mut last_id = None;
+            for seg in &segments {
+                last_id = Some(scrollback.push_block(RenderBlock::UserPrompt(
+                    crate::scrollback::blocks::UserPromptBlock::new(seg.clone()),
+                )));
+            }
+            if let (Some(pi), Some(id)) = (prompt_index, last_id)
+                && let Some(entry) = scrollback.get_by_id_mut(id)
+                && let RenderBlock::UserPrompt(ref mut block) = entry.block
+            {
+                block.prompt_index = Some(pi);
+            }
+            return true;
+        }
         let display_override = match &chunk.content {
             acp::ContentBlock::Text(t) => t
                 .meta
@@ -1219,6 +1367,23 @@ impl AcpUpdateTracker {
         }
         true
     }
+}
+/// Per-prompt display strings from combine ([`user_prompt_meta::COMBINED_DISPLAY_TEXTS`]).
+fn combined_display_texts_from_chunk(chunk: &acp::ContentChunk) -> Option<Vec<String>> {
+    let acp::ContentBlock::Text(t) = &chunk.content else {
+        return None;
+    };
+    let arr = t
+        .meta
+        .as_ref()?
+        .get(user_prompt_meta::COMBINED_DISPLAY_TEXTS)?
+        .as_array()?;
+    let segs: Vec<String> = arr
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .filter(|s| !s.is_empty())
+        .collect();
+    (segs.len() >= 2).then_some(segs)
 }
 /// Parse `skillTokenRanges` content-block meta (`[[start, end], …]`) into
 /// byte ranges. Malformed entries are skipped; bounds/boundary validation
@@ -2098,12 +2263,6 @@ fn is_todo_tool(tc: &acp::ToolCall) -> bool {
         "todo_write" | "TodoWrite" | "Updating plan"
     ) || is_todo_variant(extract_variant(tc))
 }
-/// Check if a tool call is a goal-update tool (update_goal).
-///
-/// Suppressed from scrollback because the goal dashboard provides visibility.
-fn is_goal_tool(tc: &acp::ToolCall) -> bool {
-    tc.title == "update_goal" || matches!(extract_variant(tc), Some("UpdateGoal"))
-}
 /// Check if a tool call is a task tool (subagent spawn).
 ///
 /// Suppressed from scrollback because the SubagentBlock (created from
@@ -2112,6 +2271,25 @@ fn is_goal_tool(tc: &acp::ToolCall) -> bool {
 fn is_task_tool(tc: &acp::ToolCall) -> bool {
     matches!(tc.title.as_str(), "task" | "Task" | "spawn_subagent")
         || is_task_variant(extract_variant(tc))
+}
+fn is_goal_tool(tc: &acp::ToolCall) -> bool {
+    tc.title == "update_goal"
+        || tc.title.starts_with("Goal:")
+        || matches!(extract_variant(tc), Some("UpdateGoal" | "WorkflowSignal"))
+}
+fn is_workflow_tool(tc: &acp::ToolCall) -> bool {
+    let is_workflow = tc.title == "workflow" || matches!(extract_variant(tc), Some("Workflow"));
+    if !is_workflow {
+        return false;
+    }
+    let validate_only = tc.title.starts_with("Validating workflow")
+        || tc
+            .raw_input
+            .as_ref()
+            .and_then(|v| v.get("validate_only"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+    !validate_only
 }
 /// Check if a tool call is a scheduler tool (scheduler_create/delete/list).
 ///
@@ -2527,6 +2705,45 @@ mod tests {
             acp::TextContent::new(text.to_string()),
         )))
     }
+    #[test]
+    fn workflow_suppression_keeps_authoring_calls_visible() {
+        let wf = |title: &str, raw: serde_json::Value| {
+            acp::ToolCall::new(acp::ToolCallId::new(Arc::from("t1")), title.to_string())
+                .kind(acp::ToolKind::Other)
+                .status(acp::ToolCallStatus::Pending)
+                .raw_input(Some(raw))
+        };
+        assert!(is_workflow_tool(&wf(
+            "Workflow: deep-research",
+            serde_json::json!({
+            "variant" : "Workflow", "name" : "deep-research" }),
+        )));
+        assert!(is_workflow_tool(&wf(
+            "Workflow: resume run",
+            serde_json::json!({ "variant" :
+            "Workflow", "resume_from_run_id" : "wf_1" }),
+        )));
+        assert!(!is_workflow_tool(&wf(
+            "Validating workflow 'triage'",
+            serde_json::json!({
+            "variant" : "Workflow", "script" : "let meta = ...", "validate_only" : true
+            }),
+        )));
+        assert!(is_workflow_tool(&wf(
+            "Creating workflow 'triage'",
+            serde_json::json!({
+            "variant" : "Workflow", "script" : "let meta = ..." }),
+        )));
+        assert!(!is_workflow_tool(&wf(
+            "workflow",
+            serde_json::json!({ "validate_only" :
+            true }),
+        )));
+        assert!(is_workflow_tool(&wf(
+            "workflow",
+            serde_json::json!({ "name" : "goal" }),
+        )));
+    }
     fn tool_call(id: &str, kind: acp::ToolKind, title: &str) -> acp::SessionUpdate {
         acp::SessionUpdate::ToolCall(
             acp::ToolCall::new(acp::ToolCallId::new(Arc::from(id)), title.to_string())
@@ -2747,10 +2964,22 @@ mod tests {
         tracker.handle_update(thought_chunk("thinking"), &meta(), &mut sb);
         assert!(tracker.current_agent_msg.is_some());
         assert!(tracker.current_thinking.is_some());
+        tracker.handle_update(tool_update_completed("tc-orphan"), &meta(), &mut sb);
+        assert_eq!(tracker.orphan_updates.len(), 1);
+        tracker.task_tool_background.insert("task-x".into(), true);
         tracker.finish_turn(&mut sb);
         assert!(tracker.current_agent_msg.is_none());
         assert!(tracker.current_thinking.is_none());
         assert!(tracker.pending_tools.is_empty());
+        assert!(
+            tracker.orphan_updates.is_empty(),
+            "orphaned tool-call updates are turn-scoped"
+        );
+        assert_eq!(
+            tracker.task_tool_background.get("task-x"),
+            Some(&true),
+            "background Task flags survive turn end for the late SubagentSpawned"
+        );
         assert!(
             !sb.needs_animation(),
             "no entries should be running after finish_turn"
@@ -3968,6 +4197,327 @@ mod tests {
             .locations(vec![]),
             "title_fallback",
         );
+    }
+    /// ToolCall(Pending) start for a search_replace edit.
+    fn edit_tool_start(id: &str) -> acp::SessionUpdate {
+        tool_call(id, acp::ToolKind::Edit, "search_replace")
+    }
+    /// Diff content replacing one line at `line`, so each scripted edit
+    /// yields exactly one `+1/-1` hunk at a distinct position.
+    fn edit_diff_content(path: &str, line: usize) -> acp::ToolCallContent {
+        acp::ToolCallContent::Diff(
+            acp::Diff::new(path, format!("new_{line}"))
+                .old_text(Some(format!("old_{line}")))
+                .meta(
+                    serde_json::json!({ "old_line" : line, "new_line" : line })
+                        .as_object()
+                        .cloned(),
+                ),
+        )
+    }
+    /// Completed update carrying the edit's file_path and one-hunk diff.
+    fn edit_tool_complete(id: &str, path: &str, line: usize) -> acp::SessionUpdate {
+        acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+            acp::ToolCallId::new(Arc::from(id)),
+            acp::ToolCallUpdateFields::new()
+                .kind(Some(acp::ToolKind::Edit))
+                .title(Some(path.to_string()))
+                .raw_input(Some(serde_json::json!({ "file_path" : path })))
+                .content(Some(vec![edit_diff_content(path, line)]))
+                .status(Some(acp::ToolCallStatus::Completed)),
+        ))
+    }
+    /// Full Pending → Completed lifecycle for one scripted edit.
+    fn run_edit(
+        tracker: &mut AcpUpdateTracker,
+        sb: &mut ScrollbackState,
+        id: &str,
+        path: &str,
+        line: usize,
+    ) {
+        tracker.handle_update(edit_tool_start(id), &meta(), sb);
+        tracker.handle_update(edit_tool_complete(id, path, line), &meta(), sb);
+    }
+    /// Pre-completed ToolCall (replay / session-load shape) with the same
+    /// one-hunk diff as [`edit_tool_complete`].
+    fn edit_tool_precompleted(id: &str, path: &str, line: usize) -> acp::SessionUpdate {
+        acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new(acp::ToolCallId::new(Arc::from(id)), path.to_string())
+                .kind(acp::ToolKind::Edit)
+                .status(acp::ToolCallStatus::Completed)
+                .raw_input(Some(serde_json::json!({ "file_path" : path })))
+                .content(vec![edit_diff_content(path, line)])
+                .locations(vec![]),
+        )
+    }
+    fn edit_block_at(sb: &ScrollbackState, idx: usize) -> &EditToolCallBlock {
+        match &sb.get(idx).expect("entry at index").block {
+            RenderBlock::ToolCall(ToolCallBlock::Edit(edit)) => edit,
+            other => panic!("expected Edit block at {idx}, got {other:?}"),
+        }
+    }
+    /// Positions of the edited lines, one per hunk, in hunk order.
+    fn hunk_lines(edit: &EditToolCallBlock) -> Vec<usize> {
+        edit.hunks
+            .iter()
+            .map(|h| {
+                h.iter()
+                    .find(|l| l.tag == similar::ChangeTag::Insert)
+                    .expect("insert line")
+                    .ln
+            })
+            .collect()
+    }
+    #[test]
+    fn adjacent_same_file_edits_coalesce() {
+        std::thread::spawn(|| {
+            crate::appearance::cache::set_collapsed_edit_blocks(true);
+            let mut sb = ScrollbackState::new();
+            let mut tracker = AcpUpdateTracker::new();
+            run_edit(&mut tracker, &mut sb, "e1", "foo.rs", 5);
+            run_edit(&mut tracker, &mut sb, "e2", "foo.rs", 40);
+            assert_eq!(sb.len(), 1, "two adjacent edits must merge into one entry");
+            let edit = edit_block_at(&sb, 0);
+            assert_eq!(edit.hunks.len(), 2);
+            assert_eq!(edit.edit_count, 2);
+            assert_eq!(hunk_lines(edit), vec![5, 40], "hunks keep scrollback order");
+            let inserts: usize = edit
+                .hunks
+                .iter()
+                .flatten()
+                .filter(|l| l.tag == similar::ChangeTag::Insert)
+                .count();
+            assert_eq!(inserts, 2);
+        })
+        .join()
+        .unwrap();
+    }
+    #[test]
+    fn overlapping_adjacent_edits_stitch_into_single_hunk() {
+        std::thread::spawn(|| {
+            crate::appearance::cache::set_collapsed_edit_blocks(true);
+            let mut sb = ScrollbackState::new();
+            let mut tracker = AcpUpdateTracker::new();
+            for (i, line) in (5..=9).enumerate() {
+                run_edit(&mut tracker, &mut sb, &format!("e{i}"), "foo.rs", line);
+            }
+            assert_eq!(sb.len(), 1);
+            let edit = edit_block_at(&sb, 0);
+            assert_eq!(edit.hunks.len(), 1, "contiguous hunks stitch into one");
+            assert_eq!(
+                edit.edit_count, 5,
+                "the (N edits) fallback counts merged calls, not stitched hunks"
+            );
+            let rows: Vec<(similar::ChangeTag, usize)> =
+                edit.hunks[0].iter().map(|l| (l.tag, l.ln)).collect();
+            let expected: Vec<(similar::ChangeTag, usize)> = (5..=9)
+                .flat_map(|ln| {
+                    [
+                        (similar::ChangeTag::Delete, ln),
+                        (similar::ChangeTag::Insert, ln),
+                    ]
+                })
+                .collect();
+            assert_eq!(rows, expected);
+        })
+        .join()
+        .unwrap();
+    }
+    #[test]
+    fn coalesce_disabled_when_collapsed_edit_blocks_off() {
+        std::thread::spawn(|| {
+            crate::appearance::cache::set_collapsed_edit_blocks(false);
+            let mut sb = ScrollbackState::new();
+            let mut tracker = AcpUpdateTracker::new();
+            run_edit(&mut tracker, &mut sb, "e1", "foo.rs", 5);
+            run_edit(&mut tracker, &mut sb, "e2", "foo.rs", 40);
+            assert_eq!(
+                sb.len(),
+                2,
+                "flag off keeps the legacy one-row-per-call transcript"
+            );
+            assert_eq!(edit_block_at(&sb, 0).hunks.len(), 1);
+            assert_eq!(edit_block_at(&sb, 1).hunks.len(), 1);
+        })
+        .join()
+        .unwrap();
+    }
+    #[test]
+    fn three_sequential_edits_chain_into_one() {
+        std::thread::spawn(|| {
+            crate::appearance::cache::set_collapsed_edit_blocks(true);
+            let mut sb = ScrollbackState::new();
+            let mut tracker = AcpUpdateTracker::new();
+            run_edit(&mut tracker, &mut sb, "e1", "foo.rs", 5);
+            run_edit(&mut tracker, &mut sb, "e2", "foo.rs", 20);
+            run_edit(&mut tracker, &mut sb, "e3", "foo.rs", 40);
+            assert_eq!(sb.len(), 1);
+            let edit = edit_block_at(&sb, 0);
+            assert_eq!(edit.hunks.len(), 3);
+            assert_eq!(hunk_lines(edit), vec![5, 20, 40]);
+        })
+        .join()
+        .unwrap();
+    }
+    #[test]
+    fn different_files_do_not_coalesce() {
+        std::thread::spawn(|| {
+            crate::appearance::cache::set_collapsed_edit_blocks(true);
+            let mut sb = ScrollbackState::new();
+            let mut tracker = AcpUpdateTracker::new();
+            run_edit(&mut tracker, &mut sb, "e1", "foo.rs", 5);
+            run_edit(&mut tracker, &mut sb, "e2", "bar.rs", 5);
+            assert_eq!(sb.len(), 2, "edits to different files stay separate");
+        })
+        .join()
+        .unwrap();
+    }
+    #[test]
+    fn intervening_entry_breaks_coalesce_run() {
+        std::thread::spawn(|| {
+            crate::appearance::cache::set_collapsed_edit_blocks(true);
+            let mut sb = ScrollbackState::new();
+            let mut tracker = AcpUpdateTracker::new();
+            run_edit(&mut tracker, &mut sb, "e1", "foo.rs", 5);
+            tracker.handle_update(agent_chunk("first edit done"), &meta(), &mut sb);
+            run_edit(&mut tracker, &mut sb, "e2", "foo.rs", 40);
+            assert_eq!(
+                sb.len(),
+                3,
+                "a visible entry between edits blocks the merge"
+            );
+            assert_eq!(edit_block_at(&sb, 0).hunks.len(), 1);
+            assert_eq!(edit_block_at(&sb, 2).hunks.len(), 1);
+        })
+        .join()
+        .unwrap();
+    }
+    #[test]
+    fn parallel_out_of_order_completion_coalesces() {
+        std::thread::spawn(|| {
+            crate::appearance::cache::set_collapsed_edit_blocks(true);
+            let mut sb = ScrollbackState::new();
+            let mut tracker = AcpUpdateTracker::new();
+            tracker.handle_update(edit_tool_start("e1"), &meta(), &mut sb);
+            tracker.handle_update(edit_tool_start("e2"), &meta(), &mut sb);
+            tracker.handle_update(edit_tool_complete("e2", "foo.rs", 40), &meta(), &mut sb);
+            assert_eq!(sb.len(), 2, "no merge while the earlier call still runs");
+            tracker.handle_update(edit_tool_complete("e1", "foo.rs", 5), &meta(), &mut sb);
+            assert_eq!(sb.len(), 1, "forward check merges once the earlier lands");
+            let edit = edit_block_at(&sb, 0);
+            assert_eq!(
+                hunk_lines(edit),
+                vec![5, 40],
+                "push order, not completion order"
+            );
+        })
+        .join()
+        .unwrap();
+    }
+    #[test]
+    fn errored_edit_does_not_coalesce() {
+        std::thread::spawn(|| {
+            crate::appearance::cache::set_collapsed_edit_blocks(true);
+            let mut sb = ScrollbackState::new();
+            let mut tracker = AcpUpdateTracker::new();
+            run_edit(&mut tracker, &mut sb, "e1", "foo.rs", 5);
+            tracker.handle_update(edit_tool_start("e2"), &meta(), &mut sb);
+            tracker.handle_update(
+                acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                    acp::ToolCallId::new(Arc::from("e2")),
+                    acp::ToolCallUpdateFields::new()
+                        .kind(Some(acp::ToolKind::Edit))
+                        .raw_input(Some(serde_json::json!({ "file_path" : "foo.rs" })))
+                        .status(Some(acp::ToolCallStatus::Failed)),
+                )),
+                &meta(),
+                &mut sb,
+            );
+            assert_eq!(sb.len(), 2, "a failed edit never merges");
+            assert!(edit_block_at(&sb, 1).error.is_some());
+        })
+        .join()
+        .unwrap();
+    }
+    #[test]
+    fn committed_edit_does_not_coalesce() {
+        std::thread::spawn(|| {
+            crate::appearance::cache::set_collapsed_edit_blocks(true);
+            let mut sb = ScrollbackState::new();
+            let mut tracker = AcpUpdateTracker::new();
+            run_edit(&mut tracker, &mut sb, "e1", "foo.rs", 5);
+            sb.mark_committed(0);
+            run_edit(&mut tracker, &mut sb, "e2", "foo.rs", 40);
+            assert_eq!(sb.len(), 2, "a committed row never merges");
+            assert_eq!(edit_block_at(&sb, 0).hunks.len(), 1);
+            assert_eq!(edit_block_at(&sb, 1).hunks.len(), 1);
+        })
+        .join()
+        .unwrap();
+    }
+    #[test]
+    fn untrusted_summary_edit_does_not_coalesce() {
+        std::thread::spawn(|| {
+            crate::appearance::cache::set_collapsed_edit_blocks(true);
+            let mut sb = ScrollbackState::new();
+            let mut tracker = AcpUpdateTracker::new();
+            run_edit(&mut tracker, &mut sb, "e1", "foo.rs", 5);
+            let multi_diff =
+                acp::ToolCall::new(acp::ToolCallId::new(Arc::from("e2")), "foo.rs".to_string())
+                    .kind(acp::ToolKind::Edit)
+                    .status(acp::ToolCallStatus::Completed)
+                    .raw_input(Some(serde_json::json!({ "file_path" : "foo.rs" })))
+                    .content(vec![
+                        edit_diff_content("foo.rs", 40),
+                        edit_diff_content("bar.rs", 7),
+                    ])
+                    .locations(vec![]);
+            tracker.handle_update(acp::SessionUpdate::ToolCall(multi_diff), &meta(), &mut sb);
+            assert_eq!(sb.len(), 2, "an untrusted summary never merges");
+            assert!(edit_block_at(&sb, 1).summary_untrusted);
+        })
+        .join()
+        .unwrap();
+    }
+    #[test]
+    fn replay_precompleted_edits_coalesce_without_hl_queue() {
+        std::thread::spawn(|| {
+            crate::appearance::cache::set_collapsed_edit_blocks(true);
+            let mut sb = ScrollbackState::new();
+            let mut tracker = AcpUpdateTracker::new();
+            let replay = NotificationMeta {
+                is_replay: true,
+                ..Default::default()
+            };
+            tracker.handle_update(edit_tool_precompleted("e1", "foo.rs", 5), &replay, &mut sb);
+            tracker.handle_update(edit_tool_precompleted("e2", "foo.rs", 40), &replay, &mut sb);
+            assert_eq!(sb.len(), 1, "replayed adjacent edits merge like live ones");
+            assert_eq!(hunk_lines(edit_block_at(&sb, 0)), vec![5, 40]);
+            assert!(
+                tracker.take_pending_edit_hl().is_empty(),
+                "replay never queues full-file HL"
+            );
+        })
+        .join()
+        .unwrap();
+    }
+    #[test]
+    fn coalesce_repoints_pending_edit_hl_to_survivor() {
+        std::thread::spawn(|| {
+            crate::appearance::cache::set_collapsed_edit_blocks(true);
+            let mut sb = ScrollbackState::new();
+            let mut tracker = AcpUpdateTracker::new();
+            run_edit(&mut tracker, &mut sb, "e1", "foo.rs", 5);
+            run_edit(&mut tracker, &mut sb, "e2", "foo.rs", 40);
+            let survivor = sb.get(0).unwrap().id;
+            assert_eq!(
+                tracker.take_pending_edit_hl(),
+                vec![survivor],
+                "HL queue holds the survivor exactly once, never the removed id"
+            );
+        })
+        .join()
+        .unwrap();
     }
     fn scrollback_with_respect_manual_folds() -> ScrollbackState {
         use crate::appearance::AppearanceConfig;
@@ -5294,7 +5844,11 @@ mod tests {
             !modified,
             "bg tool deferral should suppress further output streaming"
         );
-        assert_eq!(tracker.agent_output_epoch(), output_epoch + 1);
+        assert_eq!(
+            tracker.agent_output_epoch(),
+            output_epoch,
+            "deferral must not bump the epoch (re-pushes the parked marker)"
+        );
         assert_eq!(sb.len(), 1, "real execute entry kept for demotion");
         assert!(
             !tracker.pending_tools.is_empty(),
@@ -5308,6 +5862,37 @@ mod tests {
             tracker.bg_deferred_tools.get("tc1").unwrap().as_deref(),
             Some("long running task"),
             "description should be extracted from raw_input"
+        );
+    }
+    /// Regression: a bg-tool deferral (here dropping the placeholder row) must
+    /// not bump `agent_output_epoch` — bumping re-pushed the parked marker.
+    #[test]
+    fn bg_tool_deferral_does_not_bump_agent_output_epoch() {
+        let mut sb = ScrollbackState::new();
+        let mut tracker = AcpUpdateTracker::new();
+        tracker.handle_update(
+            tool_call("tc1", acp::ToolKind::Other, "run_terminal_command"),
+            &meta(),
+            &mut sb,
+        );
+        assert_eq!(sb.len(), 1);
+        let epoch = tracker.agent_output_epoch();
+        let update = acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+            acp::ToolCallId::new(Arc::from("tc1")),
+            acp::ToolCallUpdateFields::new()
+                .status(Some(acp::ToolCallStatus::InProgress))
+                .raw_input(Some(serde_json::json!(
+                    { "is_background" : true, "description" :
+                    "long running task" }
+                ))),
+        ));
+        assert!(!tracker.handle_update(update, &meta(), &mut sb));
+        assert_eq!(sb.len(), 0, "placeholder dropped on deferral");
+        assert!(tracker.bg_deferred_tools.contains_key("tc1"));
+        assert_eq!(
+            tracker.agent_output_epoch(),
+            epoch,
+            "deferral must not bump the epoch (re-pushes the parked marker)"
         );
     }
     /// Eager kind=Other title=`run_terminal_command` must not flash in the TUI.

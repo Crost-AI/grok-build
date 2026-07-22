@@ -43,13 +43,37 @@ impl AgentView {
     fn clear_scrollback_selection_state(&mut self) {
         self.update_scrollback_selection_state(Default::default(), Default::default());
     }
+    /// Keep [`Self::timeline_hover_preview`] in sync with [`Self::timeline_hover`].
+    /// Called when hover changes (mouse Moved or rail rebuild under a
+    /// stationary pointer) so render can borrow the cached text.
+    pub(crate) fn sync_timeline_hover_preview(&mut self) {
+        match self.timeline_hover {
+            Some(crate::views::timeline::TimelineHit::Tick(turn_idx)) => {
+                if self
+                    .timeline_hover_preview
+                    .as_ref()
+                    .is_some_and(|(idx, _)| *idx == turn_idx)
+                {
+                    return;
+                }
+                self.timeline_hover_preview = self
+                    .scrollback
+                    .turn_preview(turn_idx)
+                    .map(|text| (turn_idx, text));
+            }
+            _ => self.timeline_hover_preview = None,
+        }
+    }
     /// Open the fullscreen subagent view for `child_sid`, replaying child
     /// `updates.jsonl` when scrollback only has the injected task prompt.
     pub(crate) fn open_subagent_fullscreen(&mut self, child_sid: String) {
-        if self.subagent_views.contains_key(&child_sid) {
-            crate::app::subagent::ensure_subagent_child_replayed(self, &child_sid);
-            self.active_subagent = Some(child_sid);
+        if let Some(child) = self.subagent_views.get_mut(&child_sid) {
+            child.mark_as_subagent_view();
+        } else {
+            return;
         }
+        crate::app::subagent::ensure_subagent_child_replayed(self, &child_sid);
+        self.active_subagent = Some(child_sid);
     }
     /// Shortcut hints for the plan-approval prompt/comment focus states.
     ///
@@ -274,11 +298,12 @@ impl AgentView {
                     selected_entry.is_some_and(|e| e.block.supports_fullscreen()),
                 )
             };
-        let can_demote = self
-            .session
-            .tracker
-            .running_execute_tool_call_id()
-            .is_some();
+        let can_demote = !self.is_subagent_view
+            && self
+                .session
+                .tracker
+                .running_execute_tool_call_id()
+                .is_some();
         let selected_can_kill = if self.active_pane == ActivePane::Catalog {
             false
         } else if self.active_pane == ActivePane::Tasks {
@@ -582,6 +607,7 @@ impl AgentView {
             && inner.height > 3
             && let Some(child_view) = self.subagent_views.get_mut(child_sid)
         {
+            child_view.mark_as_subagent_view();
             let (_, post_flush) = child_view.draw(
                 inner,
                 buf,
@@ -609,7 +635,6 @@ impl AgentView {
     }
     /// `area` is the screen region assigned to this agent view.
     /// When a tracing overlay is visible, this is smaller than `f.area()`.
-    ///
     #[allow(clippy::too_many_arguments)]
     /// Render the agent into `area`.
     ///
@@ -858,6 +883,15 @@ impl AgentView {
             } else {
                 0
             };
+        let jump_view_h = if !self.jump_slot_taken() {
+            if let Some(ref js) = self.jump_state {
+                crate::views::jump::jump_overlay_height(js, area.height)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
         let is_question_input_mode = self
             .question_view
             .as_ref()
@@ -937,6 +971,8 @@ impl AgentView {
                 + question_footer_h
         } else if rewind_view_h > 0 {
             rewind_view_h
+        } else if jump_view_h > 0 {
+            jump_view_h
         } else if cancel_turn_view_h > 0 {
             cancel_turn_view_h
         } else {
@@ -988,6 +1024,7 @@ impl AgentView {
             &self.session.scheduled_tasks,
             self.cron_task_id.as_deref(),
             &queued_cron_ids,
+            &self.workflow_runs,
         );
         if self.active_pane == ActivePane::Tasks && !self.tasks.is_visible() {
             self.active_pane = ActivePane::Scrollback;
@@ -1022,28 +1059,15 @@ impl AgentView {
         }
         let queue_height = self.queue.desired_height();
         let drain_blocked = self.drain_blocked();
-        let watchers = turn_status::Watchers {
-            monitors: self
-                .session
-                .bg_tasks
-                .values()
-                .filter(|t| t.is_monitor && t.status == crate::app::agent::BgTaskStatus::Running)
-                .count(),
-            loops: self.session.scheduled_tasks.len(),
-            subagents: self
-                .subagent_sessions
-                .values()
-                .filter(|s| s.is_running())
-                .count(),
-        };
+        let watchers = self.watchers();
         let parked = self.renders_parked();
-        let turn_status_height = if !parked
-            && turn_status::should_show(
-                &self.session.state,
-                drain_blocked,
-                self.mcp_init_progress.as_ref(),
-                watchers,
-            ) {
+        let turn_status_height = if turn_status::should_show(
+            &self.session.state,
+            drain_blocked,
+            self.mcp_init_progress.as_ref(),
+            watchers,
+            parked,
+        ) {
             1
         } else {
             0
@@ -1066,10 +1090,17 @@ impl AgentView {
             _ => 1,
         };
         let follow_ups_height = u16::from(self.follow_ups.is_some());
+        let timeline_width = crate::views::timeline::rail_width(
+            appearance.show_timeline,
+            self.is_subagent_view,
+            area.width,
+            self.scrollback.turn_count(),
+        );
         let mut layout = AgentViewLayout::compute(
             area,
             layout_cfg,
             scrollbar_cfg,
+            timeline_width,
             prompt_height,
             tasks_height,
             catalog_height,
@@ -1097,6 +1128,89 @@ impl AgentView {
                 .height
                 .saturating_sub(search_reserved_rows);
         }
+        let overlay_blocks_rail_hover = self.jump_state.is_some()
+            || self.rewind_state.is_some()
+            || self.question_view.is_some()
+            || !self.permission_queue.is_empty()
+            || self.cancel_turn_view.is_some()
+            || self.block_viewer.is_some();
+        if layout.timeline_width > 0 {
+            self.sync_pending_user_input_marks();
+            self.scrollback.set_cwd(Some(self.session.cwd.clone()));
+            let _ = self.sync_inline_edit_layout(layout.scrollback_content.width);
+            self.scrollback.prepare_layout(
+                layout.scrollback_content.width,
+                layout.scrollback_content.height,
+            );
+            let viewport = crate::views::timeline::RailViewport {
+                active: self.scrollback.active_turn_for_viewport(),
+                up_target: self.scrollback.turn_above_viewport_top(),
+                down_target: self.scrollback.turn_below_viewport_top(),
+                at_bottom: !self.scrollback.has_content_below(),
+            };
+            match crate::views::timeline::compute_rail(
+                layout.scrollback,
+                layout.timeline_x,
+                self.scrollback.turn_count(),
+                viewport,
+            ) {
+                Some(rail) => {
+                    self.timeline_rail = Some(rail);
+                    if overlay_blocks_rail_hover {
+                        self.timeline_hover = None;
+                        self.timeline_hover_preview = None;
+                    } else {
+                        let (col, row) = self.last_mouse_pos;
+                        let new_hover = self.timeline_rail.as_ref().and_then(|r| r.hit(col, row));
+                        if new_hover != self.timeline_hover {
+                            self.timeline_hover = new_hover;
+                            self.sync_timeline_hover_preview();
+                        }
+                    }
+                }
+                None => {
+                    self.timeline_rail = None;
+                    self.timeline_hover = None;
+                    self.timeline_hover_preview = None;
+                    layout = AgentViewLayout::compute(
+                        area,
+                        layout_cfg,
+                        scrollbar_cfg,
+                        0,
+                        prompt_height,
+                        tasks_height,
+                        catalog_height,
+                        todo_height,
+                        queue_height,
+                        btw_height,
+                        turn_status_height,
+                        banner_height,
+                        cta_height,
+                        follow_ups_height,
+                        0,
+                        prompt_gap,
+                        voice_recording_height,
+                        1,
+                        compact,
+                    );
+                    if search_reserved_rows > 0 {
+                        layout.scrollback.height -= search_reserved_rows;
+                        layout.scrollback_content.height = layout
+                            .scrollback_content
+                            .height
+                            .saturating_sub(search_reserved_rows);
+                    }
+                    self.scrollback.prepare_layout(
+                        layout.scrollback_content.width,
+                        layout.scrollback_content.height,
+                    );
+                }
+            }
+        } else {
+            self.timeline_rail = None;
+            self.timeline_hover = None;
+            self.timeline_hover_preview = None;
+        }
         agent::fill_background(buf, area, layout_cfg, compact, &theme);
         use crate::views::agent_status::AgentStatusBar;
         use crate::views::context_bar;
@@ -1116,6 +1230,7 @@ impl AgentView {
             &self.session.bg_tasks,
             &self.subagent_sessions,
             &self.session.scheduled_tasks,
+            &self.workflow_runs,
         );
         if running_count > 0 {
             let spinner_frames = crate::glyphs::dot_spinner_frames();
@@ -1143,7 +1258,7 @@ impl AgentView {
             let active_subagent_tokens: u64 = self
                 .subagent_sessions
                 .values()
-                .filter(|s| !s.finished)
+                .filter(|s| !s.finished && s.workflow_run_id.is_none())
                 .filter_map(|s| s.tokens_used)
                 .sum();
             status.push(
@@ -1346,8 +1461,10 @@ impl AgentView {
             self.scrollback.set_cwd(Some(self.session.cwd.clone()));
             let inline_edit_dim_from =
                 self.sync_inline_edit_layout(layout.scrollback_content.width);
-            self.scrollback
-                .prepare_layout(layout.scrollback.width, layout.scrollback.height);
+            self.scrollback.prepare_layout(
+                layout.scrollback_content.width,
+                layout.scrollback_content.height,
+            );
             let rewind_dim_from = self.rewind_dim_from_entry().or(inline_edit_dim_from);
             let sb_focused = self.active_pane == ActivePane::Scrollback && !overlay_focused;
             let search_highlight = if search_active {
@@ -1399,26 +1516,47 @@ impl AgentView {
                     );
                 }
                 let query = search.query();
-                crate::views::picker::render_search_bar(
-                    buf,
-                    layout.scrollback.x,
-                    bar_y,
-                    layout.scrollback.width,
-                    &theme,
-                    query,
-                    search.is_composing(),
-                    !search.is_composing(),
-                    query.len(),
-                    None,
-                );
                 let counter = match search.current_index() {
                     Some(i) => Some(format!("{}/{}", i + 1, search.match_count())),
                     None if search.has_error() => Some("bad pattern".to_string()),
                     None if !query.is_empty() => Some("no matches".to_string()),
                     None => None,
                 };
-                if let Some(counter) = counter {
-                    let w = counter.len() as u16;
+                let counter_width = counter
+                    .as_deref()
+                    .map_or(0, |text| UnicodeWidthStr::width(text) as u16);
+                let search_layout =
+                    crate::views::picker::search_bar_layout(layout.scrollback.width, counter_width);
+                let leading_query;
+                let (rendered_query, viewport) = if search.is_composing() {
+                    (
+                        query,
+                        Some(search.query_viewport(search_layout.input_width())),
+                    )
+                } else {
+                    leading_query =
+                        crate::render::line_utils::truncate_str(query, search_layout.input_width());
+                    (leading_query.as_str(), None)
+                };
+                crate::views::picker::render_search_bar_with_viewport(
+                    buf,
+                    layout.scrollback.x,
+                    bar_y,
+                    search_layout,
+                    &theme,
+                    rendered_query,
+                    search.is_composing(),
+                    !search.is_composing(),
+                    None,
+                    viewport.unwrap_or(xai_ratatui_textarea::SingleLineViewport {
+                        visible_byte_range: 0..rendered_query.len(),
+                        cursor_display_column: 0,
+                    }),
+                );
+                if let Some(counter) = counter
+                    && search_layout.trailing_width() > 0
+                {
+                    let w = UnicodeWidthStr::width(counter.as_str()) as u16;
                     if layout.scrollback.width > w {
                         buf.set_string(
                             layout.scrollback.x + layout.scrollback.width - w,
@@ -1500,16 +1638,19 @@ impl AgentView {
                 self.hit_sb_copy.clear();
                 self.hit_sb_view.clear();
             }
-            agent::render_scrollbar(
-                buf,
-                layout.scrollback,
-                layout.scrollbar_x,
-                scrollbar_cfg,
-                sb_output.scroll_info,
-                self.scrollback.is_follow_mode(),
-                &theme,
-            );
-            if scrollbar_cfg.enabled && sb_output.scroll_info.is_some() {
+            let rail_shown = self.timeline_rail.is_some();
+            if !rail_shown {
+                agent::render_scrollbar(
+                    buf,
+                    layout.scrollback,
+                    layout.scrollbar_x,
+                    scrollbar_cfg,
+                    sb_output.scroll_info,
+                    self.scrollback.is_follow_mode(),
+                    &theme,
+                );
+            }
+            if !rail_shown && scrollbar_cfg.enabled && sb_output.scroll_info.is_some() {
                 self.hit_scrollbar.set(Some(Rect {
                     x: layout.scrollbar_x,
                     y: layout.scrollback.y,
@@ -1518,6 +1659,28 @@ impl AgentView {
                 }));
             } else {
                 self.hit_scrollbar.clear();
+            }
+            if let Some(ref rail) = self.timeline_rail {
+                crate::views::timeline::render_rail(buf, rail, self.timeline_hover, &theme);
+                if let Some(crate::views::timeline::TimelineHit::Tick(turn_idx)) =
+                    self.timeline_hover
+                {
+                    let preview = self
+                        .timeline_hover_preview
+                        .as_ref()
+                        .filter(|(idx, _)| *idx == turn_idx)
+                        .map(|(_, text)| text.as_str());
+                    if let Some(preview) = preview {
+                        crate::views::timeline::render_tick_hover_popup(
+                            buf,
+                            rail,
+                            layout.scrollback,
+                            turn_idx,
+                            preview,
+                            &theme,
+                        );
+                    }
+                }
             }
         }
         if self.block_viewer.is_none() && !search_active {
@@ -1575,25 +1738,26 @@ impl AgentView {
         }
         if let Some(msg) = self.active_toast_message() {
             let sb = layout.scrollback;
-            let toast_text = format!(" {msg} ");
-            let w = toast_text.chars().count() as u16;
-            if sb.height > 0 && sb.width > w + 2 {
-                let x = sb.right().saturating_sub(w + 1);
-                let y = sb.bottom().saturating_sub(1);
-                for (i, ch) in toast_text.chars().enumerate() {
-                    if let Some(cell) = buf.cell_mut((x + i as u16, y)) {
-                        cell.set_char(ch);
-                        cell.fg = theme.accent_user;
-                        cell.bg = theme.bg_base;
-                        cell.modifier = ratatui::prelude::Modifier::BOLD;
+            if let Some(toast_text) = fit_toast_text(msg, sb.width) {
+                let w = toast_text.chars().count() as u16;
+                if sb.height > 0 {
+                    let x = sb.right().saturating_sub(w + 1);
+                    let y = sb.bottom().saturating_sub(1);
+                    for (i, ch) in toast_text.chars().enumerate() {
+                        if let Some(cell) = buf.cell_mut((x + i as u16, y)) {
+                            cell.set_char(ch);
+                            cell.fg = theme.accent_user;
+                            cell.bg = theme.bg_base;
+                            cell.modifier = ratatui::prelude::Modifier::BOLD;
+                        }
                     }
+                    self.frame_occluder_rects.push(Rect {
+                        x,
+                        y,
+                        width: w,
+                        height: 1,
+                    });
                 }
-                self.frame_occluder_rects.push(Rect {
-                    x,
-                    y,
-                    width: w,
-                    height: 1,
-                });
             }
         }
         if tasks_height > 0 {
@@ -1800,11 +1964,12 @@ impl AgentView {
                 self.hit_cancel_button.rect = None;
                 self.hit_bg_button.rect = None;
             } else {
-                let has_running_execute = self
-                    .session
-                    .tracker
-                    .running_execute_tool_call_id()
-                    .is_some();
+                let has_running_execute = !self.is_subagent_view
+                    && self
+                        .session
+                        .tracker
+                        .running_execute_tool_call_id()
+                        .is_some();
                 let is_pending_user_input =
                     !self.permission_queue.is_empty() || self.question_view.is_some();
                 let goal_verifying = self
@@ -1833,6 +1998,7 @@ impl AgentView {
                     is_pending_user_input,
                     goal_verifying,
                     watchers,
+                    parked,
                     false,
                     held_queue,
                     held_queue_top_sendable,
@@ -2031,17 +2197,11 @@ impl AgentView {
         }
         let mode_flags: &[PromptFlag] = &mode_flags_vec;
         let multiline = self.multiline_mode;
-        let usage_visible = self
-            .prompt
-            .slash_controller
-            .registry()
-            .get("usage")
-            .is_some();
         let warning = self.credit_balance.as_ref().and_then(|bal| {
             crate::views::credit_bar::usage_warning_for_session(
                 bal,
                 self.auto_topup.as_ref(),
-                usage_visible,
+                self.billing_surface_visible,
                 self.chat_kind,
             )
         });
@@ -2492,6 +2652,10 @@ impl AgentView {
                     &rw.phase,
                     prompt_focused,
                 );
+            }
+        } else if jump_view_h > 0 {
+            if let Some(ref js) = self.jump_state {
+                crate::views::jump::render_jump_overlay(buf, layout.prompt, js, prompt_focused);
             }
         } else if cancel_turn_view_h > 0 {
             let buttons = &mut self.cancel_turn_buttons;
@@ -3613,19 +3777,19 @@ impl AgentView {
                     buf.set_string(content_x, status_y, &status, status_style);
                 }
             }
-            if let Some(ref msg) = block_viewer_toast {
-                let toast_text = format!(" {msg} ");
-                let w = toast_text.len() as u16;
-                if popup_area.height > 2 && popup_area.width > w + 2 {
-                    let tx = popup_area.right().saturating_sub(w + 2);
-                    let ty = popup_area.bottom().saturating_sub(2);
-                    for (i, ch) in toast_text.chars().enumerate() {
-                        if let Some(cell) = buf.cell_mut((tx + i as u16, ty)) {
-                            cell.set_char(ch);
-                            cell.fg = theme.accent_user;
-                            cell.bg = theme.bg_base;
-                            cell.modifier = ratatui::prelude::Modifier::BOLD;
-                        }
+            if let Some(ref msg) = block_viewer_toast
+                && popup_area.height > 2
+                && let Some(toast_text) = fit_toast_text(msg, popup_area.width.saturating_sub(1))
+            {
+                let w = toast_text.chars().count() as u16;
+                let tx = popup_area.right().saturating_sub(w + 2);
+                let ty = popup_area.bottom().saturating_sub(2);
+                for (i, ch) in toast_text.chars().enumerate() {
+                    if let Some(cell) = buf.cell_mut((tx + i as u16, ty)) {
+                        cell.set_char(ch);
+                        cell.fg = theme.accent_user;
+                        cell.bg = theme.bg_base;
+                        cell.modifier = ratatui::prelude::Modifier::BOLD;
                     }
                 }
             }
@@ -3964,7 +4128,7 @@ impl AgentView {
             let active_subagent_tokens: u64 = self
                 .subagent_sessions
                 .values()
-                .filter(|s| !s.finished)
+                .filter(|s| !s.finished && s.workflow_run_id.is_none())
                 .filter_map(|s| s.tokens_used)
                 .sum();
             let close_rect = crate::views::goal_detail::render_goal_detail(
@@ -3979,6 +4143,18 @@ impl AgentView {
             );
             self.hit_goal_close.rect = close_rect;
             self.frame_occluder_rects.push(overlay_rect);
+        }
+        if self.show_workflows {
+            let runs = self.workflow_runs_newest_first();
+            let mut view = self.workflows_view.clone();
+            view.normalize(&runs);
+            let tick = self.tasks.tick_count() as usize;
+            let popup =
+                crate::views::workflows::render_workflows(buf, area, &runs, &mut view, tick);
+            self.workflows_view = view;
+            if let Some(popup) = popup {
+                self.frame_occluder_rects.push(popup);
+            }
         }
         self.pane_areas = layout.pane_areas();
         {
@@ -3998,12 +4174,19 @@ impl AgentView {
                                 && r.x < link.col_end
                         })
                     })
-                    .map(|link| xai_ratatui_inline::LinkSpan {
-                        row: link.screen_row,
-                        col_start: link.col_start,
-                        col_end: link.col_end,
-                        url: link.url.clone(),
-                        id: if emit_id { link.id } else { None },
+                    .filter_map(|link| {
+                        crate::render::osc8::resolve_link_target_with_presentation(
+                            &link.target,
+                            link.presentation,
+                        )
+                        .and_then(|resolved| resolved.osc8_url)
+                        .map(|url| xai_ratatui_inline::LinkSpan {
+                            row: link.screen_row,
+                            col_start: link.col_start,
+                            col_end: link.col_end,
+                            url,
+                            id: if emit_id { link.id } else { None },
+                        })
                     })
                     .collect();
                 self.push_promo_cta_link_span(
@@ -4041,6 +4224,43 @@ impl AgentView {
             prompt_cursor_pos
         };
         (cursor, prompt_post_flush)
+    }
+}
+/// Pad `msg` for the toast slot, truncating with a trailing ellipsis when it
+/// cannot fit in `avail_width` columns (long clipboard toasts embed backup
+/// file paths — dropping the whole toast would hide the copy feedback
+/// entirely). Returns `None` only when the slot is too narrow for any text.
+fn fit_toast_text(msg: &str, avail_width: u16) -> Option<String> {
+    let max_msg_chars = (avail_width as usize).saturating_sub(4);
+    if max_msg_chars == 0 {
+        return None;
+    }
+    let msg_chars = msg.chars().count();
+    if msg_chars <= max_msg_chars {
+        return Some(format!(" {msg} "));
+    }
+    let truncated: String = msg.chars().take(max_msg_chars.saturating_sub(1)).collect();
+    Some(format!(" {}… ", truncated.trim_end()))
+}
+#[cfg(test)]
+mod toast_fit_tests {
+    use super::fit_toast_text;
+    #[test]
+    fn short_message_is_padded_untouched() {
+        assert_eq!(fit_toast_text("Copied!", 40).as_deref(), Some(" Copied! "));
+    }
+    #[test]
+    fn long_message_truncates_with_ellipsis_instead_of_vanishing() {
+        let msg = "Copied via OSC 52 — also saved to /tmp/grok-0/last-copy.txt. If paste fails, hold Shift (or Fn) and drag to select & copy natively.";
+        let fitted = fit_toast_text(msg, 60).expect("must render truncated");
+        assert!(fitted.chars().count() <= 58);
+        assert!(fitted.ends_with("… "));
+        assert!(fitted.contains("also saved to"));
+    }
+    #[test]
+    fn zero_width_slot_yields_none() {
+        assert_eq!(fit_toast_text("Copied!", 4), None);
+        assert_eq!(fit_toast_text("Copied!", 0), None);
     }
 }
 #[cfg(test)]

@@ -4,7 +4,6 @@
 //! Pure env-map helpers (`detect_*_from_env`) enable full matrix testing.
 
 use std::collections::HashMap;
-use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -16,6 +15,7 @@ pub mod image;
 pub mod keyboard;
 pub mod overlay;
 pub(crate) mod probe;
+pub mod tmux_probe;
 pub mod xtversion;
 
 pub use embedded_editor::{EmbeddedEditor, embedded_editor_from_env};
@@ -23,7 +23,10 @@ pub use hyperlinks::{
     HyperlinkCapabilities, Osc8Support, SchemeFilter, SetDefaultCursor, SetPointerCursor,
     hyperlink_capabilities,
 };
-pub use keyboard::{KeyboardCapabilities, ModifierDelivery, ModifierFate, keyboard_capabilities};
+pub use keyboard::{
+    KeyboardCapabilities, ModifierDelivery, ModifierFate, keyboard_capabilities,
+    keyboard_capabilities_for_host,
+};
 
 #[cfg(test)]
 mod test;
@@ -62,29 +65,6 @@ pub fn set_kitty_flags_pushed(v: bool) {
 /// Used by teardown paths so concurrent callers cannot both pop.
 pub fn take_kitty_flags_pushed() -> bool {
     KITTY_FLAGS_PUSHED.swap(false, Ordering::AcqRel)
-}
-
-/// Run `tmux show-option -gqv <option>` and return the trimmed value,
-/// or `None` if the subprocess fails or returns empty / whitespace.
-/// Stderr is suppressed so startup probes don't leak shell noise.
-pub fn tmux_show_option(option: &str) -> Option<String> {
-    let mut cmd = Command::new("tmux");
-    cmd.args(["show-option", "-gqv", option])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    xai_tty_utils::detach_std_command(&mut cmd);
-    let output = cmd.output().ok()?;
-    parse_tmux_show_option_output(output.status.success(), &output.stdout)
-}
-
-/// Pure post-processing for `tmux show-option`: collapses subprocess
-/// failure, empty stdout, and whitespace-only stdout to `None`.
-pub fn parse_tmux_show_option_output(status_success: bool, stdout: &[u8]) -> Option<String> {
-    if !status_success {
-        return None;
-    }
-    let val = String::from_utf8_lossy(stdout).trim().to_string();
-    if val.is_empty() { None } else { Some(val) }
 }
 
 /// Known terminal emulator categories.
@@ -282,6 +262,8 @@ pub struct TerminalContext {
     pub tmux_meta: TmuxClientMeta,
     /// Whether the session is inside a remote SSH connection.
     pub is_ssh: bool,
+    /// Positive evidence that SSH is hosted by the official VS Code remote server.
+    pub is_official_vscode_remote: bool,
     /// The raw `TERM` environment variable (e.g. `xterm-256color`, `screen`).
     pub term_var: Option<String>,
     /// The tmux server version (e.g. `"tmux 3.4"`), populated only when
@@ -637,6 +619,23 @@ pub fn terminal_context() -> &'static TerminalContext {
     TERMINAL_CONTEXT.get_or_init(detect_terminal_context)
 }
 
+/// Detect terminal environment facts without any live tmux subprocesses.
+///
+/// Standalone diagnostics use this so an unhealthy tmux server cannot block
+/// before the diagnostic runner has a chance to report unavailable evidence.
+pub fn standalone_terminal_context() -> TerminalContext {
+    standalone_terminal_context_from_env(&collect_process_env(), HostOs::current())
+}
+
+fn standalone_terminal_context_from_env(
+    env: &HashMap<String, String>,
+    host: HostOs,
+) -> TerminalContext {
+    let mut ctx = build_terminal_context_from_env(env);
+    ctx.brand = refine_unknown_brand_for_host(ctx.brand, host);
+    ctx
+}
+
 /// Build a [`TerminalContext`] from the current process environment.
 fn detect_terminal_context() -> TerminalContext {
     let env = collect_process_env();
@@ -664,6 +663,16 @@ fn collect_process_env() -> HashMap<String, String> {
 /// values.
 fn env_get<'a>(env: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
     env.get(key).map(|v| v.as_str()).filter(|v| !v.is_empty())
+}
+
+fn is_official_vscode_remote_askpass(path: &str) -> bool {
+    std::path::Path::new(path).components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(name)
+                if name == ".vscode-server" || name == ".vscode-server-insiders"
+        )
+    })
 }
 
 /// Detect the terminal brand from an injected environment map.
@@ -935,6 +944,8 @@ pub fn build_terminal_context_from_env(env: &HashMap<String, String>) -> Termina
     let is_ssh = env_get(env, "SSH_CONNECTION").is_some()
         || env_get(env, "SSH_TTY").is_some()
         || env_get(env, "SSH_CLIENT").is_some();
+    let is_official_vscode_remote = is_ssh
+        && env_get(env, "VSCODE_GIT_ASKPASS_MAIN").is_some_and(is_official_vscode_remote_askpass);
     let term_var = env_get(env, "TERM").map(|s| s.to_owned());
     let vte_version = env_get(env, "VTE_VERSION").map(|s| s.to_owned());
     // SSH strips TERM_PROGRAM_VERSION; iTerm2 LC_TERMINAL_VERSION survives.
@@ -950,6 +961,7 @@ pub fn build_terminal_context_from_env(env: &HashMap<String, String>) -> Termina
         embedded_editor,
         tmux_meta,
         is_ssh,
+        is_official_vscode_remote,
         term_var,
         tmux_version: None,
         vte_version,
@@ -1005,70 +1017,24 @@ pub enum AltScreenMode {
 
 /// Detect whether the current tmux session is in control mode.
 ///
-/// tmux control mode is detected by checking the `client_flags` on the
-/// current client. In control mode, the flags contain "control-mode".
-///
 /// Returns `false` when not inside tmux or when the query fails.
 pub fn detect_tmux_control_mode(ctx: &TerminalContext) -> bool {
     if ctx.multiplexer != MultiplexerKind::Tmux {
         return false;
     }
-    detect_tmux_control_mode_subprocess()
-}
-
-/// Subprocess-based control-mode detection.
-///
-/// Queries `tmux display-message -p "#{client_flags}"` and checks whether
-/// the output contains `"control-mode"`.
-fn detect_tmux_control_mode_subprocess() -> bool {
-    let mut cmd = std::process::Command::new("tmux");
-    cmd.args(["display-message", "-p", "#{client_flags}"])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    xai_tty_utils::detach_std_command(&mut cmd);
-    cmd.output()
-        .ok()
-        .and_then(|out| {
-            if out.status.success() {
-                let flags = String::from_utf8_lossy(&out.stdout);
-                Some(flags.contains("control-mode"))
-            } else {
-                None
-            }
-        })
+    tmux_probe::query_control_mode()
+        .into_option()
         .unwrap_or(false)
 }
 
 /// Detect the tmux server version by running `tmux -V`.
-///
-/// Returns the trimmed version string (e.g. `"tmux 3.4"`) on success,
-/// or `None` when not inside tmux or when the subprocess fails.
-/// Only call this when `ctx.is_tmux_backed()` is true.
 pub fn detect_tmux_version() -> Option<String> {
-    let mut cmd = std::process::Command::new("tmux");
-    cmd.arg("-V")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    xai_tty_utils::detach_std_command(&mut cmd);
-    cmd.output().ok().and_then(|out| {
-        if out.status.success() {
-            let version = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-            if version.is_empty() {
-                None
-            } else {
-                Some(version)
-            }
-        } else {
-            None
-        }
-    })
+    tmux_probe::query_version().into_option()
 }
 
-/// Trimmed value of tmux's global `extended-keys` option, or `None` if
-/// the subprocess fails or the option is unset / empty. Only call this
-/// when `ctx.is_tmux_backed()` is true.
+/// Trimmed value of tmux's global `extended-keys` option.
 pub fn detect_tmux_extended_keys() -> Option<String> {
-    tmux_show_option("extended-keys")
+    tmux_probe::query_option("extended-keys").into_option()
 }
 
 /// Parse major.minor from a plain semver-ish string like `"3.6.0"` or `"1.2"`.

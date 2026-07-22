@@ -3,6 +3,7 @@ mod auth;
 mod billing;
 mod cta_e2e;
 mod dashboard;
+mod jump;
 mod modes;
 mod notes;
 mod permissions;
@@ -112,6 +113,7 @@ fn test_app() -> AppView {
         auto_mode_gate: true,
         yolo_policy_block: None,
         yolo_launch_block_notice: None,
+        screen_mode_switch_hint: None,
         require_plan_approval: false,
         plan_mode: false,
         chat_mode: false,
@@ -124,6 +126,7 @@ fn test_app() -> AppView {
         tip_seen_counts: Default::default(),
         last_known_terminal_rows: 0,
         small_screen_tip_evaluated: false,
+        ssh_wrap_tip_evaluated: false,
         clipboard_focus_tip: Default::default(),
         new_session_worktree_mode: crate::app::app_view::WorktreeMode::Never,
         fork_worktree_mode: crate::app::app_view::WorktreeMode::Ask,
@@ -139,11 +142,13 @@ fn test_app() -> AppView {
         login_label: None,
         login_method_id: None,
         auth_start_mode: AuthMode::Pending,
-        auth_code_input: String::new(),
+        auth_code_input: Default::default(),
         next_auth_request_seq: 1,
+        auth_url_poll_handle: None,
         deferred_startup: Default::default(),
         auth_use_oauth: false,
-        auth_clipboard_copied: false,
+        auth_clipboard_delivery: None,
+        auth_clipboard_feedback_generation: 0,
         team_id: None,
         team_name: None,
         is_zdr: false,
@@ -198,6 +203,7 @@ fn test_app() -> AppView {
             crate::views::picker::PickerMode::FullScreen,
         ),
         session_picker_source_filter: crate::views::session_picker::SourceFilter::default(),
+        session_picker_relaxed_notified_for: None,
         session_picker_content_results: None,
         session_picker_content_loading: false,
         session_picker_deep_search_seq: 0,
@@ -221,8 +227,7 @@ fn test_app() -> AppView {
         welcome_doc_viewer: None,
         screen_mode: crate::app::ScreenMode::Inline,
         pending_effects: Vec::new(),
-        pending_editor_path: None,
-        pending_agents_modal_refresh: None,
+        pending_editor: None,
         pending_pager_path: None,
         pending_pager_ansi: false,
         minimal_state: crate::minimal_api::MinimalState::default(),
@@ -246,6 +251,7 @@ fn test_app() -> AppView {
         cancel_rewind_enabled: true,
         session_recap_available: false,
         dashboard: None,
+        dashboard_return: None,
         dashboard_persisted: None,
         keyboard_normalizer: crate::input::KeyboardNormalizer::from_terminal_context(),
         has_claude_import: false,
@@ -345,6 +351,7 @@ fn make_test_subagent(child_sid: &str, sa_id: &str) -> crate::app::subagent::Sub
         context_source: None,
         resumed_from: None,
         capability_mode: None,
+        workflow_run_id: None,
         context_normalized: false,
         parent_prompt_id: None,
         started_at: std::time::Instant::now(),
@@ -421,6 +428,9 @@ fn cta_mcp_server(
         status,
         tool_count: 0,
         auth_required: matches!(status, McpServerDisplayStatus::NeedsAuth),
+        setup_required: false,
+        setup: None,
+        setup_values: std::collections::HashMap::new(),
         tools: vec![],
         enabled: true,
         source: plugin

@@ -9,22 +9,11 @@ use std::time::{Duration, Instant};
 
 use crate::{ContentController, PtyHarness};
 
-/// Pump PTY output until every label in `labels` is absent from the screen, or
-/// until `timeout` elapses. Reattach tests use this to wait out a slow replay
-/// before the negative spinner asserts — a fixed-duration settle would flake
-/// under host load. On timeout it returns and lets the caller's assert produce
-/// the rich screen-dump failure.
+/// Pump PTY output until every label is absent from the visible screen.
 pub fn wait_for_labels_absent(h: &mut PtyHarness, labels: &[&str], timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if labels.iter().all(|l| !h.contains_text(l)) {
-            return;
-        }
-        if Instant::now() >= deadline {
-            return;
-        }
-        h.update(Duration::from_millis(100));
-    }
+    let _ = h.wait_until("screen labels to disappear", timeout, |h| {
+        labels.iter().all(|label| !h.contains_text(label))
+    });
 }
 
 /// Submit `prompt` from `h`, then keep re-pressing Enter until the turn
@@ -81,9 +70,13 @@ pub fn inference_request_count(content: &ContentController) -> usize {
 /// Seed a fake xAI OAuth entry into the isolated home's `auth.json` so the
 /// shell has session auth (the harness's `XAI_API_KEY` is ApiKey/BYOK mode
 /// and never enters the auth manager). Load-bearing details: the scope key
-/// must be `<issuer>::<client_id>`, `auth_mode` must be `oidc`, and
-/// `expires_at` must be far-future so no network refresh is attempted; the
-/// mock server accepts any bearer. Pair with [`oauth_env_for_pager`].
+/// must be `<issuer>::<client_id>`, `auth_mode` must be `oidc`,
+/// `expires_at` must be far-future so no network refresh is attempted, and
+/// `coding_data_retention_opt_out` must be `false` so collection/upload-path
+/// e2es (e.g. storage park-on-401) still enqueue traces — missing that field
+/// now deserializes as opted-out via
+/// `default_coding_data_retention_opt_out()`. The mock server accepts any
+/// bearer. Pair with [`oauth_env_for_pager`].
 pub fn seed_fake_oauth(content: &ContentController, user: &str) {
     let grok_home = content.home().join(".grok");
     std::fs::create_dir_all(&grok_home).expect("create temp .grok");
@@ -100,7 +93,8 @@ pub fn seed_fake_oauth(content: &ContentController, user: &str) {
     "expires_at": "2030-01-01T00:00:00Z",
     "refresh_token": "pty-test-refresh-token",
     "oidc_issuer": "https://auth.x.ai",
-    "oidc_client_id": "b1a00492-073a-47ea-816f-4c329264a828"
+    "oidc_client_id": "b1a00492-073a-47ea-816f-4c329264a828",
+    "coding_data_retention_opt_out": false
   }}
 }}"#
         ),

@@ -6,8 +6,8 @@ pub(crate) use serde_json::json;
 pub(crate) use std::path::Path;
 pub(crate) use std::time::{Duration, Instant};
 pub(crate) use xai_grok_pager_pty_harness::{
-    ContentController, MockModel, PtyHarness, ScriptedResponse, SseEvent, keys,
-    oauth_env_for_pager, pager_binary, seed_fake_oauth, sse, wait_for_labels_absent,
+    AgentTurnExpectation, ContentController, MockModel, PtyHarness, ScriptedResponse, SseEvent,
+    keys, oauth_env_for_pager, pager_binary, seed_fake_oauth, sse, wait_for_labels_absent,
     wait_for_model_via_new_sessions,
 };
 
@@ -21,6 +21,17 @@ pub(crate) const DEFAULT_COLS: u16 = 120;
 /// Default wait-for-welcome timeout. The pager spawns a child shell agent,
 /// which can take a few seconds on cold build directories.
 pub(crate) const WELCOME_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Wait budget for a `--continue` / resume to replay the prior transcript back
+/// into scrollback. Resume is strictly heavier than a cold start: it runs
+/// `session/load` (MCP startup, git chores, a full `updates.jsonl` replay, and
+/// session spawn) on the agent's single-threaded runtime, and the client-side
+/// `acp_send` has no timeout — so under the fully-parallel pty_e2e suite the
+/// starved agent thread can push this well past the 20s `WELCOME_TIMEOUT`
+/// (leaving the "Loading session…" placeholder up). Sized generously for the
+/// same contention reason as `WRAP_TIMEOUT`, not because resume is slow when
+/// run alone.
+pub(crate) const RESUME_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Substring we wait for on the welcome screen. Matches the menu label `"Quit"`
 /// (`render_welcome_done` / gate menus); case-sensitive, so it does **not**
@@ -485,23 +496,6 @@ pub(crate) fn spawn_esc_double_press_pager(content: &ContentController) -> PtyHa
     PtyHarness::new(&binary, DEFAULT_ROWS, DEFAULT_COLS, &[], &env_refs).expect("spawn pager")
 }
 
-/// Block until the turn is idle (running-turn `Ctrl+c:cancel` hint gone): the
-/// Esc policy swallows a bare Esc mid-turn. Call sites run post-sentinel, so
-/// hint absence means finalized, not not-yet-running.
-pub(crate) fn wait_for_turn_idle(harness: &mut PtyHarness) {
-    // Keybar renders this only while `is_turn_running()` (views/agent.rs).
-    const CANCEL_HINT: &str = "Ctrl+c:cancel";
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while harness.contains_text(CANCEL_HINT) {
-        assert!(
-            Instant::now() < deadline,
-            "turn still running: {CANCEL_HINT:?} on screen after 15s\nscreen:\n{}",
-            harness.screen_contents()
-        );
-        harness.update(Duration::from_millis(100));
-    }
-}
-
 /// Reach an agent session with scrollback content, then focus scrollback (Tab).
 pub(crate) async fn drive_to_scrollback_with_turn(
     harness: &mut PtyHarness,
@@ -599,11 +593,6 @@ pub(crate) fn responses_api_tool_call_events(
     events
 }
 
-/// Chat Completions SSE stream with a single tool_call (fallback endpoint).
-pub(crate) fn chat_completions_tool_call_events(name: &str, arguments: &str) -> Vec<SseEvent> {
-    chat_completions_tool_call_events_with_id("call_read_hdr", name, arguments)
-}
-
 /// [`chat_completions_tool_call_events`] with an explicit `tool_call` id, for
 /// tests scripting several calls into ONE conversation (a reused id would
 /// alias distinct calls in history and confuse dangling-call bookkeeping).
@@ -652,100 +641,6 @@ pub(crate) fn chat_completions_tool_call_events_with_id(
                     "prompt_tokens": 10,
                     "completion_tokens": 20,
                     "total_tokens": 30
-                }
-            })
-            .to_string(),
-        ),
-        SseEvent::data("[DONE]".to_string()),
-    ]
-}
-
-/// Responses API SSE stream that emits a single assistant text message —
-/// the FIFO counterpart of `set_response` for tests scripting DISTINCT text
-/// replies per turn (e.g. one per auto-wake).
-pub(crate) fn responses_api_message_events(text: &str) -> Vec<SseEvent> {
-    vec![
-        SseEvent::data(
-            json!({
-                "type": "response.created",
-                "sequence_number": 0,
-                "response": {
-                    "id": "resp_text",
-                    "object": "response",
-                    "created_at": 1234567890,
-                    "model": "test-model",
-                    "status": "in_progress",
-                    "output": []
-                }
-            })
-            .to_string(),
-        ),
-        SseEvent::data(
-            json!({
-                "type": "response.output_text.delta",
-                "sequence_number": 1,
-                "item_id": "item_text",
-                "output_index": 0,
-                "content_index": 0,
-                "delta": text
-            })
-            .to_string(),
-        ),
-        SseEvent::data(
-            json!({
-                "type": "response.completed",
-                "sequence_number": 2,
-                "response": {
-                    "id": "resp_text",
-                    "object": "response",
-                    "created_at": 1234567890,
-                    "model": "test-model",
-                    "status": "completed",
-                    "output": [{
-                        "type": "message",
-                        "id": "msg_text",
-                        "role": "assistant",
-                        "status": "completed",
-                        "content": [{
-                            "type": "output_text",
-                            "text": text,
-                            "annotations": []
-                        }]
-                    }],
-                    "usage": {
-                        "input_tokens": 10,
-                        "output_tokens": 10,
-                        "total_tokens": 20,
-                        "input_tokens_details": { "cached_tokens": 0 },
-                        "output_tokens_details": { "reasoning_tokens": 0 }
-                    }
-                }
-            })
-            .to_string(),
-        ),
-        SseEvent::data("[DONE]".to_string()),
-    ]
-}
-
-/// Chat Completions SSE stream with a single assistant text message
-/// (fallback endpoint counterpart of [`responses_api_message_events`]).
-pub(crate) fn chat_completions_message_events(text: &str) -> Vec<SseEvent> {
-    vec![
-        SseEvent::data(
-            json!({
-                "id": "chatcmpl-text",
-                "object": "chat.completion.chunk",
-                "created": 1234567890,
-                "model": "test-model",
-                "choices": [{
-                    "index": 0,
-                    "delta": { "role": "assistant", "content": text },
-                    "finish_reason": "stop"
-                }],
-                "usage": {
-                    "prompt_tokens": 10,
-                    "completion_tokens": 10,
-                    "total_tokens": 20
                 }
             })
             .to_string(),
@@ -837,43 +732,184 @@ pub(crate) fn locate_screen_text(screen: &str, needle: &str) -> Option<(u16, u16
     None
 }
 
-/// Queue one scripted tool-call turn on both inference endpoints (only the
-/// endpoint the agent actually uses drains its FIFO; the other stays parked).
-pub(crate) fn enqueue_tool_turn(
+/// Register one named scripted tool-call turn on both inference endpoints.
+pub(crate) fn expect_tool_turn(
     content: &ContentController,
     call_id: &str,
     name: &str,
     args: String,
+) -> AgentTurnExpectation {
+    content.expect_agent_turn_with_responses(
+        format!("tool turn {call_id}"),
+        ScriptedResponse::sse(responses_api_tool_call_events(call_id, name, &args)),
+        ScriptedResponse::sse(chat_completions_tool_call_events_with_id(
+            call_id, name, &args,
+        )),
+    )
+}
+
+/// Responses API SSE stream whose `response.completed` output carries one
+/// `function_call` item per entry of `calls` — a single model turn invoking
+/// parallel tool calls. Each entry is `(call_id, name, arguments)`; ids must
+/// be distinct or history bookkeeping aliases the calls.
+pub(crate) fn responses_api_parallel_tool_call_events(
+    calls: &[(&str, &str, String)],
+) -> Vec<SseEvent> {
+    let mut events = Vec::new();
+    let mut seq = 0u64;
+    events.push(SseEvent::data(
+        json!({
+            "type": "response.created",
+            "sequence_number": seq,
+            "response": {
+                "id": "resp_parallel_tools",
+                "object": "response",
+                "created_at": 1234567890,
+                "model": "test-model",
+                "status": "in_progress",
+                "output": []
+            }
+        })
+        .to_string(),
+    ));
+    for (i, (call_id, _name, arguments)) in calls.iter().enumerate() {
+        seq += 1;
+        events.push(SseEvent::data(
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "sequence_number": seq,
+                "item_id": call_id,
+                "output_index": i,
+                "delta": arguments
+            })
+            .to_string(),
+        ));
+    }
+    seq += 1;
+    let output: Vec<serde_json::Value> = calls
+        .iter()
+        .map(|(call_id, name, arguments)| {
+            json!({
+                "type": "function_call",
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments
+            })
+        })
+        .collect();
+    events.push(SseEvent::data(
+        json!({
+            "type": "response.completed",
+            "sequence_number": seq,
+            "response": {
+                "id": "resp_parallel_tools",
+                "object": "response",
+                "created_at": 1234567890,
+                "model": "test-model",
+                "status": "completed",
+                "output": output,
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 20,
+                    "total_tokens": 30,
+                    "input_tokens_details": { "cached_tokens": 0 },
+                    "output_tokens_details": { "reasoning_tokens": 0 }
+                }
+            }
+        })
+        .to_string(),
+    ));
+    events.push(SseEvent::data("[DONE]".to_string()));
+    events
+}
+
+/// Chat Completions twin of [`responses_api_parallel_tool_call_events`]: one
+/// chunk whose `delta.tool_calls` carries every call (index 0, 1, …), then a
+/// `finish_reason: "tool_calls"` chunk.
+pub(crate) fn chat_completions_parallel_tool_call_events(
+    calls: &[(&str, &str, String)],
+) -> Vec<SseEvent> {
+    let tool_calls: Vec<serde_json::Value> = calls
+        .iter()
+        .enumerate()
+        .map(|(i, (call_id, name, arguments))| {
+            json!({
+                "index": i,
+                "id": call_id,
+                "type": "function",
+                "function": { "name": name, "arguments": arguments }
+            })
+        })
+        .collect();
+    vec![
+        SseEvent::data(
+            json!({
+                "id": "chatcmpl-parallel-tools",
+                "object": "chat.completion.chunk",
+                "created": 1234567890,
+                "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": tool_calls
+                    },
+                    "finish_reason": null
+                }]
+            })
+            .to_string(),
+        ),
+        SseEvent::data(
+            json!({
+                "id": "chatcmpl-parallel-tools",
+                "object": "chat.completion.chunk",
+                "created": 1234567890,
+                "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 20,
+                    "total_tokens": 30
+                }
+            })
+            .to_string(),
+        ),
+        SseEvent::data("[DONE]".to_string()),
+    ]
+}
+
+/// Queue one scripted turn with parallel tool calls on both inference
+/// endpoints (see [`expect_tool_turn`]).
+pub(crate) fn enqueue_parallel_tool_turn(
+    content: &ContentController,
+    calls: &[(&str, &str, String)],
 ) {
     content.enqueue_response(
         "/v1/responses",
-        ScriptedResponse::sse(responses_api_tool_call_events(call_id, name, &args)),
+        ScriptedResponse::sse(responses_api_parallel_tool_call_events(calls)),
     );
     content.enqueue_response(
         "/v1/chat/completions",
-        ScriptedResponse::sse(chat_completions_tool_call_events(name, &args)),
+        ScriptedResponse::sse(chat_completions_parallel_tool_call_events(calls)),
     );
 }
 
 /// Seed a target file under the isolated HOME and queue a scripted `read_file`
 /// tool call (Responses + Chat Completions) so the pager renders a Read header.
-pub(crate) fn seed_read_file_tool_call(content: &ContentController, abs_path: &Path) {
+pub(crate) fn seed_read_file_tool_call(
+    content: &ContentController,
+    abs_path: &Path,
+) -> AgentTurnExpectation {
     let args = json!({ "target_file": abs_path.to_string_lossy() }).to_string();
-    // Prefer Responses API (primary agent path); also queue Chat Completions.
-    content.enqueue_response(
-        "/v1/responses",
-        ScriptedResponse::sse(responses_api_tool_call_events(
-            "call_read_hdr",
-            "read_file",
-            &args,
-        )),
-    );
-    content.enqueue_response(
-        "/v1/chat/completions",
-        ScriptedResponse::sse(chat_completions_tool_call_events("read_file", &args)),
-    );
+    let turn = expect_tool_turn(content, "call_read_hdr", "read_file", args);
     // Follow-up turn after tool result: plain completion so the session settles.
     content.set_response(READ_HDR_SENTINEL);
+    turn
 }
 
 // ── Minimal (scrollback-native) mode e2e helpers ────────────────────────
@@ -887,6 +923,12 @@ pub(crate) const MINIMAL_ARGS: &[&str] = &["--minimal", "--no-leader"];
 /// `crate::minimal::live::render_status`). Distinct from the running status
 /// (`working…`), so it doubles as a "ready / turn finished" sentinel.
 pub(crate) const MINIMAL_IDLE_SENTINEL: &str = "minimal · /help";
+
+/// Idle status after a slash `/minimal` re-exec (switch-back cue present).
+/// Distinct from [`MINIMAL_IDLE_SENTINEL`] — cold `--minimal` starts omit the
+/// reverse-command segment.
+pub(crate) const MINIMAL_SWITCH_BACK_IDLE_SENTINEL: &str =
+    "minimal · /fullscreen to go back · /help";
 
 /// Spawn the pager in minimal mode against `content` at the default size.
 pub(crate) fn spawn_minimal(content: &ContentController) -> PtyHarness {
@@ -966,6 +1008,9 @@ pub(crate) fn quit_minimal(harness: &mut PtyHarness) {
 #[cfg(unix)]
 pub(crate) const WRAP_TIMEOUT: Duration = Duration::from_secs(120);
 
+#[cfg(unix)]
+const WRAP_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Run `grok wrap <wrap_args...>` to completion inside a PTY with an isolated
 /// `GROK_HOME`, returning the exit code (`None` if it never exited within
 /// [`WRAP_TIMEOUT`]) and everything the wrap PTY emitted. `extra_env` is where
@@ -973,6 +1018,18 @@ pub(crate) const WRAP_TIMEOUT: Duration = Duration::from_secs(120);
 /// before auth/network/sandbox.
 #[cfg(unix)]
 pub(crate) fn run_wrap(wrap_args: &[&str], extra_env: &[(&str, &str)]) -> (Option<u32>, String) {
+    run_wrap_driving(wrap_args, extra_env, |_| {})
+}
+
+/// Like [`run_wrap`], but hands the live harness to `drive` right after spawn
+/// so a test can interact mid-run (wait for output, deliver signals to wrap
+/// itself) before the exit-and-drain phase.
+#[cfg(unix)]
+pub(crate) fn run_wrap_driving(
+    wrap_args: &[&str],
+    extra_env: &[(&str, &str)],
+    drive: impl FnOnce(&mut PtyHarness),
+) -> (Option<u32>, String) {
     let binary = pager_binary().expect("resolve pager binary");
     let home = tempfile::tempdir().expect("home tempdir");
     let home_str = home.path().to_str().expect("utf8 home").to_owned();
@@ -985,27 +1042,13 @@ pub(crate) fn run_wrap(wrap_args: &[&str], extra_env: &[(&str, &str)]) -> (Optio
     let mut harness =
         PtyHarness::new(&binary, DEFAULT_ROWS, DEFAULT_COLS, &args, &env).expect("spawn grok wrap");
 
-    // All wrap e2e children are short-lived; wait for exit, don't gate on text.
-    let deadline = Instant::now() + WRAP_TIMEOUT;
-    let mut code = None;
-    while code.is_none() && Instant::now() < deadline {
-        harness.update(Duration::from_millis(100));
-        code = harness.wait_exit_code(Duration::ZERO);
-    }
+    drive(&mut harness);
+
+    let code = harness
+        .wait_for_exit_and_drain(WRAP_TIMEOUT, WRAP_DRAIN_TIMEOUT)
+        .ok();
     if code.is_none() {
         let _ = harness.quit(); // kill a hung child so the suite doesn't leak it
-    }
-
-    // Drain post-exit bytes until the reader goes quiet: output written just
-    // before exit can still be buffered in the PTY (same flake class the
-    // requirements-version test hit).
-    let drain_deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < drain_deadline {
-        let before = harness.raw_output().len();
-        harness.update(Duration::from_millis(100));
-        if harness.raw_output().len() == before {
-            break;
-        }
     }
 
     let raw = String::from_utf8_lossy(harness.raw_output()).into_owned();
@@ -1055,41 +1098,6 @@ pub(crate) fn poll_for<T>(timeout: Duration, mut probe: impl FnMut() -> Option<T
 #[cfg(unix)]
 pub(crate) fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
     poll_for(timeout, || cond().then_some(())).is_some()
-}
-
-/// Like [`wait_until`] but requires `cond` to hold *continuously* for `hold`
-/// before succeeding — the state must settle, not merely flicker true once.
-/// Use when a pager-side render can go true a beat before the matching
-/// server-side state lands (e.g. a Ctrl+C rewind clears the scrollback block
-/// optimistically before the shell finishes trimming the rewound copy from
-/// session history). Returns false if no stable window fits inside `timeout`.
-#[cfg(unix)]
-pub(crate) fn wait_until_stable(
-    timeout: Duration,
-    hold: Duration,
-    mut cond: impl FnMut() -> bool,
-) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if cond() {
-            let stable_until = Instant::now() + hold;
-            let mut held = true;
-            while Instant::now() < stable_until {
-                std::thread::sleep(Duration::from_millis(100));
-                if !cond() {
-                    held = false;
-                    break;
-                }
-            }
-            if held {
-                return true;
-            }
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
 }
 
 /// Dump assistant/tool/user messages (skipping the huge system prompt) from

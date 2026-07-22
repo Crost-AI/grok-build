@@ -473,6 +473,15 @@ fn tmux_meta_empty_outside_tmux() {
 // -- build_terminal_context_from_env (integration) ------------------------
 
 #[test]
+fn standalone_context_does_not_run_live_tmux_queries() {
+    let env = env_from(&[("TMUX", "/tmp/definitely-missing-tmux-server")]);
+    let ctx = standalone_terminal_context_from_env(&env, crate::host::HostOs::Linux);
+    assert_eq!(ctx.multiplexer, MultiplexerKind::Tmux);
+    assert_eq!(ctx.tmux_version, None);
+    assert_eq!(ctx.tmux_extended_keys, None);
+}
+
+#[test]
 fn context_plain_terminal() {
     let env = env_from(&[("TERM_PROGRAM", "Ghostty")]);
     let ctx = build_terminal_context_from_env(&env);
@@ -1052,6 +1061,52 @@ fn brand_vscode_from_askpass_without_term_program() {
         "/home/user/.vscode-server/bin/abc/askpass",
     )]);
     assert_eq!(detect_terminal_brand_from_env(&env), TerminalName::VsCode);
+}
+
+#[test]
+fn context_official_vscode_remote_from_askpass_and_ssh() {
+    for server_dir in [".vscode-server", ".vscode-server-insiders"] {
+        let askpass = format!("/home/user/{server_dir}/bin/abc/askpass");
+        let env = env_from(&[
+            ("VSCODE_GIT_ASKPASS_MAIN", &askpass),
+            ("SSH_CONNECTION", "192.0.2.1 50000 192.0.2.2 22"),
+        ]);
+        let ctx = build_terminal_context_from_env(&env);
+        assert_eq!(ctx.brand, TerminalName::VsCode);
+        assert!(ctx.is_ssh);
+        assert!(ctx.is_official_vscode_remote, "{server_dir}");
+    }
+}
+
+#[test]
+fn context_unofficial_vscode_remote_markers_are_not_official() {
+    for askpass in [
+        "/home/user/.vscode-server-oss/bin/abc/askpass",
+        "/home/user/.vscodium-server/bin/abc/askpass",
+        "/home/user/.code-oss-server/bin/abc/askpass",
+        "/home/user/cache/.vscode-server-oss/.vscode-serverish/askpass",
+        "/usr/local/bin/askpass-main.js",
+    ] {
+        let env = env_from(&[
+            ("VSCODE_GIT_ASKPASS_MAIN", askpass),
+            ("SSH_CONNECTION", "192.0.2.1 50000 192.0.2.2 22"),
+        ]);
+        let ctx = build_terminal_context_from_env(&env);
+        assert_eq!(ctx.brand, TerminalName::VsCode);
+        assert!(ctx.is_ssh);
+        assert!(!ctx.is_official_vscode_remote, "{askpass}");
+    }
+}
+
+#[test]
+fn official_vscode_server_marker_without_ssh_is_not_remote() {
+    let env = env_from(&[(
+        "VSCODE_GIT_ASKPASS_MAIN",
+        "/home/user/.vscode-server/bin/abc/askpass",
+    )]);
+    let ctx = build_terminal_context_from_env(&env);
+    assert!(!ctx.is_ssh);
+    assert!(!ctx.is_official_vscode_remote);
 }
 
 // -- Zellij detection from ZELLIJ_VERSION (no ZELLIJ or SESSION_NAME) -----
