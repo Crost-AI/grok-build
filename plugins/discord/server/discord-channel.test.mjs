@@ -254,6 +254,11 @@ function startMockRest() {
             type: parents[id] ? 11 : 0,
           }),
         )
+      } else if (req.method === 'PATCH' && /\/channels\/[^/]+$/.test(req.url)) {
+        // Thread modify (rename / archive).
+        const id = req.url.split('/').pop()
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ id, ...(parsed ?? {}) }))
       } else {
         res.writeHead(404)
         res.end('{}')
@@ -384,16 +389,18 @@ async function main() {
     JSON.stringify(toolNames) ===
       JSON.stringify([
         'add_reaction',
+        'close_thread',
         'create_poll',
         'create_thread',
         'end_poll',
         'read_attachment',
         'read_messages',
         'read_poll',
+        'rename_thread',
         'send_file',
         'send_message',
       ]),
-    `tools/list returns the nine tools (got: ${toolNames.join(', ')})`,
+    `tools/list returns the eleven tools (got: ${toolNames.join(', ')})`,
   )
 
   console.log('gateway handshake')
@@ -824,6 +831,62 @@ async function main() {
     thrEmpty.result?.isError === true &&
       thrEmpty.result?.content?.[0]?.text?.includes('non-empty name'),
     'create_thread rejects empty name after mention strip',
+  )
+
+  console.log('rename_thread / close_thread')
+  // thr1's parent may already be cached from the inbound thread test; the
+  // c1 case below exercises the REST-lookup type check either way.
+  const renRes = await request('tools/call', {
+    name: 'rename_thread',
+    arguments: { thread_id: 'thr1', name: 'PR · #700 · merged <@999>' },
+  })
+  check(
+    renRes.result?.content?.[0]?.text?.includes('renamed to "PR · #700 · merged"'),
+    `rename_thread renames with sanitized name (got: ${renRes.result?.content?.[0]?.text})`,
+  )
+  const renPatch = rest.requests.findLast(
+    (r) => r.method === 'PATCH' && r.url === '/api/v10/channels/thr1',
+  )
+  check(renPatch?.body?.name === 'PR · #700 · merged', 'rename_thread PATCHed the thread name')
+  // c1 is a regular channel (mock GET returns type 0) — must be refused,
+  // otherwise thread tools could rename real channels.
+  const renChan = await request('tools/call', {
+    name: 'rename_thread',
+    arguments: { thread_id: 'c1', name: 'evil rename' },
+  })
+  check(
+    renChan.result?.isError === true &&
+      renChan.result?.content?.[0]?.text?.includes('not a thread'),
+    'rename_thread refuses non-thread channels',
+  )
+  check(
+    !rest.requests.some((r) => r.method === 'PATCH' && r.url === '/api/v10/channels/c1'),
+    'no PATCH was issued against the regular channel',
+  )
+  // thr2's parent (c-other) is outside DISCORD_CHANNEL_IDS.
+  const renDenied = await request('tools/call', {
+    name: 'rename_thread',
+    arguments: { thread_id: 'thr2', name: 'nope' },
+  })
+  check(
+    renDenied.result?.isError === true &&
+      renDenied.result?.content?.[0]?.text?.includes('DISCORD_CHANNEL_IDS'),
+    'rename_thread rejects threads under non-allowlisted parents',
+  )
+  const closeRes = await request('tools/call', {
+    name: 'close_thread',
+    arguments: { thread_id: 'thr1', lock: true },
+  })
+  check(
+    closeRes.result?.content?.[0]?.text?.includes('archived + locked'),
+    `close_thread archives and locks (got: ${closeRes.result?.content?.[0]?.text})`,
+  )
+  const closePatch = rest.requests.findLast(
+    (r) => r.method === 'PATCH' && r.url === '/api/v10/channels/thr1',
+  )
+  check(
+    closePatch?.body?.archived === true && closePatch?.body?.locked === true,
+    'close_thread PATCHed archived + locked',
   )
 
   console.log('file attachments')

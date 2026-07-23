@@ -75,12 +75,14 @@ async fn bridge_declares_channel_capability_through_real_handshake() {
         names,
         [
             "add_reaction",
+            "close_thread",
             "create_poll",
             "create_thread",
             "end_poll",
             "read_attachment",
             "read_messages",
             "read_poll",
+            "rename_thread",
             "send_file",
             "send_message",
         ]
