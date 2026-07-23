@@ -192,6 +192,40 @@ function startMockRest() {
       } else if (req.method === 'POST' && /\/channels\/[^/]+\/messages$/.test(req.url)) {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ id: 'msg-999' }))
+      } else if (req.method === 'GET' && /\/channels\/[^/]+\/messages\/pm1$/.test(req.url)) {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(
+          JSON.stringify({
+            id: 'pm1',
+            poll: {
+              question: { text: 'Ship it?' },
+              allow_multiselect: false,
+              expiry: '2026-07-23T00:00:00Z',
+              answers: [
+                { answer_id: 1, poll_media: { text: 'Yes' } },
+                { answer_id: 2, poll_media: { text: 'No' } },
+              ],
+              results: {
+                is_finalized: false,
+                answer_counts: [
+                  { id: 1, count: 3, me_voted: false },
+                  { id: 2, count: 1, me_voted: false },
+                ],
+              },
+            },
+          }),
+        )
+      } else if (req.method === 'GET' && req.url.includes('/polls/pm1/answers/')) {
+        const answerId = req.url.split('/answers/')[1].split('?')[0]
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(
+          JSON.stringify({
+            users: answerId === '1' ? [{ id: '42', username: 'karl' }] : [],
+          }),
+        )
+      } else if (req.method === 'POST' && req.url.includes('/polls/pm1/expire')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ id: 'pm1' }))
       } else if (req.method === 'PUT' && req.url.includes('/reactions/')) {
         res.writeHead(204)
         res.end()
@@ -344,12 +378,14 @@ async function main() {
         'add_reaction',
         'create_poll',
         'create_thread',
+        'end_poll',
         'read_attachment',
         'read_messages',
+        'read_poll',
         'send_file',
         'send_message',
       ]),
-    `tools/list returns the seven tools (got: ${toolNames.join(', ')})`,
+    `tools/list returns the nine tools (got: ${toolNames.join(', ')})`,
   )
 
   console.log('gateway handshake')
@@ -835,6 +871,35 @@ async function main() {
     blocked.result?.isError === true &&
       blocked.result?.content?.[0]?.text?.includes('only fetches Discord CDN'),
     'read_attachment refuses non-CDN hosts',
+  )
+
+  console.log('polls')
+  const pollRead = await request('tools/call', {
+    name: 'read_poll',
+    arguments: { channel_id: 'c1', message_id: 'pm1' },
+  })
+  let pollData = null
+  try {
+    pollData = JSON.parse(pollRead.result?.content?.[0]?.text ?? '')
+  } catch {
+    /* checked below */
+  }
+  check(
+    pollData && pollData.question === 'Ship it?' && pollData.answers?.[0]?.count === 3,
+    `read_poll returns question and counts (got: ${pollRead.result?.content?.[0]?.text?.slice(0, 80)})`,
+  )
+  check(
+    pollData && pollData.answers?.[0]?.voters?.[0] === 'karl' && pollData.answers?.[1]?.voters?.length === 0,
+    'read_poll includes per-answer voters',
+  )
+  const pollEnd = await request('tools/call', {
+    name: 'end_poll',
+    arguments: { channel_id: 'c1', message_id: 'pm1' },
+  })
+  check(pollEnd.result?.content?.[0]?.text === 'poll ended; message id pm1', 'end_poll hits the expire endpoint')
+  check(
+    rest.requests.some((r) => r.method === 'POST' && r.url.includes('/polls/pm1/expire')),
+    'expire request recorded',
   )
 
   console.log('addressed-awareness (mention requirement off)')
