@@ -3578,6 +3578,27 @@ impl McpClient {
         }
     }
 
+    /// The `commands` reply-routing descriptor from the server's
+    /// `grok/channel` capability value, if it declared one — i.e. the
+    /// server opted into host-executed slash commands. `None` before a
+    /// successful handshake, when the server is not a channel, or when
+    /// the descriptor is absent or malformed.
+    pub async fn channel_commands_descriptor(
+        &self,
+    ) -> Option<crate::channel::ChannelCommandsDescriptor> {
+        match &*self.state.lock().await {
+            ClientState::Ready(service) => service
+                .peer_info()
+                .and_then(|info| info.capabilities.experimental.clone())
+                .and_then(|experimental| {
+                    experimental
+                        .get(crate::channel::CHANNEL_CAPABILITY_KEY)
+                        .and_then(crate::channel::parse_channel_commands_descriptor)
+                }),
+            _ => None,
+        }
+    }
+
     /// Snapshot the current event sender, if any.
     ///
     /// Used by [`crate::liveness::spawn_transport_liveness`] (which

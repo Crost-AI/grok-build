@@ -40,7 +40,7 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 
-const VERSION = '0.1.1'
+const VERSION = '0.1.2'
 
 // Sane caps for file transfer in both directions.
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024
@@ -450,8 +450,26 @@ function handleRequest(msg) {
             : '2025-06-18',
         capabilities: {
           tools: {},
-          // This key is what registers the server as a channel.
-          experimental: { 'grok/channel': {} },
+          // This key is what registers the server as a channel. The
+          // `commands` descriptor opts into host-executed slash
+          // commands (/status, /channels, /help): the host answers by
+          // calling `send_message` with the event's `channel_id` meta
+          // (threaded via `thread_ts` when the command came from a
+          // thread) — the message never reaches the model. Note the
+          // Slack client swallows `/`-prefixed input as its own slash
+          // commands; a leading space ("  /status") sends it as a
+          // literal message.
+          experimental: {
+            'grok/channel': {
+              commands: {
+                reply_tool: 'send_message',
+                target_meta: 'channel_id',
+                target_arg: 'channel_id',
+                content_arg: 'content',
+                extra_args: { thread_ts: 'thread_ts' },
+              },
+            },
+          },
         },
         serverInfo: { name: 'slack', version: VERSION },
         instructions: INSTRUCTIONS,

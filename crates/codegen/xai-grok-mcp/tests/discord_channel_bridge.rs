@@ -59,8 +59,30 @@ async fn bridge_declares_channel_capability_through_real_handshake() {
         service.peer_info(),
     );
 
+    let descriptor = client
+        .channel_commands_descriptor()
+        .await
+        .expect("bridge declares the commands reply-routing descriptor");
+    assert_eq!(descriptor.reply_tool, "send_message");
+    assert_eq!(descriptor.target_meta, "channel_id");
+    assert_eq!(descriptor.target_arg, "channel_id");
+    assert_eq!(descriptor.content_arg, "content");
+
     let tools = service.list_tools(None).await.expect("tools/list succeeds");
     let mut names: Vec<_> = tools.tools.iter().map(|t| t.name.to_string()).collect();
     names.sort();
-    assert_eq!(names, ["add_reaction", "read_messages", "send_message"]);
+    assert_eq!(
+        names,
+        [
+            "add_reaction",
+            "create_poll",
+            "create_thread",
+            "end_poll",
+            "read_attachment",
+            "read_messages",
+            "read_poll",
+            "send_file",
+            "send_message",
+        ]
+    );
 }

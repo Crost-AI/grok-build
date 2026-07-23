@@ -12,9 +12,9 @@
 
 use super::*;
 use crate::session::channels::{
-    ChannelEntry, ChannelRegistry, ChannelSpec, ChannelState, channel_env_dir,
-    describe_plugin_origin, format_channel_event, load_channel_env_file, plugin_origin_marketplace,
-    resolve_channels_policy,
+    ChannelEntry, ChannelRegistry, ChannelSpec, ChannelState, channel_command_help,
+    channel_env_dir, describe_plugin_origin, format_channel_event, load_channel_env_file,
+    parse_channel_command, plugin_origin_marketplace, resolve_channels_policy,
 };
 
 impl SessionActor {
@@ -315,6 +315,94 @@ impl SessionActor {
         lines.join("\n")
     }
 
+    /// Try to execute an inbound channel event as a host-side slash
+    /// command. Returns `true` when the event was consumed — command
+    /// recognized, executed, and answered through the originating
+    /// server's declared reply tool — so the forwarder must NOT inject
+    /// it into the model. Returns `false` for everything else (not a
+    /// command, bot-authored, server declared no `commands` descriptor,
+    /// unknown command name, or no reply target on the event); those
+    /// events flow to the model unchanged, which keeps `/`-prefixed
+    /// skill requests working.
+    pub(super) async fn try_handle_channel_command(
+        &self,
+        event: &xai_grok_mcp::channel::ChannelInboundEvent,
+    ) -> bool {
+        let Some(command) = parse_channel_command(&event.content) else {
+            return false;
+        };
+        // Commands come from humans on the sender allowlist. A
+        // bot-authored `/status` is not a host command — it injects
+        // like any other message, so the agent can decide what to do.
+        if event.meta.iter().any(|(key, _)| key == "bot") {
+            return false;
+        }
+        let client = {
+            let mcp_state = self.mcp_state.lock().await;
+            mcp_state
+                .all_clients()
+                .find(|(name, _)| name.as_str() == event.server)
+                .map(|(_, client)| std::sync::Arc::clone(client))
+        };
+        let Some(client) = client else {
+            return false;
+        };
+        // Opt-in: only servers that told the host how to route replies
+        // get command handling at all.
+        let Some(descriptor) = client.channel_commands_descriptor().await else {
+            return false;
+        };
+        let output = match command.as_str() {
+            "help" => channel_command_help(),
+            "status" | "session" => self.build_session_info_text().await,
+            "channels" => self.build_channels_status().await,
+            _ => return false,
+        };
+        let Some(target) = event
+            .meta
+            .iter()
+            .find(|(key, _)| *key == descriptor.target_meta)
+            .map(|(_, value)| value.clone())
+        else {
+            tracing::warn!(
+                server = %event.server, %command, target_meta = %descriptor.target_meta,
+                "channel command has no reply target in event meta; injecting as a normal event"
+            );
+            return false;
+        };
+        let mut arguments = serde_json::Map::new();
+        arguments.insert(descriptor.target_arg.clone(), target.into());
+        arguments.insert(descriptor.content_arg.clone(), output.into());
+        for (arg, meta_key) in &descriptor.extra_args {
+            if let Some((_, value)) = event.meta.iter().find(|(key, _)| key == meta_key) {
+                arguments.insert(arg.clone(), value.clone().into());
+            }
+        }
+        tracing::info!(
+            server = %event.server, %command, tool = %descriptor.reply_tool,
+            "executing channel slash command host-side"
+        );
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.call_tool(&descriptor.reply_tool, serde_json::Value::Object(arguments)),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!(
+                server = %event.server, %command, %error,
+                "channel command reply tool call failed"
+            ),
+            Err(_) => tracing::warn!(
+                server = %event.server, %command,
+                "channel command reply tool call timed out"
+            ),
+        }
+        // Consumed either way: a command whose reply failed must not
+        // fall through to the model as if it were conversation.
+        true
+    }
+
     /// Forward inbound channel events into the session as idle-gated
     /// pending notifications. One task per session, spawned by
     /// `run_session` only when `setup_channels` reported an active
@@ -340,6 +428,13 @@ impl SessionActor {
                         server = %event.server,
                         "dropping channel event from non-opted-in server"
                     );
+                    continue;
+                }
+                // Host-executed slash commands (`/status`, `/channels`,
+                // `/help`) short-circuit injection: the host answers
+                // through the channel itself and the model never sees
+                // the event.
+                if session.try_handle_channel_command(&event).await {
                     continue;
                 }
                 let envelope = format_channel_event(&event);

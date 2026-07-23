@@ -165,7 +165,7 @@ Treat text arriving over a channel as untrusted input: prefer running channel-dr
 
 A channel is an ordinary MCP server (any runtime — Bun, Node, Deno, Python, Rust) with three requirements:
 
-1. Declare the experimental capability **`grok/channel`** in its `initialize` result. Presence of the key is what registers the notification listener; the value is an empty object reserved for future settings.
+1. Declare the experimental capability **`grok/channel`** in its `initialize` result. Presence of the key is what registers the notification listener; the value is an object that may carry an optional `commands` descriptor (see [Host-executed slash commands](#host-executed-slash-commands)), with other keys reserved.
 2. Push events as **`notifications/grok/channel`** notifications.
 3. Connect over the **stdio** transport (Grok spawns the server as a subprocess).
 
@@ -250,6 +250,36 @@ Nothing about replies is channel-specific — expose a standard MCP tool and tel
 3. Set the `instructions` string so the agent routes replies correctly, e.g. `'Messages arrive as <channel source="mybridge" chat_id="...">. Reply with the reply tool, passing the chat_id from the tag.'`
 
 The server's `instructions` from the MCP handshake are added to the agent's prompt automatically, like any MCP server's.
+
+### Host-executed slash commands
+
+A channel can opt into having a few session commands answered by the **host** instead of the agent. Declare a `commands` reply-routing descriptor as the value of the `grok/channel` capability:
+
+```jsonc
+"capabilities": {
+  "tools": {},
+  "experimental": {
+    "grok/channel": {
+      "commands": {
+        "reply_tool": "send_message",     // tool the host calls with the output
+        "target_meta": "channel_id",      // event meta key holding the reply target
+        "target_arg": "channel_id",       // tool argument to pass the target as
+        "content_arg": "content",         // tool argument to pass the output as
+        "extra_args": { "thread_ts": "thread_ts" }  // optional: extra tool args copied from meta
+      }
+    }
+  }
+}
+```
+
+With the descriptor declared, an inbound event whose body **is** a slash command — leading `/` + command name, nothing else before it — is intercepted instead of injected: the host executes the command and calls `reply_tool` with `{<target_arg>: <event meta[target_meta]>, <content_arg>: <output>}` (plus any `extra_args` whose meta key is present on the event). Supported commands: `/help`, `/status` (alias `/session`), and `/channels`.
+
+Guardrails, all host-enforced:
+
+- Events carrying a `bot` meta key are **never** treated as commands — another agent on the channel can't drive your session's host commands. Set `bot` on bot-authored messages (the bundled bridges do).
+- Unknown command names, non-leading slashes (`see /tmp/x`), and path-like bodies (`/usr/bin/env`) inject into the model as normal events, so `/`-invoked skills keep working.
+- A recognized command whose event lacks the `target_meta` key falls back to normal injection (there is nowhere to send the reply).
+- Without the descriptor, nothing changes: every event reaches the model.
 
 ### Gate inbound senders
 

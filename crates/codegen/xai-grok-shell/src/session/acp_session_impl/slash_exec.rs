@@ -309,69 +309,7 @@ impl SessionActor {
                 ok_end_turn(0, None)
             }
             BuiltinAction::SessionInfo => {
-                let info = self.build_session_info().await;
-
-                let model = info.model.unwrap_or_else(|| "unknown".to_string());
-                let model_line = if let Some(ref resolved) = info.resolved_model_id {
-                    if resolved != &model {
-                        format!("**Model:** {} ({})", model, resolved)
-                    } else {
-                        format!("**Model:** {}", model)
-                    }
-                } else {
-                    format!("**Model:** {}", model)
-                };
-                let model_hash_line = if crate::session::acp_types::should_show_model_fingerprint(
-                    info.show_model_fingerprint,
-                    &model,
-                ) {
-                    info.model_fingerprint
-                        .as_deref()
-                        .map(|fp| format!("\n\n**Model Hash:** {fp}"))
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                };
-
-                let ctx = &info.context;
-                let context_pct = xai_token_estimation::usage_percentage(ctx.used, ctx.total);
-
-                let summary_path = crate::session::persistence::session_dir(&self.session_info)
-                    .join("summary.json");
-                let title = tokio::task::spawn_blocking(move || {
-                    std::fs::read_to_string(&summary_path)
-                        .ok()
-                        .and_then(|raw| {
-                            serde_json::from_str::<crate::session::persistence::Summary>(&raw).ok()
-                        })
-                        .map(|s| s.session_summary)
-                        .filter(|s| !s.is_empty())
-                })
-                .await
-                .ok()
-                .flatten();
-
-                let title_line = match &title {
-                    Some(t) => format!("**Title:** {t}\n\n"),
-                    None => String::new(),
-                };
-
-                let text = format!(
-                    "{}**Session ID:** {}\n\n\
-                     **Working directory:** {}\n\n\
-                     {}{}\n\n\
-                     **Turn:** {}\n\n\
-                     **Context:** {} / {} tokens ({:.0}%)",
-                    title_line,
-                    self.session_info.id.0,
-                    self.session_info.cwd,
-                    model_line,
-                    model_hash_line,
-                    info.turn_index,
-                    ctx.used,
-                    ctx.total,
-                    context_pct,
-                );
+                let text = self.build_session_info_text().await;
                 self.send_host_turn_slash_command_output(&text).await;
                 ok_end_turn(0, None)
             }
@@ -1021,5 +959,75 @@ impl SessionActor {
         }
 
         ok_end_turn(0, None)
+    }
+}
+
+impl SessionActor {
+    /// Session-info text shared by the `/session` builtin and
+    /// host-executed channel `/status` commands.
+    pub(super) async fn build_session_info_text(&self) -> String {
+        let info = self.build_session_info().await;
+
+        let model = info.model.unwrap_or_else(|| "unknown".to_string());
+        let model_line = if let Some(ref resolved) = info.resolved_model_id {
+            if resolved != &model {
+                format!("**Model:** {} ({})", model, resolved)
+            } else {
+                format!("**Model:** {}", model)
+            }
+        } else {
+            format!("**Model:** {}", model)
+        };
+        let model_hash_line = if crate::session::acp_types::should_show_model_fingerprint(
+            info.show_model_fingerprint,
+            &model,
+        ) {
+            info.model_fingerprint
+                .as_deref()
+                .map(|fp| format!("\n\n**Model Hash:** {fp}"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let ctx = &info.context;
+        let context_pct = xai_token_estimation::usage_percentage(ctx.used, ctx.total);
+
+        let summary_path =
+            crate::session::persistence::session_dir(&self.session_info).join("summary.json");
+        let title = tokio::task::spawn_blocking(move || {
+            std::fs::read_to_string(&summary_path)
+                .ok()
+                .and_then(|raw| {
+                    serde_json::from_str::<crate::session::persistence::Summary>(&raw).ok()
+                })
+                .map(|s| s.session_summary)
+                .filter(|s| !s.is_empty())
+        })
+        .await
+        .ok()
+        .flatten();
+
+        let title_line = match &title {
+            Some(t) => format!("**Title:** {t}\n\n"),
+            None => String::new(),
+        };
+
+        format!(
+            "{}**Session ID:** {}\n\n\
+             **Working directory:** {}\n\n\
+             {}{}\n\n\
+             **Turn:** {}\n\n\
+             **Context:** {} / {} tokens ({:.0}%)",
+            title_line,
+            self.session_info.id.0,
+            self.session_info.cwd,
+            model_line,
+            model_hash_line,
+            info.turn_index,
+            ctx.used,
+            ctx.total,
+            context_pct,
+        )
     }
 }

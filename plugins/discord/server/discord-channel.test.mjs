@@ -364,6 +364,14 @@ async function main() {
     init.result?.capabilities?.experimental?.['grok/channel'] !== undefined,
     'initialize declares the grok/channel capability',
   )
+  const commands = init.result?.capabilities?.experimental?.['grok/channel']?.commands
+  check(
+    commands?.reply_tool === 'send_message' &&
+      commands?.target_meta === 'channel_id' &&
+      commands?.target_arg === 'channel_id' &&
+      commands?.content_arg === 'content',
+    'capability value carries the host slash-command reply descriptor',
+  )
   check(
     typeof init.result?.instructions === 'string' && init.result.instructions.includes('send_message'),
     'initialize carries reply instructions',

@@ -40,7 +40,7 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 
-const VERSION = '0.1.9'
+const VERSION = '0.1.10'
 
 // Discord's upload limit for bots without guild boosts.
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024
@@ -727,8 +727,22 @@ function handleRequest(msg) {
             : '2025-06-18',
         capabilities: {
           tools: {},
-          // This key is what registers the server as a channel.
-          experimental: { 'grok/channel': {} },
+          // This key is what registers the server as a channel. The
+          // `commands` descriptor opts into host-executed slash
+          // commands (/status, /channels, /help): when a non-bot
+          // allowlisted sender's message is such a command, the host
+          // answers by calling `send_message` with the event's
+          // `channel_id` meta — the message never reaches the model.
+          experimental: {
+            'grok/channel': {
+              commands: {
+                reply_tool: 'send_message',
+                target_meta: 'channel_id',
+                target_arg: 'channel_id',
+                content_arg: 'content',
+              },
+            },
+          },
         },
         serverInfo: { name: 'discord', version: VERSION },
         instructions: INSTRUCTIONS,

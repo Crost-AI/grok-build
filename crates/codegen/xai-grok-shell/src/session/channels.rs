@@ -307,6 +307,40 @@ pub fn format_channel_event(event: &ChannelInboundEvent) -> String {
     out
 }
 
+/// Help text for host-executed channel slash commands (`/help`).
+pub fn channel_command_help() -> String {
+    "Commands available over this channel (run by the Grok Build host, not the agent):\n\
+     •  /help — this list\n\
+     •  /status (or /session) — session id, model, working directory, turn, context usage\n\
+     •  /channels — channel entries and live per-server status\n\
+     Anything else — including other /commands — goes to the agent as a normal message."
+        .to_string()
+}
+
+/// Extract the slash-command name from an inbound channel event body,
+/// if the body *is* a slash command: leading `/` followed by a
+/// `[A-Za-z0-9_-]+` name, then end-of-input or whitespace (any trailing
+/// text is ignored). Returns the name lowercased. Bodies like
+/// `/path/to/file` (name followed by non-whitespace) or `run /status`
+/// (command not leading) are not commands.
+pub fn parse_channel_command(content: &str) -> Option<String> {
+    let rest = content.trim().strip_prefix('/')?;
+    let name_end = rest
+        .char_indices()
+        .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-'))
+        .map(|(i, _)| i)
+        .unwrap_or(rest.len());
+    if name_end == 0 {
+        return None;
+    }
+    match rest[name_end..].chars().next() {
+        None => {}
+        Some(c) if c.is_whitespace() => {}
+        Some(_) => return None,
+    }
+    Some(rest[..name_end].to_ascii_lowercase())
+}
+
 /// Directory holding per-channel credentials:
 /// `~/.grok/channels/<server>/`.
 pub fn channel_env_dir(server: &str) -> std::path::PathBuf {
@@ -352,6 +386,38 @@ pub fn load_channel_env_file(path: &std::path::Path) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_channel_command_extracts_leading_slash_word() {
+        assert_eq!(parse_channel_command("/status"), Some("status".to_string()));
+        assert_eq!(
+            parse_channel_command("  /STATUS  "),
+            Some("status".to_string())
+        );
+        assert_eq!(
+            parse_channel_command("/channels please"),
+            Some("channels".to_string())
+        );
+        assert_eq!(
+            parse_channel_command("/deep-research"),
+            Some("deep-research".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_channel_command_rejects_non_commands() {
+        // Not leading.
+        assert_eq!(parse_channel_command("run /status"), None);
+        // Paths and non-word followers.
+        assert_eq!(parse_channel_command("/path/to/file"), None);
+        assert_eq!(parse_channel_command("/status?"), None);
+        // Bare or empty.
+        assert_eq!(parse_channel_command("/"), None);
+        assert_eq!(parse_channel_command(""), None);
+        assert_eq!(parse_channel_command("hello"), None);
+        // Non-ASCII name start.
+        assert_eq!(parse_channel_command("/émoji"), None);
+    }
 
     fn event(server: &str, content: &str, meta: &[(&str, &str)]) -> ChannelInboundEvent {
         ChannelInboundEvent {

@@ -85,6 +85,18 @@ With the mention requirement on, a guild message is treated as addressed to the 
 
 Inbound events follow standard channel delivery: an idle session wakes immediately; a busy session receives queued events together at the end of the current turn.
 
+## Slash commands from Discord
+
+A few session commands work straight from Discord — the **host** executes them and replies in the channel; the agent never sees them (and they don't interrupt whatever it's doing):
+
+| You type | You get back |
+|----------|--------------|
+| `/status` (or `/session`) | Session id, model, working directory, turn, context usage |
+| `/channels` | The session's channel entries with live per-server status |
+| `/help` | The list above |
+
+With the mention requirement on, address the bot as usual: `@grok /status`. The mention is stripped before the command is parsed. Command messages must *start* with the `/` (after the mention); anything else — including `/commands` the host doesn't recognize, like skill invocations — is forwarded to the agent as a normal message. Bot-authored messages are never treated as commands, so another agent can't drive your session's host commands; what a bot sends always goes to the agent to judge.
+
 ## Listening to other bots
 
 By default the bridge ignores every bot-authored message. To let another agent's bot (say, a Claude Code Discord bot in the same server) talk to your session, add its bot user id (Developer Mode → right-click the bot → Copy User ID) to `DISCORD_ALLOWED_BOT_IDS`. Its messages then pass the sender gate and arrive marked `bot="true"`, and the agent is instructed to keep bot-to-bot replies terse and purposeful.

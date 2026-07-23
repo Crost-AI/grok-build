@@ -69,6 +69,10 @@ With the mention requirement on, a channel message is treated as addressed to th
 
 Delivery semantics are standard channels behavior: an idle session wakes immediately; a busy one receives queued events together at the end of the current turn.
 
+## Slash commands from Slack
+
+`/status` (alias `/session`), `/channels`, and `/help` are executed by the **host** and answered in the channel (threaded, if you sent the command from a thread) — the agent never sees them, and they work even mid-turn. One Slack quirk: the Slack client intercepts messages starting with `/` as its own slash commands, so type a leading space (`  /status`) to send the text literally. Unrecognized `/commands` and everything else forward to the agent as normal messages; bot-authored messages are never treated as commands.
+
 ## Troubleshooting
 
 The bridge logs to stderr, captured at `$GROK_HOME/logs/mcp/slack.stderr.log` (truncated each session start):

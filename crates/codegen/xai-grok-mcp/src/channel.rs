@@ -7,7 +7,9 @@
 //! 1. The server declares the experimental capability
 //!    [`CHANNEL_CAPABILITY_KEY`] (`grok/channel`) in its `initialize`
 //!    result. Presence is what marks the server as a channel; the value
-//!    is an empty object reserved for future settings.
+//!    is an object that may carry optional settings — today the
+//!    `commands` reply-routing descriptor (see
+//!    [`ChannelCommandsDescriptor`]), with unknown keys reserved.
 //! 2. The server emits [`CHANNEL_NOTIFICATION_METHOD`]
 //!    (`notifications/grok/channel`) notifications whose params carry
 //!    the event:
@@ -56,6 +58,83 @@ pub struct ChannelInboundEvent {
     /// (the workspace `serde_json` preserves object insertion order).
     /// Each entry becomes a tag attribute.
     pub meta: Vec<(String, String)>,
+}
+
+/// Reply-routing descriptor a channel server may declare under the
+/// `"commands"` key of its [`CHANNEL_CAPABILITY_KEY`] capability value:
+///
+/// ```json
+/// "grok/channel": {
+///   "commands": {
+///     "reply_tool": "send_message",
+///     "target_meta": "channel_id",
+///     "target_arg": "channel_id",
+///     "content_arg": "content",
+///     "extra_args": { "thread_ts": "thread_ts" }
+///   }
+/// }
+/// ```
+///
+/// Declaring it opts the server into host-executed slash commands: when
+/// an inbound event's body is a `/command` the host recognizes (and the
+/// event is not bot-authored), the host runs the command itself and
+/// routes the output back by calling `reply_tool` with
+/// `{target_arg: <event meta[target_meta]>, content_arg: <output>}`,
+/// instead of injecting the event into the model. `extra_args` names
+/// additional tool arguments to copy from event meta when present
+/// (argument name → meta key) — e.g. so replies land in the right
+/// thread. Without the descriptor, command-looking events flow to the
+/// model like any other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelCommandsDescriptor {
+    /// Tool to call with the command output (e.g. `send_message`).
+    pub reply_tool: String,
+    /// Event meta key holding the reply target (e.g. `channel_id`).
+    /// Events missing this key cannot be replied to and are not
+    /// intercepted.
+    pub target_meta: String,
+    /// Tool argument name to pass the target as.
+    pub target_arg: String,
+    /// Tool argument name to pass the command output as.
+    pub content_arg: String,
+    /// Additional `(tool argument name, event meta key)` pairs copied
+    /// into the call when the meta key is present on the event.
+    pub extra_args: Vec<(String, String)>,
+}
+
+/// Parse the `commands` descriptor out of a [`CHANNEL_CAPABILITY_KEY`]
+/// capability *value*. Returns `None` when the value has no `commands`
+/// object or any required field is missing, empty, or not a string —
+/// a malformed descriptor disables host-side commands rather than
+/// producing misrouted tool calls.
+pub fn parse_channel_commands_descriptor(
+    capability_value: &serde_json::Map<String, serde_json::Value>,
+) -> Option<ChannelCommandsDescriptor> {
+    let commands = capability_value.get("commands")?.as_object()?;
+    let required = |key: &str| -> Option<String> {
+        commands
+            .get(key)?
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let mut extra_args: Vec<(String, String)> = Vec::new();
+    if let Some(map) = commands.get("extra_args").and_then(|v| v.as_object()) {
+        for (arg, meta_key) in map {
+            if let Some(meta_key) = meta_key.as_str().filter(|s| !s.is_empty())
+                && !arg.is_empty()
+            {
+                extra_args.push((arg.clone(), meta_key.to_string()));
+            }
+        }
+    }
+    Some(ChannelCommandsDescriptor {
+        reply_tool: required("reply_tool")?,
+        target_meta: required("target_meta")?,
+        target_arg: required("target_arg")?,
+        content_arg: required("content_arg")?,
+        extra_args,
+    })
 }
 
 /// Shared sender slot for inbound channel events — same
@@ -162,6 +241,80 @@ mod tests {
         }))
         .expect("valid event");
         assert_eq!(ev.meta, vec![("ok_key1".to_string(), "kept".to_string())]);
+    }
+
+    fn capability_value(json: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        json.as_object().expect("test value is an object").clone()
+    }
+
+    #[test]
+    fn parses_commands_descriptor() {
+        let descriptor = parse_channel_commands_descriptor(&capability_value(serde_json::json!({
+            "commands": {
+                "reply_tool": "send_message",
+                "target_meta": "channel_id",
+                "target_arg": "channel_id",
+                "content_arg": "content",
+                "extra_args": { "thread_ts": "thread_ts", "": "dropped", "bad": "" }
+            }
+        })))
+        .expect("valid descriptor");
+        assert_eq!(descriptor.reply_tool, "send_message");
+        assert_eq!(descriptor.target_meta, "channel_id");
+        assert_eq!(descriptor.target_arg, "channel_id");
+        assert_eq!(descriptor.content_arg, "content");
+        assert_eq!(
+            descriptor.extra_args,
+            vec![("thread_ts".to_string(), "thread_ts".to_string())]
+        );
+    }
+
+    #[test]
+    fn commands_descriptor_optional_and_strict() {
+        // Empty capability value (the pre-commands form) — no descriptor.
+        assert!(
+            parse_channel_commands_descriptor(&capability_value(serde_json::json!({}))).is_none()
+        );
+        // commands present but a required field missing or wrong type.
+        assert!(
+            parse_channel_commands_descriptor(&capability_value(serde_json::json!({
+                "commands": { "reply_tool": "send_message" }
+            })))
+            .is_none()
+        );
+        assert!(
+            parse_channel_commands_descriptor(&capability_value(serde_json::json!({
+                "commands": {
+                    "reply_tool": "send_message",
+                    "target_meta": "channel_id",
+                    "target_arg": 7,
+                    "content_arg": "content"
+                }
+            })))
+            .is_none()
+        );
+        // Empty string fields are rejected, extra_args stays optional.
+        assert!(
+            parse_channel_commands_descriptor(&capability_value(serde_json::json!({
+                "commands": {
+                    "reply_tool": "",
+                    "target_meta": "channel_id",
+                    "target_arg": "channel_id",
+                    "content_arg": "content"
+                }
+            })))
+            .is_none()
+        );
+        let minimal = parse_channel_commands_descriptor(&capability_value(serde_json::json!({
+            "commands": {
+                "reply_tool": "send_message",
+                "target_meta": "channel_id",
+                "target_arg": "channel_id",
+                "content_arg": "content"
+            }
+        })))
+        .expect("minimal descriptor");
+        assert!(minimal.extra_args.is_empty());
     }
 
     #[test]
