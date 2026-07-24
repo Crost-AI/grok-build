@@ -427,6 +427,14 @@ async function main() {
       ]),
     `tools/list returns the eleven tools (got: ${toolNames.join(', ')})`,
   )
+  const toolByName = Object.fromEntries((tools.result?.tools ?? []).map((t) => [t.name, t]))
+  check(
+    toolByName.read_messages?.annotations?.readOnlyHint === true &&
+      toolByName.send_message?.annotations?.destructiveHint === false &&
+      toolByName.send_message?.annotations?.openWorldHint === false &&
+      (tools.result?.tools ?? []).every((t) => t.annotations !== undefined),
+    'every tool carries approval annotations (readers read-only, writers non-destructive)',
+  )
 
   console.log('gateway handshake')
   const gw = await gateway.waitForClient()
