@@ -94,7 +94,7 @@ build failed on main: https://ci.example.com/run/1234
 
 - `source` is set automatically from the MCP server's name.
 - Every `meta` entry the server attached becomes a tag attribute (see [Notification format](#notification-format)).
-- If the agent is idle, the event wakes it immediately. If a turn is running, events queue and are delivered together at the end of the turn, separated by `---`, and the agent handles them as a group.
+- If the agent is idle, the event wakes it immediately. If a turn is running, the event is injected **mid-turn** through the interjection path (the same mechanism as typing while the model works) — the agent sees it at its next model step. An event that lands just as the turn ends becomes its own queued turn instead, so nothing is dropped.
 - Events are processed in arrival order. To process independent event streams concurrently, run separate sessions.
 
 If the agent hits a permission prompt while you're away, the session pauses until you respond at the terminal. For unattended use, `--always-approve` bypasses prompts — only use it in environments you trust, and mind that an open channel is then an unattended input path into a fully-approved agent.

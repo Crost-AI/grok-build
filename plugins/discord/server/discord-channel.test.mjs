@@ -179,6 +179,20 @@ function startMockRest() {
       if (req.method === 'GET' && req.url.startsWith('/cdn/')) {
         res.writeHead(200, { 'Content-Type': 'text/plain' })
         res.end('attachment-bytes-123')
+      } else if (req.method === 'GET' && req.url.startsWith('/cdn-expired/')) {
+        // Simulates a signed CDN URL whose signature expired.
+        res.writeHead(404)
+        res.end('{}')
+      } else if (req.method === 'POST' && req.url.endsWith('/attachments/refresh-urls')) {
+        const original = parsed?.attachment_urls?.[0] ?? ''
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(
+          JSON.stringify({
+            refreshed_urls: [
+              { original, refreshed: original.replace('/cdn-expired/', '/cdn/') },
+            ],
+          }),
+        )
       } else if (req.method === 'POST' && /\/channels\/[^/]+\/threads$/.test(req.url)) {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(
@@ -942,6 +956,42 @@ async function main() {
     blocked.result?.isError === true &&
       blocked.result?.content?.[0]?.text?.includes('only fetches Discord CDN'),
     'read_attachment refuses non-CDN hosts',
+  )
+  // Trailing "]" copied from the forwarded [attachment ...: url] line is
+  // trimmed before fetching.
+  const bracketRes = await request('tools/call', {
+    name: 'read_attachment',
+    arguments: { url: `http://127.0.0.1:${rest.port}/cdn/bracket.txt]` },
+  })
+  let bracketSaved = null
+  try {
+    bracketSaved = JSON.parse(bracketRes.result?.content?.[0]?.text ?? '')
+  } catch {
+    /* checked below */
+  }
+  check(
+    bracketSaved && bracketSaved.bytes === 'attachment-bytes-123'.length,
+    `read_attachment trims trailing punctuation from the url (got: ${bracketRes.result?.content?.[0]?.text})`,
+  )
+  // An expired signed URL (404) is re-signed via /attachments/refresh-urls
+  // and retried automatically.
+  const refreshedRes = await request('tools/call', {
+    name: 'read_attachment',
+    arguments: { url: `http://127.0.0.1:${rest.port}/cdn-expired/old-report.txt` },
+  })
+  let refreshedSaved = null
+  try {
+    refreshedSaved = JSON.parse(refreshedRes.result?.content?.[0]?.text ?? '')
+  } catch {
+    /* checked below */
+  }
+  check(
+    refreshedSaved && refreshedSaved.bytes === 'attachment-bytes-123'.length,
+    `read_attachment refreshes expired CDN links and retries (got: ${refreshedRes.result?.content?.[0]?.text})`,
+  )
+  check(
+    rest.requests.some((r) => r.method === 'POST' && r.url.endsWith('/attachments/refresh-urls')),
+    'refresh-urls endpoint was called for the expired link',
   )
 
   console.log('polls')

@@ -82,9 +82,9 @@ With the mention requirement on, a guild message is treated as addressed to the 
 - **`create_thread`** — open a public workstream thread under an allowlisted parent text channel (`POST /channels/{id}/threads`, type 11). Name is sanitized (mentions stripped, max 100 chars); **24h auto-archive**; optional first message. Parent must be in `DISCORD_CHANNEL_IDS` when that allowlist is set. New threads inherit parent allowlist for inbound (v0.1.5+).
 - **`rename_thread`** / **`close_thread`** — retitle a thread as the work evolves, or archive it (optionally lock it) when the workstream wraps up. Both verify the target really is a thread — they can never touch a regular channel — and respect the `DISCORD_CHANNEL_IDS` parent allowlist. The bot can rename/close threads it created; other threads (and locking) need the **Manage Threads** permission on the bot.
 - **`send_file`** — upload a file from the machine as a Discord attachment (10 MB bot limit), with an optional caption. Requires the **Attach Files** permission on the bot (see the invite step).
-- **`read_attachment`** — download an incoming attachment (the `[attachment ...: url]` lines in forwarded messages) to a temp file under the OS temp dir and return its path, so the agent can read images, logs, or documents you drop in the chat. Restricted to Discord's CDN hosts; 25 MB cap; CDN links expire after a while, so old attachments may need re-sending.
+- **`read_attachment`** — download an incoming attachment (the `[attachment ...: url]` lines in forwarded messages) to a temp file under the OS temp dir and return its path, so the agent can read images, logs, or documents you drop in the chat. Restricted to Discord's CDN hosts; 25 MB cap. Stray trailing punctuation (like a copied `]`) is trimmed from the URL, and expired signed CDN links are automatically re-signed through the bot token (`/attachments/refresh-urls`) and retried (v0.1.12+).
 
-Inbound events follow standard channel delivery: an idle session wakes immediately; a busy session receives queued events together at the end of the current turn.
+Inbound events follow standard channel delivery: an idle session wakes immediately; a busy session receives the message **mid-turn** (injected between model steps, like typing while the agent works), so you can steer long-running work from Discord.
 
 ## Slash commands from Discord
 

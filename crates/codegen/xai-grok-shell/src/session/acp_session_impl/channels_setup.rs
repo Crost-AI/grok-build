@@ -438,6 +438,32 @@ impl SessionActor {
                     continue;
                 }
                 let envelope = format_channel_event(&event);
+                // Mid-turn: a running turn takes the event through the
+                // interjection buffer — the same mechanism as typing
+                // while the model works. The model sees it at its next
+                // loop iteration; one that misses the turn's final
+                // drain is flushed into a queued prompt turn at turn
+                // end (`flush_stranded_interjections`), so nothing is
+                // lost to the race. Idle sessions keep the
+                // pending-notification wake path below.
+                let turn_running = session
+                    .current_prompt_id
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.clone())
+                    .is_some();
+                if turn_running {
+                    session.broadcast_interjection(&envelope, None);
+                    session.pending_interjections.push(PendingInterjection {
+                        text: envelope,
+                        attachments: Vec::new(),
+                    });
+                    tracing::info!(
+                        server = %event.server,
+                        "channel event delivered as mid-turn interjection"
+                    );
+                    continue;
+                }
                 tracing::info!(
                     server = %event.server, bytes = envelope.len(),
                     "channel event queued for injection"
