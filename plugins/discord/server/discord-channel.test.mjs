@@ -273,6 +273,17 @@ function startMockRest() {
         const id = req.url.split('/').pop()
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ id, ...(parsed ?? {}) }))
+      } else if (req.method === 'PUT' && /\/applications\/[^/]+\/guilds\/[^/]+\/commands$/.test(req.url)) {
+        // Slash command registration (bulk overwrite).
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(parsed ?? []))
+      } else if (req.method === 'POST' && /\/interactions\/[^/]+\/[^/]+\/callback$/.test(req.url)) {
+        res.writeHead(204)
+        res.end()
+      } else if (req.method === 'POST' && /\/webhooks\/[^/]+\/[^/]+$/.test(req.url)) {
+        // Interaction follow-up message.
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ id: 'followup-1' }))
       } else {
         res.writeHead(404)
         res.end('{}')
@@ -430,7 +441,12 @@ async function main() {
     op: 0,
     s: 1,
     t: 'READY',
-    d: { session_id: 'sess-1', resume_gateway_url: '', user: { id: 'BOT', username: 'grok' } },
+    d: {
+      session_id: 'sess-1',
+      resume_gateway_url: '',
+      user: { id: 'BOT', username: 'grok' },
+      application: { id: 'app1' },
+    },
   })
   // Discord sends one GUILD_CREATE per guild after READY; it carries the
   // bot's managed role, which the mention gate must honor.
@@ -901,6 +917,122 @@ async function main() {
   check(
     closePatch?.body?.archived === true && closePatch?.body?.locked === true,
     'close_thread PATCHed archived + locked',
+  )
+
+  console.log('native slash commands (interactions)')
+  check(
+    rest.requests.some(
+      (r) => r.method === 'PUT' && r.url === '/api/v10/applications/app1/guilds/g1/commands',
+    ),
+    'slash commands registered for the guild on GUILD_CREATE',
+  )
+  const cmdPut = rest.requests.find(
+    (r) => r.method === 'PUT' && r.url === '/api/v10/applications/app1/guilds/g1/commands',
+  )
+  check(
+    Array.isArray(cmdPut?.body) &&
+      ['status', 'channels', 'help', 'ask'].every((n) => cmdPut.body.some((c) => c.name === n)),
+    'registered command set includes status, channels, help, ask',
+  )
+  // /status from an allowlisted user: deferred callback + channel event
+  // carrying the interaction token for the host's reply.
+  gw.send({
+    op: 0,
+    s: 60,
+    t: 'INTERACTION_CREATE',
+    d: {
+      id: 'int1',
+      token: 'tok1',
+      type: 2,
+      guild_id: 'g1',
+      channel_id: 'c1',
+      member: { user: { id: '42', username: 'karl' } },
+      data: { name: 'status' },
+    },
+  })
+  const intEv = await expectStdout(
+    (m) =>
+      m.method === 'notifications/grok/channel' && m.params.meta.interaction_token === 'tok1',
+    'channel event for /status interaction',
+  )
+  check(intEv.params.content === '/status', 'interaction forwarded as a /status channel event')
+  check(intEv.params.meta.author_id === '42', 'interaction meta carries the invoker id')
+  const deferCb = rest.requests.find(
+    (r) => r.method === 'POST' && r.url === '/api/v10/interactions/int1/tok1/callback',
+  )
+  check(deferCb?.body?.type === 5, 'interaction acknowledged with a deferred (type 5) callback')
+  // Host reply with the token posts as the interaction follow-up.
+  const followRes = await request('tools/call', {
+    name: 'send_message',
+    arguments: { channel_id: 'c1', content: 'session status text', interaction_token: 'tok1' },
+  })
+  check(
+    followRes.result?.content?.[0]?.text?.includes('followup-1'),
+    'send_message with interaction_token returns the follow-up id',
+  )
+  const followup = rest.requests.find(
+    (r) => r.method === 'POST' && r.url === '/api/v10/webhooks/app1/tok1',
+  )
+  check(
+    followup?.body?.content === 'session status text',
+    'reply posted to the interaction follow-up webhook, not the channel',
+  )
+  // Disallowed user: ephemeral refusal, no channel event.
+  gw.send({
+    op: 0,
+    s: 61,
+    t: 'INTERACTION_CREATE',
+    d: {
+      id: 'int2',
+      token: 'tok2',
+      type: 2,
+      guild_id: 'g1',
+      channel_id: 'c1',
+      member: { user: { id: '99', username: 'mallory' } },
+      data: { name: 'status' },
+    },
+  })
+  await new Promise((r) => setTimeout(r, 300))
+  const deniedCb = rest.requests.find(
+    (r) => r.method === 'POST' && r.url === '/api/v10/interactions/int2/tok2/callback',
+  )
+  check(
+    deniedCb?.body?.type === 4 && deniedCb?.body?.data?.flags === 64,
+    'non-allowlisted invoker gets an ephemeral refusal',
+  )
+  check(
+    !fromBridge.some(
+      (m) =>
+        m.method === 'notifications/grok/channel' && m.params.meta.interaction_token === 'tok2',
+    ),
+    'no channel event for the refused interaction',
+  )
+  // /ask forwards the prompt as a normal channel event (no token meta).
+  gw.send({
+    op: 0,
+    s: 62,
+    t: 'INTERACTION_CREATE',
+    d: {
+      id: 'int3',
+      token: 'tok3',
+      type: 2,
+      guild_id: 'g1',
+      channel_id: 'c1',
+      member: { user: { id: '42', username: 'karl' } },
+      data: { name: 'ask', options: [{ name: 'prompt', value: 'run the tests' }] },
+    },
+  })
+  const askEv = await expectStdout(
+    (m) => m.method === 'notifications/grok/channel' && m.params.content === 'run the tests',
+    'channel event for /ask prompt',
+  )
+  check(askEv.params.meta.interaction_token === undefined, '/ask event carries no interaction token')
+  const askCb = rest.requests.find(
+    (r) => r.method === 'POST' && r.url === '/api/v10/interactions/int3/tok3/callback',
+  )
+  check(
+    askCb?.body?.type === 4 && askCb?.body?.data?.flags === undefined,
+    '/ask acknowledged with a public immediate callback',
   )
 
   console.log('file attachments')

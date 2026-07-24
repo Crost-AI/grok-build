@@ -18,7 +18,7 @@ you, on Discord:            (the reply arrives in the same Discord channel)
 1. Open the [Discord developer portal](https://discord.com/developers/applications) → **New Application**.
 2. Under **Bot**, click **Reset Token** and copy the token — this is `DISCORD_BOT_TOKEN`.
 3. Still under **Bot → Privileged Gateway Intents**, enable **Message Content Intent** (without it, guild messages arrive with empty text and are dropped).
-4. Invite the bot to your server: **OAuth2 → URL Generator**, scope `bot`, permissions **View Channels**, **Send Messages**, **Read Message History**, **Add Reactions**, **Attach Files** (for `send_file`), **Create Public Threads** (for `create_thread`), and optionally **Manage Threads** (to rename/close threads the bot didn't create, and to lock threads); open the generated URL. (DMs also require sharing at least one server with the bot.)
+4. Invite the bot to your server: **OAuth2 → URL Generator**, scopes `bot` **and** `applications.commands` (the latter makes the native `/status`, `/channels`, `/help`, `/ask` slash commands appear), permissions **View Channels**, **Send Messages**, **Read Message History**, **Add Reactions**, **Attach Files** (for `send_file`), **Create Public Threads** (for `create_thread`), and optionally **Manage Threads** (to rename/close threads the bot didn't create, and to lock threads); open the generated URL. (DMs also require sharing at least one server with the bot.)
 
 ### 2. Find your Discord user id
 
@@ -88,15 +88,20 @@ Inbound events follow standard channel delivery: an idle session wakes immediate
 
 ## Slash commands from Discord
 
-A few session commands work straight from Discord — the **host** executes them and replies in the channel; the agent never sees them (and they don't interrupt whatever it's doing):
+A few session commands work straight from Discord — the **host** executes them and replies; the agent never sees them (and they don't interrupt whatever it's doing):
 
-| You type | You get back |
-|----------|--------------|
+| Command | You get back |
+|---------|--------------|
 | `/status` (or `/session`) | Session id, model, working directory, turn, context usage |
 | `/channels` | The session's channel entries with live per-server status |
 | `/help` | The list above |
 
-With the mention requirement on, address the bot as usual: `@grok /status`. The mention is stripped before the command is parsed. Command messages must *start* with the `/` (after the mention); anything else — including `/commands` the host doesn't recognize, like skill invocations — is forwarded to the agent as a normal message. Bot-authored messages are never treated as commands, so another agent can't drive your session's host commands; what a bot sends always goes to the agent to judge.
+They work two ways:
+
+- **Native slash commands** (v0.1.13+): the bridge registers `/status`, `/channels`, `/help`, and `/ask` as real Discord application commands in every server it's in, so they appear in Discord's command picker with autocomplete. The interaction is acknowledged instantly and the host's answer arrives as the command's reply. `/ask prompt:...` sends a message to the agent without needing an @mention — handy from channels where the mention requirement is on. **Requires the `applications.commands` OAuth2 scope**: if commands don't appear, re-invite the bot with `scope=bot+applications.commands` in the invite URL (no need to kick it first). Registered per guild, so they don't show in DMs — there, plain text works.
+- **Plain text**: a message that *starts* with `/status` etc. (`@grok /status` with the mention requirement on — the mention is stripped first) is intercepted by the host the same way. Anything else — including `/commands` the host doesn't recognize, like skill invocations — is forwarded to the agent as a normal message.
+
+Only allowlisted humans can invoke either form (non-allowlisted users get an ephemeral refusal on native commands); bot-authored messages are never treated as commands, so another agent can't drive your session's host commands.
 
 ## Listening to other bots
 

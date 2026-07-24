@@ -67,6 +67,12 @@ async fn bridge_declares_channel_capability_through_real_handshake() {
     assert_eq!(descriptor.target_meta, "channel_id");
     assert_eq!(descriptor.target_arg, "channel_id");
     assert_eq!(descriptor.content_arg, "content");
+    // Native slash commands route host replies to the interaction
+    // follow-up webhook via this meta pass-through.
+    assert_eq!(
+        descriptor.extra_args,
+        vec![("interaction_token".to_string(), "interaction_token".to_string())]
+    );
 
     let tools = service.list_tools(None).await.expect("tools/list succeeds");
     let mut names: Vec<_> = tools.tools.iter().map(|t| t.name.to_string()).collect();
