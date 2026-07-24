@@ -1,0 +1,8 @@
+{
+  "name": "discord",
+  "version": "2.0.0",
+  "description": "Discord channel bridge (shared with Codex and Claude Code): forwards Discord messages into a running session and lets the agent reply, react, create polls/threads, and read history through the Discord API.",
+  "author": { "name": "crost.ai" },
+  "repository": "https://github.com/lakerfan901/discord-channel-bridge",
+  "keywords": ["discord", "channel", "chat", "bridge", "bot", "notifications"]
+}
