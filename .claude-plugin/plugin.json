@@ -2,8 +2,16 @@
   "name": "discord-bridge",
   "description": "Discord channel bridge: forwards Discord messages into a running session (channels), lets the agent reply/react/thread/poll/file through the same bot, adds native Discord slash commands, and relays Claude Code tool-approval prompts to Discord.",
   "version": "2.0.0",
-  "author": { "name": "crost.ai" },
+  "author": {
+    "name": "crost.ai"
+  },
   "homepage": "https://github.com/lakerfan901/discord-channel-bridge",
-  "repository": { "type": "git", "url": "https://github.com/lakerfan901/discord-channel-bridge.git" },
-  "keywords": ["discord", "channel", "chat", "bridge", "bot"]
+  "repository": "https://github.com/lakerfan901/discord-channel-bridge",
+  "keywords": [
+    "discord",
+    "channel",
+    "chat",
+    "bridge",
+    "bot"
+  ]
 }
