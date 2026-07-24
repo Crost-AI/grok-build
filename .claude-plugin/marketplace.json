@@ -1,0 +1,16 @@
+{
+  "name": "discord-channel-bridge",
+  "description": "One Discord channel bridge serving Claude Code, Grok Build, and Codex.",
+  "owner": { "name": "crost.ai" },
+  "plugins": [
+    {
+      "name": "discord-bridge",
+      "displayName": "Discord Bridge",
+      "description": "Two-way Discord channel: inbound messages wake the session; the agent replies, reacts, threads, polls, and sends files; native Discord slash commands; tool-approval relay.",
+      "version": "2.0.0",
+      "source": "./",
+      "category": "communication",
+      "tags": ["discord", "chat", "channel", "bridge"]
+    }
+  ]
+}
