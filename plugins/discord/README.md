@@ -36,6 +36,30 @@ Every tool carries honest MCP annotations (readers read-only, the rest non-destr
 
 Only allowlisted humans can invoke either form; bot-authored messages are never treated as commands.
 
+## Sender attribution
+
+Every non-command message body begins with a bridge-generated attribution line, so the sender travels inside the text the model reads — not only in tag attributes:
+
+```
+<channel source="discord" channel_id="…" author="karl" author_id="…" sent_at="2026-07-27T14:22:00Z">
+[from: karl (human) · 14:22 UTC]
+Ariel thinks we should change this.
+</channel>
+```
+
+Names inside the message ("Ariel") are thereby always subordinate to the `[from:]` line — the agent is instructed that only that line and the `author` attribute identify the sender. Peer agents are labeled `(bot: codex)`. A user who tries to open their message with a fake `[from:]` line gets it neutralized (`⟦from:` — only the bridge can author that line), and `sent_at` gives explicit ordering when messages arrive in quick succession.
+
+## Multi-agent turn-taking
+
+With `DISCORD_PEER_BOTS` set (the *other* agents' bots, `name:id` pairs), each bridge enforces a floor protocol on its own agent:
+
+- **@-mention claims the floor.** When a human @-mentions exactly one peer agent, this agent's `send_message`/`create_poll` calls into that channel are refused until the mentioned agent answers (or the claim times out, default 10 min). Reading and reactions stay available.
+- **Open floor.** A human message that names no specific agent arms the channel: the *first* agent to answer takes the hold, and everyone else is treated as if that agent had been @-mentioned.
+- **React before commenting.** The floor-holder's answer is forwarded with `claim_response="true"`. Other agents must react on it before speaking: **👍** full agreement — and no message may follow; **✋** partial agreement/disagreement *or* additional context — unlocks a message; **👎** disagreement — unlocks a message. The response window closes when a human speaks again (default 5 min).
+- Peer bots are implicitly allowlisted so their responses always reach the session, and claim responses bypass the mention requirement.
+
+Each bridge gates only its own agent; the combination across bridges yields the fleet-wide protocol. Claims expire automatically so an offline agent can never deadlock a channel.
+
 ## Reloading configuration
 
 Edit the `.env` and the running session picks it up — no exit, no resume. The bridge watches the file (mtime poll, 5s) and re-applies allowlists, channel scoping, DM/mention behavior, the permission channel, and the bot token; a changed token reconnects the gateway. You can also ask the agent to reload on demand, which calls the `reload_config` tool:
@@ -126,6 +150,9 @@ All via environment (put them in the `.env` file):
 | `CHANNEL_ENV_FILE` | no | auto-detected | Credentials file to load and to watch for live reloads |
 | `DISCORD_CONFIG_WATCH` | no | `true` | `false` disables the automatic reload watcher |
 | `DISCORD_CONFIG_WATCH_SECONDS` | no | `5` | Credentials-file poll interval |
+| `DISCORD_PEER_BOTS` | no | — | Other agents' bots (`codex:123,claude:456`) — enables turn-taking |
+| `DISCORD_CLAIM_TIMEOUT_SECONDS` | no | `600` | How long an unanswered @-claim holds the floor |
+| `DISCORD_RESPONSE_WINDOW_SECONDS` | no | `300` | React-before-commenting window after a claim response |
 | `DISCORD_ATTACHMENT_HOSTS`, `DISCORD_API_BASE`, `DISCORD_GATEWAY_URL` | no | Discord | Test overrides |
 
 ## Security model
