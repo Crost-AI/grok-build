@@ -29,6 +29,7 @@ mod display_refresh_startup;
 mod effects;
 pub mod roster;
 pub mod session_startup;
+pub(crate) mod session_title_resolve;
 pub mod status_blocks;
 pub mod subagent;
 pub mod subscription;
@@ -145,6 +146,19 @@ pub(crate) fn minimal_mode_active() -> bool {
 pub(crate) fn set_minimal_mode_active_for_test(on: bool) {
     MINIMAL_MODE_ACTIVE.store(on, Ordering::Release);
 }
+/// Whether a bare Esc cancels a running turn: minimal mode and non-vim
+/// fullscreen get the single-Esc cancel; fullscreen vim mode keeps the
+/// mid-turn swallow (Ctrl+C stays the cancel gesture there).
+///
+/// Pure over its inputs — production callers pass the agent's injected
+/// effective screen mode (`AgentView::is_minimal_mode`, seeded by
+/// `apply_app_scoped_gates`; never the [`minimal_mode_active`] process
+/// global) and tests pass explicit booleans. `vim_mode` is the
+/// scrollback-nav setting (`[ui].vim_mode` / `/vim-mode`), not the prompt
+/// `simple_mode`.
+pub(crate) fn esc_cancels_turn(is_minimal: bool, vim_mode: bool) -> bool {
+    is_minimal || !vim_mode
+}
 /// Whether the opt-in mouse-reporting toggle feature is enabled
 /// (`[ui] mouse_reporting_toggle` / `GROK_MOUSE_REPORTING_TOGGLE`). Seeded once
 /// at startup; gates both the `Ctrl+R` shortcut registration and the
@@ -164,6 +178,19 @@ pub(crate) fn voice_mode_enabled() -> bool {
 /// Test helper for the process-global voice gate.
 pub fn set_voice_mode_enabled_for_test(on: bool) {
     VOICE_MODE_ENABLED.store(on, Ordering::Release);
+}
+/// Process-global gate for the Ctrl+Space / F8 voice chord, for key-routing
+/// and view code without an `AppView` (`resolve_action`, the cheatsheet).
+/// Default ON. Seeded at startup from `[ui].voice_keybind_enabled` and
+/// updated live by the settings setter; unlike [`VOICE_MODE_ENABLED`] it only
+/// silences the keybinding — `/voice` and the other voice surfaces stay up.
+pub(crate) static VOICE_KEYBIND_ENABLED: AtomicBool = AtomicBool::new(true);
+pub(crate) fn voice_keybind_enabled() -> bool {
+    VOICE_KEYBIND_ENABLED.load(Ordering::Acquire)
+}
+/// Test helper for the process-global voice-keybind gate.
+pub fn set_voice_keybind_enabled_for_test(on: bool) {
+    VOICE_KEYBIND_ENABLED.store(on, Ordering::Release);
 }
 /// `[features] voice_mode` from merged `requirements.toml`.
 pub(crate) fn voice_mode_requirement_pin() -> Option<bool> {
@@ -431,6 +458,23 @@ fn resolve_hunk_tracker_mode(
         .find(|s| !s.is_empty())
         .map(str::to_owned)
 }
+/// Run a connect future bounded by cancellation and `timeout`, so a hung leader
+/// or embedded spawn cannot strand the user on a blank screen.
+async fn bounded_connect(
+    cancel: &CancellationToken,
+    timeout: std::time::Duration,
+    target: &str,
+    connect: impl std::future::Future<Output = anyhow::Result<crate::acp::AcpConnection>>,
+) -> anyhow::Result<crate::acp::AcpConnection> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(anyhow::anyhow!("startup cancelled before {target} connected")),
+        r = connect => r,
+        () = tokio::time::sleep(timeout) => {
+            Err(anyhow::anyhow!("timed out after {}s connecting to {target}", timeout.as_secs()))
+        }
+    }
+}
 /// Main entry point: connect to agent, init terminal, run event loop, restore.
 ///
 /// If a session ID is provided via `--resume` / `--load` / `--continue`, the
@@ -451,19 +495,25 @@ pub async fn run(
     let startup_start = std::time::Instant::now();
     let raw_config = xai_grok_shell::config::load_effective_config()
         .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
-    let grok_com_config =
-        match xai_grok_shell::agent::config::Config::new_from_toml_cfg(&raw_config) {
-            Ok(c) => c.grok_com_config,
-            Err(e) => {
-                tracing::warn!(
-                    error = % e, "failed to parse config for auth refresh, using defaults"
-                );
-                xai_grok_shell::auth::GrokComConfig::default()
-            }
-        };
-    let refreshed_auth = xai_grok_shell::auth::try_ensure_fresh_auth(&grok_com_config).await;
-    let early_prefetch =
-        xai_grok_shell::agent::models::start_early_prefetch_with_auth(refreshed_auth);
+    let grok_com_config = match xai_grok_shell::agent::config::Config::new_from_toml_cfg(
+        &raw_config,
+    ) {
+        Ok(c) => c.grok_com_config,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to parse config for auth refresh, using defaults");
+            xai_grok_shell::auth::GrokComConfig::default()
+        }
+    };
+    let refreshed_auth = tokio::time::timeout(
+        xai_grok_shell::http::STARTUP_AUTH_REFRESH_TIMEOUT,
+        xai_grok_shell::auth::try_ensure_fresh_auth(&grok_com_config),
+    )
+    .await
+    .unwrap_or(None);
+    let early_prefetch = match refreshed_auth {
+        Some(auth) => xai_grok_shell::agent::models::start_early_prefetch_with_auth(Some(auth)),
+        None => xai_grok_shell::agent::models::start_early_prefetch(Some(grok_com_config.clone())),
+    };
     xai_grok_shell::agent::mvp_agent::warm_async_http_client();
     tokio::task::spawn_blocking(|| {});
     if let Ok(cwd) = std::env::current_dir() {
@@ -497,9 +547,7 @@ pub async fn run(
         match std::env::current_dir() {
             Ok(cwd) => xai_grok_shell::agent::folder_trust::grant_folder_trust(&cwd),
             Err(e) => {
-                tracing::warn!(
-                    error = % e, "--trust: failed to resolve cwd; folder not trusted"
-                )
+                tracing::warn!(error = %e, "--trust: failed to resolve cwd; folder not trusted")
             }
         }
     }
@@ -618,21 +666,6 @@ pub async fn run(
         default_auto_mode: launch_auto && !launch_yolo.yolo,
         channels: args.channels.clone(),
     };
-    let connection = if use_leader {
-        let conn = crate::acp::connect_via_leader(&cancel, connect_flags, &raw_config).await?;
-        tracing::info!(
-            elapsed_ms = startup_start.elapsed().as_millis() as u64,
-            "Connected via leader"
-        );
-        conn
-    } else {
-        let conn = crate::acp::connect(&cancel, connect_flags).await?;
-        tracing::info!(
-            elapsed_ms = startup_start.elapsed().as_millis() as u64,
-            "Connected directly (non-leader)"
-        );
-        conn
-    };
     let mut config_watcher = crate::appearance::ConfigWatcher::start().await?;
     let alt_screen_config_mode = config_watcher.current().alt_screen;
     let term_ctx = crate::terminal::terminal_context();
@@ -667,12 +700,18 @@ pub async fn run(
     let relaunched_into_minimal = screen_mode_override == Some(ScreenMode::Minimal);
     let relaunched_into_fullscreen = screen_mode_override == Some(ScreenMode::Fullscreen);
     tracing::info!(
-        use_alt_screen = screen_mode.is_fullscreen(), minimal = screen_mode.is_minimal(),
-        mouse_capture = ! screen_mode.is_minimal(), minimal_live_rows = config_watcher
-        .current().minimal_live_rows, is_control_mode, no_alt_screen_cli = args
-        .no_alt_screen, minimal_cli = args.minimal, fullscreen_cli = args.fullscreen,
-        config_screen_mode = ? config_screen_mode, auto_minimal_mouse_leak, config_mode =
-        ? alt_screen_config_mode, multiplexer = ? term_ctx.multiplexer,
+        use_alt_screen = screen_mode.is_fullscreen(),
+        minimal = screen_mode.is_minimal(),
+        mouse_capture = !screen_mode.is_minimal(),
+        minimal_live_rows = config_watcher.current().minimal_live_rows,
+        is_control_mode,
+        no_alt_screen_cli = args.no_alt_screen,
+        minimal_cli = args.minimal,
+        fullscreen_cli = args.fullscreen,
+        config_screen_mode = ?config_screen_mode,
+        auto_minimal_mouse_leak,
+        config_mode = ?alt_screen_config_mode,
+        multiplexer = ?term_ctx.multiplexer,
         "resolved fullscreen policy"
     );
     engage_startup_theme(screen_mode);
@@ -697,6 +736,53 @@ pub async fn run(
     if let Some(ref t) = session_title {
         set_terminal_title(t);
     }
+    const CONNECT_UI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    let fallback_flags = use_leader.then(|| connect_flags.clone());
+    let primary_target = if use_leader {
+        "the grok leader"
+    } else {
+        "the embedded agent"
+    };
+    let connect_result = bounded_connect(&cancel, CONNECT_UI_TIMEOUT, primary_target, async {
+        if use_leader {
+            crate::acp::connect_via_leader(&cancel, connect_flags, &raw_config).await
+        } else {
+            crate::acp::connect(&cancel, connect_flags).await
+        }
+    })
+    .await;
+    let (connect_result, embedded_fallback) = match connect_result {
+        Err(e) if use_leader && !cancel.is_cancelled() => {
+            tracing::warn!(error = %e, "leader connect failed; falling back to embedded agent");
+            let flags = fallback_flags.expect("set on the use_leader path");
+            let fallback =
+                bounded_connect(&cancel, CONNECT_UI_TIMEOUT, "the embedded agent", async {
+                    crate::acp::connect(&cancel, flags).await
+                })
+                .await;
+            (fallback, true)
+        }
+        other => (other, false),
+    };
+    let mut connection = match connect_result {
+        Ok(conn) => {
+            tracing::info!(
+                elapsed_ms = startup_start.elapsed().as_millis() as u64,
+                use_leader = use_leader && !embedded_fallback,
+                embedded_fallback,
+                "Connected"
+            );
+            conn
+        }
+        Err(e) => {
+            crate::unified_log::flush_blocking().await;
+            let _ = restore_terminal(terminal, writer_thread, screen_mode);
+            cancel.cancel();
+            return Err(e);
+        }
+    };
+    let agent_guard =
+        crate::acp::spawn::AgentShutdownGuard::new(cancel.clone(), connection.agent_thread.take());
     let effective_args = PagerArgs {
         resume_session: None,
         load_session: None,
@@ -727,19 +813,20 @@ pub async fn run(
     .await;
     crate::unified_log::flush_blocking().await;
     let restore_result = restore_terminal(terminal, writer_thread, screen_mode);
-    cancel.cancel();
+    drop(agent_guard);
     xai_tty_utils::global_process_scope().kill_all();
     if let Err(cleanup_error) = restore_result {
         match &result {
             Ok(_) => {
                 tracing::warn!(
-                    error = % cleanup_error,
+                    error = %cleanup_error,
                     "terminal cleanup failed after successful event loop"
                 )
             }
             Err(run_error) => {
                 tracing::warn!(
-                    error = % cleanup_error, run_error = % run_error,
+                    error = %cleanup_error,
+                    run_error = %run_error,
                     "terminal cleanup also failed"
                 )
             }
@@ -755,7 +842,7 @@ pub async fn run(
                     &relaunch.session_id,
                     relaunch.minimal,
                 ) {
-                    tracing::error!(error = % e, "screen-mode relaunch failed");
+                    tracing::error!(error = %e, "screen-mode relaunch failed");
                     print_relaunch_failure_hint(
                         &e,
                         &relaunch.session_id,
@@ -1154,8 +1241,10 @@ fn init_terminal(
                 let _ = execute!(stderr, event::PushKeyboardEnhancementFlags(flags));
             });
             tracing::info!(
-                kitty.flags = ? flags, kitty.disambiguate = true, kitty
-                .report_event_types = true, kitty.report_all_keys = false,
+                kitty.flags = ?flags,
+                kitty.disambiguate = true,
+                kitty.report_event_types = true,
+                kitty.report_all_keys = false,
                 "kitty keyboard protocol pushed"
             );
         } else {
@@ -1451,6 +1540,31 @@ mod tests {
     fn config_with_leader(enabled: bool) -> toml::Value {
         let toml_str = format!("[cli]\nuse_leader = {enabled}");
         toml::from_str(&toml_str).unwrap()
+    }
+    #[tokio::test]
+    async fn bounded_connect_times_out_when_the_target_stalls() {
+        let cancel = CancellationToken::new();
+        let r = bounded_connect(
+            &cancel,
+            std::time::Duration::from_millis(20),
+            "the test target",
+            std::future::pending::<anyhow::Result<crate::acp::AcpConnection>>(),
+        )
+        .await;
+        assert!(r.is_err_and(|e| e.to_string().contains("timed out")));
+    }
+    #[tokio::test]
+    async fn bounded_connect_returns_err_on_cancel() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let r = bounded_connect(
+            &cancel,
+            std::time::Duration::from_secs(60),
+            "the test target",
+            std::future::pending::<anyhow::Result<crate::acp::AcpConnection>>(),
+        )
+        .await;
+        assert!(r.is_err_and(|e| e.to_string().contains("cancelled")));
     }
     #[test]
     fn terminal_title_strips_control_characters() {

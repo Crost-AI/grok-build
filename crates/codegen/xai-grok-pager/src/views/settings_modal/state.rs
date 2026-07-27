@@ -7,9 +7,9 @@ use ratatui::layout::Rect;
 use crate::app::actions::Action;
 use crate::input::line_editor::LineEditor;
 use crate::settings::{
-    EnumChoice, OwnedEnumChoice, PagerLocalSnapshot, SettingCategory, SettingKey, SettingKind,
-    SettingMeta, SettingValue, SettingsRegistry, StringValidator, current_value_for,
-    dynamic_enum_choices,
+    CodingDataSharingLock, EnumChoice, OwnedEnumChoice, PagerLocalSnapshot, SettingCategory,
+    SettingKey, SettingKind, SettingMeta, SettingValue, SettingsRegistry, StringValidator,
+    current_value_for, dynamic_enum_choices,
 };
 use crate::views::modal_window::ModalWindowState;
 
@@ -243,6 +243,16 @@ impl SettingsModalState {
         }
     }
 
+    /// Why a Browse row cannot be edited (`None` = editable). Consulted by
+    /// both render and input.
+    pub fn row_lock(&self, key: SettingKey) -> Option<CodingDataSharingLock> {
+        if key == "coding_data_sharing" {
+            self.pager_snapshot.coding_data_sharing_lock
+        } else {
+            None
+        }
+    }
+
     /// The currently-focused setting row, if any.
     pub fn focused_setting(&self) -> Option<(SettingKey, &SettingMeta)> {
         match self.rows.get(self.selected)? {
@@ -252,6 +262,21 @@ impl SettingsModalState {
             }
             RowEntry::Header { .. } => None,
         }
+    }
+
+    /// Focus a setting by registry key (Browse mode). Returns whether the
+    /// key was found; no-op if missing.
+    pub fn focus_key(&mut self, key: &str) -> bool {
+        if let Some(idx) = self
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowEntry::Setting { key: k, .. } if *k == key))
+        {
+            self.selected = idx;
+            self.clamp_selected_to_visible();
+            return true;
+        }
+        false
     }
 
     /// Filtered row indices in render order.
@@ -536,6 +561,9 @@ impl SettingsModalState {
             let Some((key, meta)) = self.focused_setting() else {
                 return false;
             };
+            if self.row_lock(key).is_some() {
+                return false;
+            }
             // Handles both static `Enum` and `DynamicEnum` catalogs.
             let (supports_preview, resolved): (bool, Vec<OwnedEnumChoice>) = match &meta.kind {
                 SettingKind::Enum {
@@ -773,7 +801,12 @@ pub(super) fn setting_row_visible(
     minimal: bool,
     voice_mode: bool,
 ) -> bool {
-    if !voice_mode && matches!(meta.key, "voice_capture_mode" | "voice_stt_language") {
+    if !voice_mode
+        && matches!(
+            meta.key,
+            "voice_keybind_enabled" | "voice_capture_mode" | "voice_stt_language"
+        )
+    {
         return false;
     }
     if meta.key == "voice_capture_mode" && !kitty_releases {
@@ -843,6 +876,7 @@ pub(super) fn action_for_bool(key: SettingKey, new: bool) -> Option<Action> {
         "contextual_hints.ssh_wrap" => Some(Action::SetContextualHintSshWrap(new)),
         "multiline_mode" => Some(Action::SetMultilineMode(new)),
         "vim_mode" => Some(Action::SetVimMode(new)),
+        "voice_keybind_enabled" => Some(Action::SetVoiceKeybindEnabled(new)),
         "remember_tool_approvals" => Some(Action::SetRememberToolApprovals(new)),
         "toolset.ask_user_question.timeout_enabled" => {
             Some(Action::SetAskUserQuestionTimeoutEnabled(new))

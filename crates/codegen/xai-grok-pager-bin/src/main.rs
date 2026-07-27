@@ -44,7 +44,7 @@ use xai_grok_shell::leader::{
 use xai_grok_shell::leader::{
     ControlPayload, LeaderClient, LeaderEnvUrls, connect_or_spawn, socket_path_for_ws_url,
 };
-use xai_grok_update::{UpdateConfig, auto_update, enforce_minimum_version_or_exit};
+use xai_grok_update::{UpdateConfig, auto_update, enforce_version_policy_or_exit};
 /// Apply headless args to an existing config, only overriding values that are
 /// explicitly set. This allows environment defaults to be preserved when
 /// specific args are not provided.
@@ -338,13 +338,15 @@ fn print_leader_descriptor(d: &LeaderDescriptor) {
     eprintln!("  PID {pid} ({state}) -- {sock}");
 }
 fn leader_descriptor_json(d: &LeaderDescriptor) -> serde_json::Value {
-    serde_json::json!(
-        { "pid" : leader_pid(d), "pidFromLock" : d.pid_from_lock, "pidLive" : d.live_info
-        .as_ref().map(| li | li.pid), "classification" : format!("{:?}", d
-        .classification), "socketPath" : d.socket_path.as_deref().map(| p | p.display()
-        .to_string()), "lockPath" : d.lock_path.as_deref().map(| p | p.display()
-        .to_string()), "wsUrlSuffix" : d.ws_url_suffix, }
-    )
+    serde_json::json!({
+        "pid": leader_pid(d),
+        "pidFromLock": d.pid_from_lock,
+        "pidLive": d.live_info.as_ref().map(|li| li.pid),
+        "classification": format!("{:?}", d.classification),
+        "socketPath": d.socket_path.as_deref().map(|p| p.display().to_string()),
+        "lockPath": d.lock_path.as_deref().map(|p| p.display().to_string()),
+        "wsUrlSuffix": d.ws_url_suffix,
+    })
 }
 fn leader_info_json(
     d: &LeaderDescriptor,
@@ -588,10 +590,15 @@ fn render_workspace_payload(payload: &ControlPayload, json: bool) {
         return;
     };
     if json {
-        let value = serde_json::json!(
-            { "state" : state, "hubUrl" : hub_url, "cwd" : cwd, "uptimeMs" : uptime_ms,
-            "activeToolCalls" : active_tool_calls, "sessions" : sessions, "pid" : pid, }
-        );
+        let value = serde_json::json!({
+            "state": state,
+            "hubUrl": hub_url,
+            "cwd": cwd,
+            "uptimeMs": uptime_ms,
+            "activeToolCalls": active_tool_calls,
+            "sessions": sessions,
+            "pid": pid,
+        });
         println!("{}", serde_json::to_string(&value).unwrap_or_default());
         return;
     }
@@ -858,17 +865,22 @@ fn replay_load_json(sid: &str, cached: &CachedSession) -> Option<String> {
         return Some(verbatim.clone());
     }
     let cwd = cached.cwd.as_deref()?;
-    let mut params = serde_json::json!({ "sessionId" : sid, "cwd" : cwd, });
+    let mut params = serde_json::json!({
+        "sessionId": sid,
+        "cwd": cwd,
+    });
     if let Some(ref mcp_raw) = cached.mcp_servers_json
         && let Ok(mcp_val) = serde_json::from_str::<serde_json::Value>(mcp_raw)
     {
         params["mcpServers"] = mcp_val;
     }
     Some(
-        serde_json::json!(
-            { "jsonrpc" : "2.0", "id" : REPLAY_LOAD_REQUEST_ID, "method" :
-            "session/load", "params" : params, }
-        )
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": REPLAY_LOAD_REQUEST_ID,
+            "method": "session/load",
+            "params": params,
+        })
         .to_string(),
     )
 }
@@ -908,24 +920,23 @@ async fn replay_acp_state_after_reconnect(
     let mut restored: Vec<String> = Vec::new();
     for (sid, cached) in &state.sessions {
         let Some(load_json) = replay_load_json(sid, cached) else {
-            tracing::warn!(
-                session_id = % sid, "replay: no way to rebuild session/load; skipping"
-            );
+            tracing::warn!(session_id = %sid, "replay: no way to rebuild session/load; skipping");
             continue;
         };
         match replay_request_until_response(tx, rx, stdout, &load_json, "session/load").await {
             ReplayOutcome::ResponseOk => {
-                tracing::info!(session_id = % sid, "replay: session restored");
+                tracing::info!(session_id = %sid, "replay: session restored");
                 restored.push(sid.clone());
             }
             ReplayOutcome::ResponseErr => {
                 tracing::warn!(
-                    session_id = % sid, "replay: session/load was rejected by new leader"
+                    session_id = %sid,
+                    "replay: session/load was rejected by new leader"
                 );
             }
             ReplayOutcome::Failed => {
                 tracing::warn!(
-                    session_id = % sid,
+                    session_id = %sid,
                     "replay: transport failure during session/load; aborting remaining replays"
                 );
                 break;
@@ -1015,6 +1026,12 @@ async fn run_agent_command(
             }
         }
     });
+    if matches!(
+        agent_args.mode,
+        Some(AgentCmd::Leader(_) | AgentCmd::Stdio | AgentCmd::Headless(_) | AgentCmd::Serve(_))
+    ) {
+        xai_grok_shell::agent::app::suppress_otel();
+    }
     init_tracing_simple("agent");
     let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
     xai_grok_telemetry::instrumentation::install_panic_hook();
@@ -1022,9 +1039,7 @@ async fn run_agent_command(
         match std::env::current_dir() {
             Ok(cwd) => xai_grok_shell::agent::folder_trust::grant_folder_trust(&cwd),
             Err(e) => {
-                tracing::warn!(
-                    error = % e, "--trust: failed to resolve cwd; folder not trusted"
-                )
+                tracing::warn!(error = %e, "--trust: failed to resolve cwd; folder not trusted")
             }
         }
     }
@@ -1191,11 +1206,18 @@ async fn run_agent_command(
                     let mut stdin_lines = xai_acp_lib::spawn_stdin_line_reader();
                     loop {
                         tokio::select! {
-                            biased; _ = cancel_stdin.cancelled() => break, maybe_line =
-                            stdin_lines.recv() => { let Some(line) = maybe_line else {
-                            break }; forward_stdio_line_to_leader(line, &
-                            leader_tx_stdin, & replay_state_stdin, & cancel_stdin,).
-                            await; }
+                            biased;
+                            _ = cancel_stdin.cancelled() => break,
+                            maybe_line = stdin_lines.recv() => {
+                                let Some(line) = maybe_line else { break };
+                                forward_stdio_line_to_leader(
+                                    line,
+                                    &leader_tx_stdin,
+                                    &replay_state_stdin,
+                                    &cancel_stdin,
+                                )
+                                .await;
+                            }
                         }
                     }
                 });
@@ -1245,7 +1267,7 @@ async fn run_agent_command(
                                         reconnector.notify_connected();
                                         let params = match replayed_session_id {
                                             Some(ref sid) => {
-                                                serde_json::json!({ "sessionId" : sid }).to_string()
+                                                serde_json::json!({ "sessionId": sid }).to_string()
                                             }
                                             None => "{}".to_string(),
                                         };
@@ -1258,7 +1280,7 @@ async fn run_agent_command(
                                         continue;
                                     }
                                     Err(e) => {
-                                        tracing::error!(error = % e, "Failed to reconnect (stdio)");
+                                        tracing::error!(error = %e, "Failed to reconnect (stdio)");
                                         cancel_stdout.cancel();
                                         break;
                                     }
@@ -1268,7 +1290,8 @@ async fn run_agent_command(
                     }
                 });
                 tokio::select! {
-                    _ = stdin_task => {} _ = stdout_task => {}
+                    _ = stdin_task => {}
+                    _ = stdout_task => {}
                 }
                 return Ok(());
             }
@@ -1293,9 +1316,7 @@ async fn run_agent_command(
                                     continue;
                                 }
                                 Err(e) => {
-                                    tracing::error!(
-                                        error = % e, "Failed to reconnect (headless)"
-                                    );
+                                    tracing::error!(error = %e, "Failed to reconnect (headless)");
                                     break;
                                 }
                             }
@@ -1401,25 +1422,24 @@ async fn run_agent_command(
         }
     }
 }
-/// Raise the per-process file descriptor soft limit on macOS.
+/// Raise the per-process fd soft limit toward the hard limit.
 ///
-/// macOS has a conservative default soft `RLIMIT_NOFILE` (256) that is easily
-/// exceeded by parallel directory walking + file copying in worktree creation,
-/// stdio MCP servers, tool subprocesses, and async runtime sockets.
+/// Default soft limits (256 macOS, commonly 1024 Linux) are easily exceeded:
+/// each session thread's runtime costs ~3 fds, and a wide parallel subagent
+/// wave adds spawn-burst transients — a 1024 limit fails with EMFILE under a
+/// ~100-session wave. Targets 65536 on Linux (hard limits typically >= 1M)
+/// and 8192 on macOS (`kern.maxfilesperproc` is often ~10k). No known
+/// in-tree `select(2)` users (Rust std/tokio use epoll/kqueue); residual
+/// third-party `FD_SETSIZE` risk is accepted — the prior 8192 cap already
+/// exceeded FD_SETSIZE.
 ///
-/// We raise the soft limit toward the hard limit, capped at 8192 to stay below
-/// `FD_SETSIZE` (1024 on macOS) safety boundaries in any C dependency that may
-/// still use `select(2)` -- Rust std + tokio use `kqueue`, but vendored C code
-/// can corrupt the stack if it select()'s on an fd >= FD_SETSIZE. 8192 also
-/// keeps fork-time fd-table iteration cheap for any child that does
-/// "close all fds up to rlim_cur" on exec.
-///
-/// Best-effort: silently ignores all errors (process limits can be tightened by
-/// containers/cgroups and we should never block startup on a non-essential
-/// optimization).
-#[cfg(target_os = "macos")]
+/// Best-effort: never blocks startup (containers/cgroups may pin limits).
+#[cfg(unix)]
 fn raise_fd_limit() {
+    #[cfg(target_os = "macos")]
     const TARGET: libc::rlim_t = 8192;
+    #[cfg(not(target_os = "macos"))]
+    const TARGET: libc::rlim_t = 65536;
     unsafe {
         let mut rlim = libc::rlimit {
             rlim_cur: 0,
@@ -1439,7 +1459,7 @@ fn raise_fd_limit() {
         }
     }
 }
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(unix))]
 fn raise_fd_limit() {}
 /// Single audit point for the `Command::Dashboard` soft-subcommand.
 /// Sets `GROK_OPEN_DASHBOARD_AT_STARTUP=1` if the user asked for
@@ -1640,6 +1660,9 @@ fn main() {
     if let Some(code) = xai_grok_pager::app::mermaid_worker::maybe_run_render_subprocess() {
         std::process::exit(code);
     }
+    if let Some(code) = xai_grok_pager::voice::maybe_run_capture_subprocess() {
+        std::process::exit(code);
+    }
     let args = PagerArgs::parse_cli();
     if dispatch_version_if_requested(&args) || dispatch_doctor_if_requested(&args) {
         return;
@@ -1753,6 +1776,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
     if let Some(Command::Wrap(ref wrap_args)) = args.command {
         return xai_grok_pager::wrap_cmd::run(wrap_args);
     }
+    args.pin_local_resume_target()?;
     let saved_profile = args.saved_resume_profile();
     let sandbox_profile_arg = match args.startup_sandbox_profile(saved_profile.as_deref()) {
         xai_grok_pager::app::cli::SandboxStartup::Apply(profile) => profile,
@@ -1785,10 +1809,10 @@ async fn async_main(args: PagerArgs) -> Result<()> {
         match command {
             Command::Version { json } => {
                 if json {
-                    let payload = serde_json::json!(
-                        { "currentVersion" : env!("VERSION_WITH_COMMIT"), "channel" :
-                        xai_grok_update::channel_name().unwrap_or("unknown"), }
-                    );
+                    let payload = serde_json::json!({
+                        "currentVersion": env!("VERSION_WITH_COMMIT"),
+                        "channel": xai_grok_update::channel_name().unwrap_or("unknown"),
+                    });
                     println!("{}", serde_json::to_string(&payload)?);
                 } else {
                     write_version(
@@ -1810,7 +1834,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                          Use `grok-pager agent {flag}` instead."
                     );
                 }
-                enforce_minimum_version_or_exit(&update_config).await;
+                enforce_version_policy_or_exit();
                 return run_agent_command(
                     agent_args,
                     args.permission_mode_flag.clone(),
@@ -1974,7 +1998,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
     if let Some(prompt) = headless_prompt {
         init_tracing_simple(HEADLESS_ENTRYPOINT);
         let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
-        enforce_minimum_version_or_exit(&update_config).await;
+        enforce_version_policy_or_exit();
         let launch_yolo = xai_grok_shell::util::config::effective_yolo_for_launch(
             args.yolo,
             args.permission_mode_flag.as_deref(),
@@ -1999,6 +2023,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
             xai_grok_pager::headless::HeadlessOptions {
                 session_id: args.session_id.clone(),
                 resume: args.resume_session.or(args.load_session),
+                resume_title_pinned: args.resume_target_pinned,
                 cwd: args.cwd,
                 yolo: launch_yolo.yolo,
                 trust: args.trust,
@@ -2030,7 +2055,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
         )
         .await;
     }
-    enforce_minimum_version_or_exit(&update_config).await;
+    enforce_version_policy_or_exit();
     let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
     type UpdateWaitHandle = tokio::task::JoinHandle<std::io::Result<std::process::ExitStatus>>;
     let bg_update_wait: std::sync::Arc<tokio::sync::Mutex<Option<UpdateWaitHandle>>> =
@@ -2264,9 +2289,7 @@ async fn signal_leaders_to_relaunch(installed_version: &str) {
         {
             Ok(c) => c,
             Err(e) => {
-                tracing::debug!(
-                    error = % e, "Could not connect to leader to signal relaunch"
-                );
+                tracing::debug!(error = %e, "Could not connect to leader to signal relaunch");
                 continue;
             }
         };
@@ -2288,17 +2311,14 @@ async fn signal_leaders_to_relaunch(installed_version: &str) {
                 eprintln!("  ↻ Relaunching shared session (leader {from_version} → {to_version})…");
             }
             Ok(Ok(xai_grok_shell::leader::ControlPayload::RelaunchDeclined { reason })) => {
-                tracing::debug!(% reason, "Leader declined relaunch");
+                tracing::debug!(%reason, "Leader declined relaunch");
             }
             Ok(Ok(_)) => {}
             Ok(Err(e)) => {
-                tracing::debug!(error = % e.message, "Leader relaunch control error");
+                tracing::debug!(error = %e.message, "Leader relaunch control error");
             }
             Err(e) => {
-                tracing::debug!(
-                    error = % e,
-                    "Leader relaunch ack not received (leader may be exiting)"
-                );
+                tracing::debug!(error = %e, "Leader relaunch ack not received (leader may be exiting)");
             }
         }
         client.cancel();
@@ -2819,10 +2839,11 @@ mod tests {
             assert_eq!(load2_json["id"].as_str(), Some(REPLAY_LOAD_REQUEST_ID));
             response_tx
                 .send(
-                    serde_json::json!(
-                        { "jsonrpc" : "2.0", "id" : REPLAY_LOAD_REQUEST_ID, "result" : {}
-                        }
-                    )
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": REPLAY_LOAD_REQUEST_ID,
+                        "result": {}
+                    })
                     .to_string(),
                 )
                 .unwrap();
@@ -2968,8 +2989,8 @@ mod tests {
                 response_tx
                     .send(
                         format!(
-                            r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s9","n":{i}}}}}"#
-                        ),
+                        r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s9","n":{i}}}}}"#
+                    ),
                     )
                     .unwrap();
             }
@@ -3072,10 +3093,11 @@ mod tests {
             );
             response_tx
                 .send(
-                    serde_json::json!(
-                        { "jsonrpc" : "2.0", "id" : REPLAY_LOAD_REQUEST_ID, "result" : {}
-                        }
-                    )
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": REPLAY_LOAD_REQUEST_ID,
+                        "result": {}
+                    })
                     .to_string(),
                 )
                 .unwrap();

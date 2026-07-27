@@ -241,6 +241,7 @@ impl SessionActor {
             json_schema,
             origin,
             running_display,
+            tool_overrides_update,
         ) = {
             let Some(front) = state.pending_inputs.front_mut() else {
                 return;
@@ -260,8 +261,10 @@ impl SessionActor {
                 front.json_schema.clone(),
                 front.origin.clone(),
                 running_display,
+                front.tool_overrides_update.take(),
             )
         };
+        self.apply_tool_overrides_update(tool_overrides_update);
         if matches!(origin, super::PromptOrigin::User) {
             if let Some(gate) = &self.tool_context.task_wake_suppressed {
                 gate.set(false);
@@ -600,6 +603,7 @@ impl SessionActor {
             json_schema: None,
             origin: super::PromptOrigin::NotificationDrain,
             task_wake_fallback: None,
+            tool_overrides_update: None,
             respond_to,
             persist_ack: None,
             parsed_prompt_tx: None,

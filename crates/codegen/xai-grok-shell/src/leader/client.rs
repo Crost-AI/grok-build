@@ -26,12 +26,13 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// Timeout for receiving registration response from server.
 /// This prevents indefinite hangs if the server doesn't respond.
 const REGISTRATION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Timeout for waiting for `LeaderReady` after a `Registered { ready: false }` response.
+/// Timeout for waiting for `LeaderReady` after a `Registered { ready: false }`.
 ///
-/// Auth + model prefetch can take significant time (network calls, potential browser
-/// OAuth flow). 5 minutes is generous enough to cover all practical scenarios; if the
-/// leader fails it will close the connection first anyway.
-const LEADER_READY_TIMEOUT: Duration = Duration::from_secs(300);
+/// The leader signals readiness right after its bounded sign-in
+/// (`STARTUP_AUTH_TIMEOUT`); model/settings prefetch runs off the readiness path
+/// and the leader never opens a browser OAuth flow. This therefore only needs to
+/// cover that bounded auth plus margin, matching the client connect ceiling.
+const LEADER_READY_TIMEOUT: Duration = crate::http::MIN_CLIENT_CONNECT_TIMEOUT;
 
 /// Reason the client disconnected from the leader server.
 ///
@@ -863,8 +864,7 @@ mod tests {
                             svg_path,
                             frequency_hz: 200,
                             ..
-                        }
-if svg_path == output_path
+                        } if svg_path == output_path
                     ));
 
                     let status = client
@@ -880,8 +880,7 @@ if svg_path == output_path
                             svg_path: Some(path),
                             frequency_hz: Some(200),
                             ..
-                        }
-if path == output_path
+                        } if path == output_path
                     ));
 
                     let stopped = client
@@ -891,8 +890,7 @@ if path == output_path
                         .unwrap();
                     assert!(matches!(
                         stopped,
-                        ControlPayload::CpuProfileStopped { svg_path, .. }
-if svg_path == output_path
+                        ControlPayload::CpuProfileStopped { svg_path, .. } if svg_path == output_path
                     ));
                     assert!(output_path.exists());
                 }
@@ -997,8 +995,7 @@ if svg_path == output_path
                 svg_path: Some(path),
                 frequency_hz: Some(200),
                 ..
-            }
-if path == output_path
+            } if path == output_path
         ));
 
         let leader_info = client_b
@@ -1038,8 +1035,7 @@ if path == output_path
         let stopped = stop_task.await.unwrap().unwrap().unwrap();
         assert!(matches!(
             stopped,
-            ControlPayload::CpuProfileStopped { svg_path, .. }
-if svg_path == output_path
+            ControlPayload::CpuProfileStopped { svg_path, .. } if svg_path == output_path
         ));
         assert_eq!(
             stop_calls.lock().unwrap().as_slice(),

@@ -27,8 +27,8 @@ Location: `~/.grok/config.toml`. If the file is missing, Grok uses its built-in 
 auto_update = true                     # check for updates on launch
 
 [models]
-default = "grok-build"                 # model used for new sessions
-web_search = "grok-4.20-multi-agent"   # model used by the web_search tool
+default = "grok-4.5"                   # model used for new sessions
+web_search = "grok-4.5"                # model used by the web_search tool
 
 # Defaults applied to every model; a per-model [model.<id>] value always wins.
 # See "Custom Models" for the per-model overrides and full details.
@@ -124,8 +124,8 @@ You can also override this with `GROK_DEFAULT_SELECTED_PERMISSION`, which is han
 
 | Value | Behavior |
 |-------|----------|
-| `false` (default) | Bare-letter and `Shift+letter` keys (`j`/`k`, `h`/`l`, `g`/`G`, `y`/`Y`, `o`/`O`, `r`, `x`, `e`/`E`, `H`/`L`, plus `i`) are suppressed in the scrollback: pressing one focuses the prompt and types the character. Arrows, `Tab`, `Space`, `PageUp`/`PageDown`, and every `Ctrl+letter` shortcut still navigate. `Esc` is **not** a scrollback key — it follows clear / rewind / mid-turn-swallow policy (see [Keyboard Shortcuts](03-keyboard-shortcuts.md#escape)). |
-| `true` | All vim-style scrollback bindings are active, exactly as listed in [Keyboard Shortcuts](03-keyboard-shortcuts.md). |
+| `false` (default) | Bare-letter and `Shift+letter` keys (`j`/`k`, `h`/`l`, `g`/`G`, `y`/`Y`, `o`/`O`, `r`, `x`, `e`/`E`, `H`/`L`, plus `i`) are suppressed in the scrollback: pressing one focuses the prompt and types the character. Arrows, `Tab`, `Space`, `PageUp`/`PageDown`, and every `Ctrl+letter` shortcut still navigate. `Esc` is **not** a scrollback key — it cancels a running turn, and while idle follows the clear / rewind policy (see [Keyboard Shortcuts](03-keyboard-shortcuts.md#escape)). |
+| `true` | All vim-style scrollback bindings are active, exactly as listed in [Keyboard Shortcuts](03-keyboard-shortcuts.md). Mid-turn `Esc` is swallowed in this mode (`Ctrl+C` cancels); minimal mode keeps Esc-cancel regardless. |
 
 Toggle it at runtime with `/vim-mode`, or from `/settings` → **Vim scrollback navigation**. Grok writes the change to `[ui] vim_mode` immediately and applies it to every future pager session, including new agents and subagents in the same process. There's no per-session override — `config.toml` is the source of truth on next launch. `vim_mode` is independent of `simple_mode`.
 
@@ -226,9 +226,11 @@ temperature = 0.7                     # sampling temperature (0.0-2.0)
 top_p = 0.95                          # nucleus sampling parameter
 max_completion_tokens = 8192          # max tokens per response
 context_window = 128000               # context window size (for auto-compact)
+query_params = { api-version = "2026-07-22" } # query params appended to every request URL
+env_http_headers = { "X-Tenant" = "TENANT_TOKEN" }    # request headers from env vars, resolved at client build
 ```
 
-Credential resolution: `api_key` > `env_key` > signed-in session token > `XAI_API_KEY`.
+Credential resolution: `api_key` > `env_key` > signed-in session token > `XAI_API_KEY`. See [Custom Models](11-custom-models.md#request-query-parameters) for `query_params` and `env_http_headers`, and [Sandbox Mode](18-sandbox.md#shell-environment-policy) for `[shell_environment_policy]`, which restricts the environment variables tool subprocesses inherit.
 
 To override a built-in model, use its name as the section key and set only the fields you need:
 
@@ -326,11 +328,11 @@ To pin the model a subagent uses, set its entry under `[subagents.models]`.
 
 `/goal` has two drivers, chosen by the background-workflows setting. With workflows enabled, the host-owned workflow engine evaluates rounds and drives completion verification; with them disabled, `/goal` falls back to the legacy model-facing `update_goal` tool. Whether `/goal` is available at all is a separate switch (the goal feature setting).
 
-Background workflows — the `workflow` tool, named `.grok/workflows/*.rhai` scripts, `/deep-research`, and `/workflow` launches — are **off by default**.
+Background workflows — the `workflow` tool, named `.grok/workflows/*.rhai` scripts, `/deep-research`, and `/workflow` launches — are **on by default**. Disable with config, env, or remote settings.
 
 ```toml
 [workflows]
-enabled = true                        # enable background workflows (or GROK_WORKFLOWS=1)
+enabled = false                       # disable background workflows (or GROK_WORKFLOWS=0)
 ```
 
 Project workflows are discovered from `<repo-root>/.grok/workflows/`; user workflows from `~/.grok/workflows/`. Discovery and invocation key off the script's `meta.name`, so keep each filename aligned with its `meta.name`. Built-ins win over project names, and project names win over user names, so keep names unique across scopes.
@@ -491,16 +493,7 @@ timeout_secs = 5
 
 #### Troubleshooting
 
-**Notifications not working in tmux:** tmux blocks escape sequences by default, so enable passthrough:
-
-```bash
-# In ~/.tmux.conf
-set -g allow-passthrough on
-```
-
-Restart tmux afterward. If passthrough isn't available (tmux < 3.3), set `method = "bel"`, which works without it.
-
-**Focus tracking not working:** some terminals don't report focus events. If `condition = "unfocused"` never fires, try `condition = "always"`. Grok supports focus tracking in every detected terminal except Apple Terminal and unrecognized ones.
+Run `/doctor` in the affected session. It shows the detected notification and focus issues, the relevant configuration file, and the steps to resolve them. An explicit `method = "bel"` is treated as intentional. `method = "none"` turns off notification and focus findings.
 
 **Sleep prevention not taking effect:** on macOS, sleep prevention uses `IOPMAssertionCreateWithName` via CoreFoundation; on Linux, `systemd-inhibit` (which must be on `$PATH`). Make sure the relevant tool is available. Prevention is only active during agent turns and releases automatically when the turn ends.
 
@@ -541,6 +534,41 @@ otel_protocol = "http/protobuf"                           # http/protobuf | grpc
 otel_log_user_prompts = false                             # content gate (admins can pin via requirements)
 otel_log_tool_details = false                             # content gate (admins can pin via requirements)
 ```
+
+### Version pinning
+
+Control which versions the CLI may auto-update to and which versions may run. Set
+these in `[cli]`, or in a managed layer for fleet-wide policy. Each has an
+environment override that can only tighten the bound, for CI and testing.
+
+> **Changed:** `minimum_version` no longer blocks startup. It is now a soft
+> anti-downgrade floor for the updater. For a hard floor that prevents old
+> versions from starting, use `required_minimum_version`.
+
+```toml
+[cli]
+minimum_version = "0.2.109"          # updater won't downgrade below this
+maximum_version = "0.2.180"          # updater won't install above this
+required_minimum_version = "0.2.100" # refuse to start below this
+required_maximum_version = "0.2.200" # refuse to start above this
+```
+
+- `minimum_version` (`GROK_MINIMUM_VERSION`) is a soft anti-downgrade floor. The
+  updater skips a target below it and keeps the current version. It never blocks
+  startup.
+- `maximum_version` (`GROK_MAXIMUM_VERSION`) is a soft ceiling. The updater caps
+  its target at it and never installs above it.
+- `required_minimum_version` (`GROK_REQUIRED_MINIMUM_VERSION`) and
+  `required_maximum_version` (`GROK_REQUIRED_MAXIMUM_VERSION`) are hard bounds. If
+  the running version is outside the range, the CLI exits at startup and instructs
+  the user to install an approved version. `grok update` and `grok --version` keep
+  working so an out-of-range install can recover.
+- Bounds resolve across config layers by tightening only: a floor takes the
+  highest value and a ceiling the lowest, so a managed bound can't be loosened,
+  and a user or environment bound can't cancel a managed hard bound. An invalid
+  value is ignored so a bad policy can't block startup.
+- An explicit `grok update --version X` is allowed above the ceiling, to recover
+  from a too-new install, and rejected below the hard floor.
 
 ### Enterprise deployment
 
@@ -714,7 +742,7 @@ The key ones. See the README for the complete list.
 |----------|-------------|
 | `GROK_MEMORY` | Enable (`1`) or disable (`0`) cross-session memory |
 | `GROK_SUBAGENTS` | Enable (`1`) or disable (`0`) subagents |
-| `GROK_WORKFLOWS` | Enable (`1`) or disable (`0`) background workflows and select the `/goal` driver (default off: legacy `update_goal`; on: host-owned workflow driver) |
+| `GROK_WORKFLOWS` | Enable (`1`) or disable (`0`) background workflows and select the `/goal` driver (default on: host-owned workflow driver; off: legacy `update_goal`) |
 | `GROK_WEB_FETCH` | Enable (`1`) or disable (`0`) the web_fetch tool |
 | `GROK_WEB_FETCH_ALLOW_LOCAL` | Allow `web_fetch` to explicit loopback hosts only (`localhost` / `127.0.0.0/8` / `::1`). Same as `[toolset.web_fetch] allow_local`. Default off; private/metadata stay blocked. |
 | `GROK_AGENT` | Custom agent definition path or name |
