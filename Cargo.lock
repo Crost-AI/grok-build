@@ -13223,6 +13223,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "xai-grok-crost-memory"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "fastrand",
+ "regex",
+ "reqwest 0.12.24",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "xai-token-estimation",
+]
+
+[[package]]
 name = "xai-grok-env"
 version = "0.1.0"
 dependencies = [
