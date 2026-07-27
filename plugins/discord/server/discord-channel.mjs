@@ -51,7 +51,7 @@
 //
 // DISCORD_API_BASE and DISCORD_GATEWAY_URL exist for tests only.
 
-import { readFileSync } from 'node:fs'
+import { readFileSync, statSync } from 'node:fs'
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -68,22 +68,41 @@ const NAMESPACES = (process.env.CHANNEL_NAMESPACES ?? 'grok,codex,claude')
   .map((s) => s.trim())
   .filter(Boolean)
 
-// Claude Code does not inject channel credentials into plugin MCP servers
-// the way Grok Build and Codex do, so when launched by Claude Code
-// (detected via the CLAUDE_PLUGIN_ROOT env var it exports; Grok only
-// substitutes the token in strings and never exports it) the bridge loads
-// ~/.claude/channels/discord/.env itself. CHANNEL_ENV_FILE overrides the
-// path. Only variables not already present in the environment are filled
-// in, so host-injected credentials always win.
-const channelEnvFile =
-  process.env.CHANNEL_ENV_FILE ??
-  (process.env.CLAUDE_PLUGIN_ROOT
-    ? path.join(os.homedir(), '.claude', 'channels', 'discord', '.env')
-    : null)
-if (channelEnvFile) {
+// ── Channel credentials file ──────────────────────────────────────────
+// Grok Build and Codex inject `~/.<home>/channels/<server>/.env` into the
+// server's environment at spawn; Claude Code does not, so the bridge reads
+// the file itself. Either way the FILE is the source of truth, which is
+// what makes live reload (`reload_config`) meaningful: re-reading it picks
+// up edits without restarting the session.
+function resolveChannelEnvPath() {
+  const explicit = process.env.CHANNEL_ENV_FILE
+  if (explicit) return explicit.replace(/^~(?=\/)/, os.homedir())
+  const homes = []
+  if (process.env.CLAUDE_PLUGIN_ROOT) homes.push('.claude')
+  if (process.env.CODEX_HOME) homes.push(process.env.CODEX_HOME)
+  if (process.env.GROK_HOME) homes.push(process.env.GROK_HOME)
+  homes.push('.claude', '.codex', '.grok')
+  for (const home of homes) {
+    const base = home.startsWith('.') ? path.join(os.homedir(), home) : home
+    const candidate = path.join(base, 'channels', 'discord', '.env')
+    try {
+      statSync(candidate)
+      return candidate
+    } catch {
+      /* try the next home */
+    }
+  }
+  return null
+}
+
+const CHANNEL_ENV_PATH = resolveChannelEnvPath()
+
+/** Parse the credentials .env into a plain object (empty when unreadable). */
+function readChannelEnvFile() {
+  if (!CHANNEL_ENV_PATH) return {}
+  const vars = {}
   try {
-    const envPath = channelEnvFile.replace(/^~(?=\/)/, os.homedir())
-    for (const rawLine of readFileSync(envPath, 'utf8').split('\n')) {
+    for (const rawLine of readFileSync(CHANNEL_ENV_PATH, 'utf8').split('\n')) {
       let line = rawLine.trim()
       if (!line || line.startsWith('#')) continue
       if (line.startsWith('export ')) line = line.slice('export '.length).trim()
@@ -97,12 +116,19 @@ if (channelEnvFile) {
       ) {
         value = value.slice(1, -1)
       }
-      if (key && !(key in process.env)) process.env[key] = value
+      if (key) vars[key] = value
     }
   } catch {
-    // Missing/unreadable file is fine — credentials may come from the
-    // environment instead.
+    // Missing/unreadable file is fine — the host may have injected the
+    // variables directly.
   }
+  return vars
+}
+
+// Startup: fill in only what the host did not already provide, so
+// host-injected credentials win on the first load.
+for (const [key, value] of Object.entries(readChannelEnvFile())) {
+  if (!(key in process.env)) process.env[key] = value
 }
 
 // Discord's upload limit for bots without guild boosts.
@@ -111,44 +137,56 @@ const MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 const MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
 // Hosts read_attachment may fetch from — Discord's CDN only, so the tool
 // can't be steered into arbitrary URL fetches. Env override is for tests.
-const ATTACHMENT_HOSTS = new Set(
-  (process.env.DISCORD_ATTACHMENT_HOSTS ?? 'cdn.discordapp.com,media.discordapp.net')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean),
-)
+// ── Live-reloadable configuration ─────────────────────────────────────
+// These are `let`, not `const`: `reloadConfig()` recomputes them from the
+// credentials file so allowlists, channel scoping, and mention behavior
+// can be changed without restarting the session. Endpoints and intents
+// are fixed for the process lifetime.
 const DOWNLOAD_DIR = path.join(os.tmpdir(), 'discord-bridge-attachments')
 const API_BASE = process.env.DISCORD_API_BASE ?? 'https://discord.com/api/v10'
 const GATEWAY_URL =
   process.env.DISCORD_GATEWAY_URL ?? 'wss://gateway.discord.gg/?v=10&encoding=json'
-const TOKEN = (process.env.DISCORD_BOT_TOKEN ?? '').trim()
 
 // GUILDS | GUILD_MESSAGES | DIRECT_MESSAGES | MESSAGE_CONTENT
 const INTENTS = (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15)
 
-const allowedUsers = new Set(
-  (process.env.DISCORD_ALLOWED_USER_IDS ?? '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean),
-)
-const allowAllUsers = allowedUsers.has('*')
-const allowedBots = new Set(
-  (process.env.DISCORD_ALLOWED_BOT_IDS ?? '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean),
-)
-const channelIds = new Set(
-  (process.env.DISCORD_CHANNEL_IDS ?? '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean),
-)
-const allowDMs = process.env.DISCORD_ALLOW_DMS !== 'false'
-const requireMention = process.env.DISCORD_REQUIRE_MENTION !== 'false'
-const mentionWindowMs =
-  Math.max(0, Number(process.env.DISCORD_MENTION_WINDOW_SECONDS ?? '60') || 0) * 1000
+function idSet(value) {
+  return new Set(
+    (value ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
+  )
+}
+
+let ATTACHMENT_HOSTS
+let TOKEN
+let allowedUsers
+let allowAllUsers
+let allowedBots
+let channelIds
+let allowDMs
+let requireMention
+let mentionWindowMs
+let permissionChannelEnv
+
+/** Recompute every reloadable setting from the current environment. */
+function applyConfigFromEnv() {
+  ATTACHMENT_HOSTS = idSet(
+    process.env.DISCORD_ATTACHMENT_HOSTS ?? 'cdn.discordapp.com,media.discordapp.net',
+  )
+  TOKEN = (process.env.DISCORD_BOT_TOKEN ?? '').trim()
+  allowedUsers = idSet(process.env.DISCORD_ALLOWED_USER_IDS)
+  allowAllUsers = allowedUsers.has('*')
+  allowedBots = idSet(process.env.DISCORD_ALLOWED_BOT_IDS)
+  channelIds = idSet(process.env.DISCORD_CHANNEL_IDS)
+  allowDMs = process.env.DISCORD_ALLOW_DMS !== 'false'
+  requireMention = process.env.DISCORD_REQUIRE_MENTION !== 'false'
+  mentionWindowMs =
+    Math.max(0, Number(process.env.DISCORD_MENTION_WINDOW_SECONDS ?? '60') || 0) * 1000
+  permissionChannelEnv = (process.env.DISCORD_PERMISSION_CHANNEL_ID ?? '').trim()
+}
+applyConfigFromEnv()
 
 // thread channel id → parent channel id (for DISCORD_CHANNEL_IDS inheritance).
 // Populated from THREAD_CREATE/UPDATE and REST fallback on first message.
@@ -177,6 +215,109 @@ function pushChannelEvent(content, meta) {
   }
 }
 
+// ── Live config reload ────────────────────────────────────────────────
+// Re-reads the credentials file and re-applies every reloadable setting,
+// so editing allowlists / channel scoping / mention behavior takes effect
+// without exiting and resuming the session. Triggered by the
+// `reload_config` tool, or automatically when the file's mtime changes.
+
+/** Snapshot used to describe what a reload actually changed. */
+function configSnapshot() {
+  return {
+    token: TOKEN,
+    users: [...allowedUsers].sort().join(','),
+    bots: [...allowedBots].sort().join(','),
+    channels: [...channelIds].sort().join(','),
+    dms: allowDMs,
+    mention: requireMention,
+    window: mentionWindowMs,
+    permissionChannel: permissionChannelEnv,
+  }
+}
+
+function describeConfigChanges(before, after) {
+  const changes = []
+  if (before.token !== after.token) changes.push('bot token')
+  if (before.users !== after.users) changes.push(`allowed users (${after.users || 'none'})`)
+  if (before.bots !== after.bots) changes.push(`allowed bots (${after.bots || 'none'})`)
+  if (before.channels !== after.channels) {
+    changes.push(`channel allowlist (${after.channels || 'all channels'})`)
+  }
+  if (before.dms !== after.dms) changes.push(`DMs ${after.dms ? 'allowed' : 'ignored'}`)
+  if (before.mention !== after.mention) {
+    changes.push(`mention requirement ${after.mention ? 'on' : 'off'}`)
+  }
+  if (before.window !== after.window) changes.push(`continuation window ${after.window / 1000}s`)
+  if (before.permissionChannel !== after.permissionChannel) changes.push('permission channel')
+  return changes
+}
+
+/**
+ * Re-read the credentials file and apply it. The file wins over the
+ * environment here (unlike startup): a reload exists precisely because the
+ * user just edited it. Returns a human-readable summary.
+ */
+function reloadConfig() {
+  if (!CHANNEL_ENV_PATH) {
+    return 'no channel credentials file found; nothing to reload (set CHANNEL_ENV_FILE to point at one)'
+  }
+  const before = configSnapshot()
+  const vars = readChannelEnvFile()
+  if (Object.keys(vars).length === 0) {
+    return `could not read ${CHANNEL_ENV_PATH} (missing or empty); configuration left unchanged`
+  }
+  for (const [key, value] of Object.entries(vars)) {
+    process.env[key] = value
+  }
+  applyConfigFromEnv()
+  const after = configSnapshot()
+  const changes = describeConfigChanges(before, after)
+  if (changes.length === 0) {
+    return `reloaded ${CHANNEL_ENV_PATH}; no settings changed`
+  }
+  // A new token needs a fresh gateway identity; everything else is read
+  // per-message and takes effect immediately.
+  if (before.token !== after.token && TOKEN) {
+    log('bot token changed on reload; reconnecting the gateway')
+    try {
+      ws?.close(4000)
+    } catch {
+      /* the reconnect path handles a closed socket */
+    }
+  }
+  const summary = `reloaded ${CHANNEL_ENV_PATH}: ${changes.join('; ')}`
+  log(summary)
+  return summary
+}
+
+// Auto-reload: poll the credentials file's mtime. Cheap (one stat every
+// few seconds) and avoids fs.watch's platform quirks over network mounts.
+let lastEnvMtimeMs = null
+try {
+  lastEnvMtimeMs = CHANNEL_ENV_PATH ? statSync(CHANNEL_ENV_PATH).mtimeMs : null
+} catch {
+  /* file may not exist yet */
+}
+if (CHANNEL_ENV_PATH && process.env.DISCORD_CONFIG_WATCH !== 'false') {
+  const intervalMs = Math.max(
+    1000,
+    Number(process.env.DISCORD_CONFIG_WATCH_SECONDS ?? '5') * 1000 || 5000,
+  )
+  setInterval(() => {
+    let mtime
+    try {
+      mtime = statSync(CHANNEL_ENV_PATH).mtimeMs
+    } catch {
+      return
+    }
+    if (lastEnvMtimeMs !== null && mtime !== lastEnvMtimeMs) {
+      log('channel credentials file changed on disk; reloading')
+      reloadConfig()
+    }
+    lastEnvMtimeMs = mtime
+  }, intervalMs).unref()
+}
+
 // ── Claude permission relay ───────────────────────────────────────────
 // When serving the claude namespace the bridge also declares
 // `claude/channel/permission`: Claude Code then forwards tool-approval
@@ -187,7 +328,6 @@ function pushChannelEvent(content, meta) {
 // send the request notification, so this is inert for them.
 const PERMISSION_RELAY = NAMESPACES.includes('claude')
 const pendingPermissions = new Map() // request_id -> Discord channel id it was posted to
-const permissionChannelEnv = (process.env.DISCORD_PERMISSION_CHANNEL_ID ?? '').trim()
 // Fallback target: wherever the session was last spoken to from.
 let lastInboundChannelId = null
 
@@ -453,6 +593,12 @@ const TOOLS = [
       required: ['url'],
     },
   },
+  {
+    name: 'reload_config',
+    description:
+      "Re-read this channel's credentials file and apply it — allowlists, channel scoping, mention behavior, and the bot token — without restarting the session. Use when the operator says they changed the Discord channel configuration. Changes to the bridge's own code still need a session restart.",
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  },
 ]
 
 // MCP tool annotations drive host-side auto-approval (Codex prompts for
@@ -469,6 +615,7 @@ const TOOL_ANNOTATIONS = {
   rename_thread: { destructiveHint: false, openWorldHint: false, idempotentHint: true },
   close_thread: { destructiveHint: false, openWorldHint: false, idempotentHint: true },
   end_poll: { destructiveHint: false, openWorldHint: false, idempotentHint: true },
+  reload_config: { destructiveHint: false, openWorldHint: false, idempotentHint: true },
 }
 for (const tool of TOOLS) {
   tool.annotations = TOOL_ANNOTATIONS[tool.name] ?? {
@@ -614,6 +761,11 @@ async function resolveThreadParent(threadId) {
 }
 
 async function callTool(name, args) {
+  // Config reload works without a token — it is how a session that started
+  // with no credentials picks them up.
+  if (name === 'reload_config') {
+    return toolText(reloadConfig())
+  }
   if (!TOKEN) {
     return toolText(
       'DISCORD_BOT_TOKEN is not configured. Put it in your CLI\u2019s channel credentials file (~/.grok/channels/discord/.env, ~/.codex/channels/discord/.env, or ~/.claude/channels/discord/.env — see the README) and restart the session.',
