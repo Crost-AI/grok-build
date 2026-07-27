@@ -24,6 +24,7 @@ agent → send_message tool:  Two tests in auth_flow are failing after #482 — 
 - **`create_poll` / `read_poll` / `end_poll`** — native Discord polls (bots can't cast native votes; the agent states its vote in chat and `read_poll` tallies humans)
 - **`create_thread` / `rename_thread` / `close_thread`** — workstream threads (rename/close verify the target is a thread and can never touch a regular channel)
 - **`send_file`** — upload a local file (10 MB bot limit; needs the **Attach Files** permission)
+- **`reload_config`** — re-read the credentials file and apply it live (see [Reloading configuration](#reloading-configuration))
 - **`read_attachment`** — download an incoming attachment to a temp file (Discord CDN hosts only, 25 MB cap; trailing punctuation is trimmed from copied URLs and expired signed links are re-signed via `/attachments/refresh-urls` and retried)
 
 Every tool carries honest MCP annotations (readers read-only, the rest non-destructive closed-world), so annotation-aware hosts auto-approve them.
@@ -34,6 +35,16 @@ Every tool carries honest MCP annotations (readers read-only, the rest non-destr
 - **Plain text** — a message that *starts* with `/status`, `/session`, `/channels`, or `/help` (after any @mention) is intercepted and answered by the host; unknown `/commands` flow to the agent unchanged.
 
 Only allowlisted humans can invoke either form; bot-authored messages are never treated as commands.
+
+## Reloading configuration
+
+Edit the `.env` and the running session picks it up — no exit, no resume. The bridge watches the file (mtime poll, 5s) and re-applies allowlists, channel scoping, DM/mention behavior, the permission channel, and the bot token; a changed token reconnects the gateway. You can also ask the agent to reload on demand, which calls the `reload_config` tool:
+
+> reload your discord config
+
+Two knobs: `DISCORD_CONFIG_WATCH=false` disables the watcher (leaving the tool), and `DISCORD_CONFIG_WATCH_SECONDS` changes the poll interval.
+
+What a reload does **not** cover: changes to the bridge's own code (for example after `grok plugin update discord` or a `git pull` of this repo). The running process still has the old script loaded, so that needs a session restart.
 
 ## Claude Code tool-approval relay
 
@@ -112,7 +123,9 @@ All via environment (put them in the `.env` file):
 | `DISCORD_MENTION_WINDOW_SECONDS` | no | `60` | Sliding continuation window after a forwarded message |
 | `DISCORD_PERMISSION_CHANNEL_ID` | no | last-messaged channel | Where Claude tool-approval prompts are posted |
 | `CHANNEL_NAMESPACES` | no | `grok,codex,claude` | Host protocols to serve |
-| `CHANNEL_ENV_FILE` | no | auto for Claude | Extra `.env` loaded at startup for unset vars |
+| `CHANNEL_ENV_FILE` | no | auto-detected | Credentials file to load and to watch for live reloads |
+| `DISCORD_CONFIG_WATCH` | no | `true` | `false` disables the automatic reload watcher |
+| `DISCORD_CONFIG_WATCH_SECONDS` | no | `5` | Credentials-file poll interval |
 | `DISCORD_ATTACHMENT_HOSTS`, `DISCORD_API_BASE`, `DISCORD_GATEWAY_URL` | no | Discord | Test overrides |
 
 ## Security model

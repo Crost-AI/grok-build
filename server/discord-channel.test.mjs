@@ -10,6 +10,8 @@
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
+import { writeFile as writeFileTmp } from 'node:fs/promises'
+import os from 'node:os'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import process from 'node:process'
@@ -312,6 +314,14 @@ async function main() {
   const gateway = await startMockGateway()
   const rest = await startMockRest()
 
+  // Credentials file the reload test rewrites. Seeded to match the child's
+  // explicit env so the first reload is a no-op change.
+  const ENV_FILE = path.join(os.tmpdir(), `discord-bridge-env-${process.pid}.env`)
+  await writeFileTmp(
+    ENV_FILE,
+    ['DISCORD_ALLOWED_USER_IDS=42', 'DISCORD_CHANNEL_IDS=c1,c2,c3', ''].join('\n'),
+  )
+
   // Explicit env — do NOT inherit host DISCORD_* (a live Grok session often
   // exports DISCORD_REQUIRE_MENTION=false / real channel ids, which break the suite).
   const child = spawn(process.execPath, [BRIDGE], {
@@ -327,6 +337,9 @@ async function main() {
       DISCORD_MENTION_WINDOW_SECONDS: '2',
       DISCORD_ATTACHMENT_HOSTS: '127.0.0.1',
       DISCORD_PERMISSION_CHANNEL_ID: 'c1',
+      CHANNEL_ENV_FILE: ENV_FILE,
+      // Deterministic: the suite drives reloads explicitly.
+      DISCORD_CONFIG_WATCH: 'false',
       // Allowlisted parents/channels used by the suite. Threads inherit via
       // parent (thr1 under c1 ok; thr2 under c-other drops).
       DISCORD_CHANNEL_IDS: 'c1,c2,c3',
@@ -432,11 +445,12 @@ async function main() {
         'read_attachment',
         'read_messages',
         'read_poll',
+        'reload_config',
         'rename_thread',
         'send_file',
         'send_message',
       ]),
-    `tools/list returns the eleven tools (got: ${toolNames.join(', ')})`,
+    `tools/list returns the twelve tools (got: ${toolNames.join(', ')})`,
   )
   const toolByName = Object.fromEntries((tools.result?.tools ?? []).map((t) => [t.name, t]))
   check(
@@ -1065,6 +1079,61 @@ async function main() {
   check(
     askCb?.body?.type === 4 && askCb?.body?.data?.flags === undefined,
     '/ask acknowledged with a public immediate callback',
+  )
+
+  console.log('live config reload')
+  // A sender the running bridge does not know about yet.
+  gw.send({
+    op: 0,
+    s: 80,
+    t: 'MESSAGE_CREATE',
+    d: {
+      id: 'pre-reload',
+      guild_id: 'g1',
+      channel_id: 'c1',
+      content: '<@BOT> before reload',
+      author: { id: '4242', username: 'ariel' },
+      mentions: [{ id: 'BOT' }],
+    },
+  })
+  await new Promise((r) => setTimeout(r, 300))
+  check(
+    !fromBridge.some(
+      (m) => m.method === 'notifications/grok/channel' && m.params.meta.message_id === 'pre-reload',
+    ),
+    'sender not yet allowlisted is dropped before the reload',
+  )
+  // Operator edits the credentials file, then asks for a reload.
+  await writeFileTmp(
+    ENV_FILE,
+    ['DISCORD_ALLOWED_USER_IDS=42,4242', 'DISCORD_CHANNEL_IDS=c1,c2,c3', ''].join('\n'),
+  )
+  const reloadRes = await request('tools/call', { name: 'reload_config', arguments: {} })
+  const reloadText = reloadRes.result?.content?.[0]?.text ?? ''
+  check(
+    reloadText.includes('allowed users') && reloadText.includes('4242'),
+    `reload_config reports the changed allowlist (got: ${reloadText})`,
+  )
+  gw.send({
+    op: 0,
+    s: 81,
+    t: 'MESSAGE_CREATE',
+    d: {
+      id: 'post-reload',
+      guild_id: 'g1',
+      channel_id: 'c1',
+      content: '<@BOT> after reload',
+      author: { id: '4242', username: 'ariel' },
+      mentions: [{ id: 'BOT' }],
+    },
+  })
+  const reloaded = await expectStdout(
+    (m) => m.method === 'notifications/grok/channel' && m.params.meta.message_id === 'post-reload',
+    'message from the newly allowlisted sender',
+  )
+  check(
+    reloaded.params.content === 'after reload',
+    'newly allowlisted sender reaches the session without a restart',
   )
 
   console.log('Claude permission relay')
