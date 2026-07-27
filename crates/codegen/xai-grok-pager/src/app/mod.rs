@@ -666,6 +666,8 @@ pub async fn run(
         default_auto_mode: launch_auto && !launch_yolo.yolo,
         channels: args.channels.clone(),
     };
+    // Kept for the exit hint: `args` is consumed before the session ends.
+    let resume_channels = args.channels.clone();
     let mut config_watcher = crate::appearance::ConfigWatcher::start().await?;
     let alt_screen_config_mode = config_watcher.current().alt_screen;
     let term_ctx = crate::terminal::terminal_context();
@@ -854,7 +856,7 @@ pub async fn run(
             }
             if let Some(info) = run_result.exit_info {
                 let width = crossterm::terminal::size().map_or(80, |(cols, _)| cols as usize);
-                print_exit_resume_hint(&info, width, &mut io::stderr());
+                print_exit_resume_hint(&info, &resume_channels, width, &mut io::stderr());
             }
             Ok(false)
         }
@@ -867,7 +869,12 @@ pub async fn run(
 /// each, width-truncated — precedes the command so a glance at the pane
 /// shows which session lives there and where it left off.
 /// Best-effort: closed-pane EIO/BrokenPipe must not panic (`panic = "abort"`).
-fn print_exit_resume_hint(info: &ExitInfo, max_width: usize, w: &mut impl Write) {
+fn print_exit_resume_hint(
+    info: &ExitInfo,
+    channels: &[String],
+    max_width: usize,
+    w: &mut impl Write,
+) {
     use crate::render::line_utils::truncate_str;
     let _ = writeln!(w);
     if let Some(summary) = &info.summary {
@@ -885,10 +892,21 @@ fn print_exit_resume_hint(info: &ExitInfo, max_width: usize, w: &mut impl Write)
         let _ = writeln!(w);
     }
     let _ = writeln!(w, "Resume this session with:");
-    if info.minimal {
-        let _ = writeln!(w, "  grok --minimal --resume {}", info.session_id);
+    // Channels are a per-launch opt-in, so a bare `--resume` would come back
+    // without them; carry the entries this session was started with.
+    let channels_flag = if channels.is_empty() {
+        String::new()
     } else {
-        let _ = writeln!(w, "  grok --resume {}", info.session_id);
+        format!(" --channels {}", channels.join(","))
+    };
+    if info.minimal {
+        let _ = writeln!(
+            w,
+            "  grok --minimal --resume {}{channels_flag}",
+            info.session_id
+        );
+    } else {
+        let _ = writeln!(w, "  grok --resume {}{channels_flag}", info.session_id);
     }
 }
 /// Screen-mode relaunch failure fallback (same quit tail as plain resume).
@@ -1999,7 +2017,7 @@ mod tests {
     #[test]
     fn print_exit_resume_hint_writes_expected_lines() {
         let mut buf = Vec::new();
-        print_exit_resume_hint(&bare_exit_info("sess-abc", false), 80, &mut buf);
+        print_exit_resume_hint(&bare_exit_info("sess-abc", false), &[], 80, &mut buf);
         assert_eq!(
             String::from_utf8(buf).unwrap(),
             "\nResume this session with:\n  grok --resume sess-abc\n"
@@ -2008,10 +2026,28 @@ mod tests {
     #[test]
     fn print_exit_resume_hint_includes_minimal_flag() {
         let mut buf = Vec::new();
-        print_exit_resume_hint(&bare_exit_info("sess-abc", true), 80, &mut buf);
+        print_exit_resume_hint(&bare_exit_info("sess-abc", true), &[], 80, &mut buf);
         assert_eq!(
             String::from_utf8(buf).unwrap(),
             "\nResume this session with:\n  grok --minimal --resume sess-abc\n"
+        );
+    }
+    #[test]
+    fn print_exit_resume_hint_carries_channels_opt_in() {
+        let mut buf = Vec::new();
+        print_exit_resume_hint(
+            &bare_exit_info("sess-abc", false),
+            &[
+                "plugin:discord@grok-build".to_string(),
+                "server:webhook".to_string(),
+            ],
+            80,
+            &mut buf,
+        );
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "\nResume this session with:\n  grok --resume sess-abc \
+--channels plugin:discord@grok-build,server:webhook\n"
         );
     }
     #[test]
@@ -2026,7 +2062,7 @@ mod tests {
             }),
         };
         let mut buf = Vec::new();
-        print_exit_resume_hint(&info, 80, &mut buf);
+        print_exit_resume_hint(&info, &[], 80, &mut buf);
         assert_eq!(
             String::from_utf8(buf).unwrap(),
             concat!(
@@ -2052,7 +2088,7 @@ mod tests {
             }),
         };
         let mut buf = Vec::new();
-        print_exit_resume_hint(&info, 20, &mut buf);
+        print_exit_resume_hint(&info, &[], 20, &mut buf);
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains(&format!("\n{}…\n", "t".repeat(19))));
         assert!(out.contains(&format!("\n> {}…\n", "p".repeat(17))));
@@ -2086,9 +2122,9 @@ mod tests {
     #[test]
     fn print_hints_survive_eio() {
         let mut w = AlwaysFailWrite;
-        print_exit_resume_hint(&bare_exit_info("sess-abc", false), 80, &mut w);
-        print_exit_resume_hint(&bare_exit_info("sess-abc", true), 80, &mut w);
-        print_exit_resume_hint(&full_exit_info("sess-abc"), 80, &mut w);
+        print_exit_resume_hint(&bare_exit_info("sess-abc", false), &[], 80, &mut w);
+        print_exit_resume_hint(&bare_exit_info("sess-abc", true), &[], 80, &mut w);
+        print_exit_resume_hint(&full_exit_info("sess-abc"), &[], 80, &mut w);
         print_relaunch_failure_hint(&"exec failed", "sess-xyz", true, &mut w);
     }
     /// Close the *read* end so writes on the write end get EPIPE
@@ -2104,9 +2140,9 @@ mod tests {
             libc::close(fds[0]);
         }
         let mut writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
-        print_exit_resume_hint(&bare_exit_info("pipe-sid", false), 80, &mut writer);
-        print_exit_resume_hint(&bare_exit_info("pipe-sid", true), 80, &mut writer);
-        print_exit_resume_hint(&full_exit_info("pipe-sid"), 80, &mut writer);
+        print_exit_resume_hint(&bare_exit_info("pipe-sid", false), &[], 80, &mut writer);
+        print_exit_resume_hint(&bare_exit_info("pipe-sid", true), &[], 80, &mut writer);
+        print_exit_resume_hint(&full_exit_info("pipe-sid"), &[], 80, &mut writer);
         print_relaunch_failure_hint(&"exec failed", "pipe-sid", false, &mut writer);
     }
 }
