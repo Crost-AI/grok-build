@@ -288,6 +288,23 @@ pub(super) async fn run_session(
             .await;
         });
     }
+    // ── Channels (experimental) ─────────────────────────────────────
+    // Resolve `--channels` opt-ins and wire the inbound-event pipe
+    // BEFORE the MCP init task below spawns any server process, so the
+    // credential env merge is visible to the spawn and the very first
+    // notification a fast server pushes post-handshake finds a sender.
+    if !session.startup_hints.is_subagent
+        && !session.startup_hints.channels.is_empty()
+        && session.setup_channels().await
+    {
+        let (channel_tx, channel_rx) =
+            tokio::sync::mpsc::unbounded_channel::<xai_grok_mcp::channel::ChannelInboundEvent>();
+        {
+            let mut mcp_state = session.mcp_state.lock().await;
+            mcp_state.set_channel_event_tx(Some(channel_tx));
+        }
+        SessionActor::spawn_channel_forwarder(session.clone(), completion_tx.clone(), channel_rx);
+    }
     let session_for_mcp = session.clone();
     let completion_tx_for_mcp = completion_tx.clone();
     tokio::task::spawn_local(async move {
@@ -796,7 +813,14 @@ pub(super) async fn run_session(
                                 .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
                                 .unwrap_or(false);
 
-                            if is_turn_active && priority == NotificationPriority::Next {
+                            // The mid-turn buffer is task-keyed, so only task-sourced
+                            // notifications may route into it; task-less sources
+                            // (channel events — which are always `Later` anyway) take
+                            // the pending_notifications path below.
+                            if is_turn_active
+                                && priority == NotificationPriority::Next
+                                && source.task_id().is_some()
+                            {
                                 // Mid-turn + Next: push to the shared buffer for
                                 // the turn loop's `inject_pending_monitor_events`.
                                 if let Some(buffer) = &session.tool_context.monitor_event_buffer {
@@ -820,7 +844,10 @@ pub(super) async fn run_session(
                                         .collect::<Vec<_>>()
                                         .join("\n");
 
-                                    let task_id = source.task_id().to_owned();
+                                    // `task_id()` is `Option` since channel events
+                                    // carry none; the guard above keeps this branch
+                                    // task-sourced, so the default never applies.
+                                    let task_id = source.task_id().map(String::from).unwrap_or_default();
 
                                     // Cap to prevent unbounded growth during long tool calls.
                                     const MAX_BUFFER_EVENTS: usize = 50;

@@ -2133,9 +2133,11 @@ impl SessionActor {
         });
         let dropped_inputs = dropped.len();
         let before_notifications = state.pending_notifications.len();
-        state
-            .pending_notifications
-            .retain(|n| !consumed_ids.contains(&n.source.task_id()));
+        state.pending_notifications.retain(|n| {
+            !n.source
+                .task_id()
+                .is_some_and(|id| consumed_ids.contains(&id))
+        });
         let dropped_notifications = before_notifications - state.pending_notifications.len();
         drop(state);
         if let Some(reservations) = &self.tool_context.task_completion_reservations {

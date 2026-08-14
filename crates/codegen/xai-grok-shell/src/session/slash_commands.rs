@@ -215,6 +215,14 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         resolve: |_args| BuiltinAction::PluginsReload,
     },
     BuiltinCommand {
+        name: "channels",
+        description: "Show channel status (external event sources for this session)",
+        argument_hint: None,
+        aliases: &[],
+        gate: BuiltinGate::AlwaysOn,
+        resolve: |_args| BuiltinAction::ChannelsStatus,
+    },
+    BuiltinCommand {
         name: "session-info",
         description: "Show session details (model, turns, context usage)",
         argument_hint: None,
@@ -1213,6 +1221,7 @@ pub(super) enum BuiltinAction {
     PluginsUpdate {
         name: Option<String>,
     },
+    ChannelsStatus,
     Feedback {
         text: String,
     },
@@ -1262,6 +1271,7 @@ impl BuiltinAction {
             BuiltinAction::PluginsInstall { .. } => "plugins-install",
             BuiltinAction::PluginsUninstall { .. } => "plugins-uninstall",
             BuiltinAction::PluginsUpdate { .. } => "plugins-update",
+            BuiltinAction::ChannelsStatus => "channels",
             BuiltinAction::Feedback { .. } => "feedback",
             BuiltinAction::MemoryBrowse => "memory",
             BuiltinAction::MemoryToggle { .. } => "memory",
@@ -1296,6 +1306,7 @@ impl BuiltinAction {
             BuiltinAction::PluginsInstall { .. } => true,
             BuiltinAction::PluginsUninstall { .. } => true,
             BuiltinAction::PluginsUpdate { name } => name.is_some(),
+            BuiltinAction::ChannelsStatus => false,
             BuiltinAction::Feedback { text } => !text.is_empty(),
             BuiltinAction::MemoryBrowse => false,
             BuiltinAction::MemoryToggle { .. } => true,

@@ -111,16 +111,31 @@ pub enum NotificationPriority {
 }
 #[derive(Debug, Clone)]
 pub enum NotificationSource {
-    MonitorEvent { task_id: String },
-    MonitorCompleted { task_id: String },
-    BashTaskCompleted { task_id: String },
+    MonitorEvent {
+        task_id: String,
+    },
+    MonitorCompleted {
+        task_id: String,
+    },
+    BashTaskCompleted {
+        task_id: String,
+    },
+    /// Inbound event from an opted-in channel MCP server (see
+    /// `crate::session::channels`). Carries the server name; the
+    /// prompt blocks already hold the rendered `<channel>` envelope.
+    ChannelEvent {
+        server: String,
+    },
 }
 impl NotificationSource {
-    pub fn task_id(&self) -> &str {
+    /// Background-task id for task-sourced notifications; `None` for
+    /// channel events, which have no owning task.
+    pub fn task_id(&self) -> Option<&str> {
         match self {
             Self::MonitorEvent { task_id }
             | Self::MonitorCompleted { task_id }
-            | Self::BashTaskCompleted { task_id } => task_id,
+            | Self::BashTaskCompleted { task_id } => Some(task_id),
+            Self::ChannelEvent { .. } => None,
         }
     }
 }

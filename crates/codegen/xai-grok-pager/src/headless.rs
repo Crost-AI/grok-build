@@ -77,6 +77,9 @@ pub struct HeadlessOptions {
     pub wait_for_background: bool,
     /// Max time to wait for background quiescence after the first turn ends.
     pub background_wait_timeout: Duration,
+    /// Channel opt-in entries from `--channels`, forwarded as
+    /// `startupHints.channels`.
+    pub channels: Vec<String>,
 }
 
 struct HeadlessEmitter {
@@ -491,6 +494,7 @@ async fn authenticate(
 fn build_headless_init_request(
     rules: Option<&str>,
     system_prompt_override: Option<&str>,
+    channels: &[String],
 ) -> acp::InitializeRequest {
     let mut meta = serde_json::json!({
         "clientType": HEADLESS_CLIENT_TYPE,
@@ -506,6 +510,7 @@ fn build_headless_init_request(
         "nonInteractive": true,
         "skipGitStatus": true,
         "skipProjectLayout": true,
+        "channels": channels,
     });
 
     acp::InitializeRequest::new(acp::ProtocolVersion::V1)
@@ -868,6 +873,7 @@ pub async fn run_single_turn(
     let init_req = build_headless_init_request(
         options.rules.as_deref(),
         options.system_prompt_override.as_deref(),
+        &options.channels,
     );
     xai_grok_telemetry::startup::enter(crate::acp::StartupPhase::AcpInitialize);
     let init_resp: acp::InitializeResponse = match acp_send(init_req, &acp_tx).await {

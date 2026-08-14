@@ -1502,6 +1502,7 @@ pub(crate) async fn spawn_session_actor(
         delivery_tools: std::cell::RefCell::new(startup_hints.delivery_tools.clone()),
         attach_non_interactive: std::cell::Cell::new(startup_hints.non_interactive),
         startup_hints,
+        channel_registry: Default::default(),
         forked_tool_override,
         compaction: super::compaction_config::CompactionConfig {
             threshold_percent: std::cell::Cell::new(auto_compact_threshold_percent),
