@@ -1,0 +1,25 @@
+{
+  "name": "grok-build",
+  "description": "Plugins bundled with the Grok Build repository.",
+  "owner": { "name": "xAI" },
+  "plugins": [
+    {
+      "name": "discord",
+      "version": "2.0.0",
+      "description": "Discord channel: forwards Discord messages into a running session and lets the agent reply, react, and read history.",
+      "category": "productivity",
+      "source": "./plugins/discord",
+      "tags": ["channel", "discord", "chat", "bridge"],
+      "keywords": ["discord", "channel", "chat", "bot", "bridge", "notifications"]
+    },
+    {
+      "name": "slack",
+      "version": "0.1.2",
+      "description": "Slack channel: forwards Slack messages into a running session over Socket Mode and lets the agent reply (thread-aware), react, and read history.",
+      "category": "productivity",
+      "source": "./plugins/slack",
+      "tags": ["channel", "slack", "chat", "bridge"],
+      "keywords": ["slack", "channel", "chat", "bot", "bridge", "notifications"]
+    }
+  ]
+}

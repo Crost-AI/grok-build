@@ -124,11 +124,14 @@ fn pending_notification_cap_keeps_newest_entries() {
         );
     }
     assert_eq!(state.pending_notifications.len(), MAX_PENDING_NOTIFICATIONS);
-    assert_eq!(state.pending_notifications[0].source.task_id(), "task-3");
+    assert_eq!(
+        state.pending_notifications[0].source.task_id(),
+        Some("task-3")
+    );
     let newest = format!("task-{}", MAX_PENDING_NOTIFICATIONS + 2);
     assert_eq!(
         state.pending_notifications.last().unwrap().source.task_id(),
-        newest
+        Some(newest.as_str())
     );
 }
 #[tokio::test(flavor = "current_thread")]
@@ -1061,7 +1064,7 @@ async fn subagent_completed_drops_matching_pending_input() {
             let remaining_notif: Vec<&str> = state
                 .pending_notifications
                 .iter()
-                .map(|n| n.source.task_id())
+                .filter_map(|n| n.source.task_id())
                 .collect();
             assert_eq!(
                 remaining_notif,
@@ -1224,7 +1227,7 @@ async fn sweep_clears_matching_pending_notifications() {
             let remaining: Vec<&str> = state
                 .pending_notifications
                 .iter()
-                .map(|n| n.source.task_id())
+                .filter_map(|n| n.source.task_id())
                 .collect();
             assert_eq!(
                 remaining,
@@ -1381,7 +1384,7 @@ async fn split_drops_goal_turn_origin_when_blanket_gate_off() {
         dropped, 2,
         "both goal-origin entries (bash + monitor) dropped"
     );
-    let surfaced: Vec<&str> = surface.iter().map(|n| n.source.task_id()).collect();
+    let surfaced: Vec<&str> = surface.iter().filter_map(|n| n.source.task_id()).collect();
     assert_eq!(
         surfaced,
         vec!["bg-user"],
@@ -1400,7 +1403,7 @@ async fn split_surfaces_normal_completions_with_no_goal() {
     ];
     let (surface, dropped) = SessionActor::split_goal_suppressed(false, &goal_turn, notifications);
     assert_eq!(dropped, 0, "no goal => no suppression");
-    let surfaced: Vec<&str> = surface.iter().map(|n| n.source.task_id()).collect();
+    let surfaced: Vec<&str> = surface.iter().filter_map(|n| n.source.task_id()).collect();
     assert_eq!(surfaced, vec!["bg-1", "bg-2"]);
 }
 /// Blanket gate ON (goal Active/Complete) drops everything — the existing

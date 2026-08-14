@@ -162,6 +162,8 @@ pub(crate) use laziness_classifier::*;
 #[path = "acp_session_impl/notification_drain.rs"]
 mod notification_drain;
 use notification_drain::*;
+#[path = "acp_session_impl/channels_setup.rs"]
+mod channels_setup;
 #[path = "acp_session_impl/extensions.rs"]
 mod extensions;
 use extensions::*;
@@ -739,6 +741,13 @@ pub(crate) struct SessionActor {
     /// `startup_hints.non_interactive` keeps governing spawn-time structure
     /// (system prompt variant, user-message prefix, git-status mode).
     pub(crate) attach_non_interactive: std::cell::Cell<bool>,
+    /// Per-session channel opt-in table (see [`crate::session::channels`]).
+    /// Empty unless `startup_hints.channels` named entries; populated once
+    /// by `setup_channels` during `run_session` startup, read by the
+    /// inbound channel-event forwarder and `/channels`. `std::sync::Mutex`
+    /// because it is locked only for brief reads/writes, never across an
+    /// `.await`.
+    pub(crate) channel_registry: std::sync::Mutex<crate::session::channels::ChannelRegistry>,
     /// Verbatim mirror-fork override: when `Some`, every turn sends this exact
     /// parent tool schema instead of the locally-built toolset, keeping the
     /// child's request prefix byte-identical to the parent for radix cache reuse.

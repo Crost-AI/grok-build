@@ -62,7 +62,8 @@ impl SessionActor {
             .filter_map(|notification| match &notification.source {
                 NotificationSource::BashTaskCompleted { task_id }
                 | NotificationSource::MonitorCompleted { task_id } => Some(task_id.clone()),
-                NotificationSource::MonitorEvent { .. } => None,
+                NotificationSource::MonitorEvent { .. }
+                | NotificationSource::ChannelEvent { .. } => None,
             })
             .collect();
         completion_ids.sort();
@@ -80,6 +81,9 @@ impl SessionActor {
                 NotificationSource::MonitorEvent { task_id } => {
                     deferred_ids.contains(task_id.as_str())
                 }
+                // Channel events are external input, not task completions:
+                // they stay pending for the normal idle-gated drain.
+                NotificationSource::ChannelEvent { .. } => false,
             };
             if consume {
                 deferred.push(notification);
@@ -482,7 +486,7 @@ impl SessionActor {
 
             drained_task_ids = notifications
                 .iter()
-                .map(|n| n.source.task_id().to_string())
+                .filter_map(|n| n.source.task_id().map(String::from))
                 .collect();
 
             let (to_surface, dropped) = {
@@ -590,15 +594,19 @@ impl SessionActor {
         goal_turn_task_ids: &std::collections::HashSet<String>,
         notifications: Vec<PendingNotification>,
     ) -> (Vec<PendingNotification>, usize) {
-        if suppress_all {
-            let dropped = notifications.len();
-            return (Vec::new(), dropped);
-        }
+        // Channel events are external input (a chat message, a webhook),
+        // not background-task completion noise — the goal-mode gates
+        // never drop them. Task-sourced notifications keep the original
+        // suppression semantics.
         let mut dropped = 0usize;
         let to_surface = notifications
             .into_iter()
             .filter(|n| {
-                let keep = !goal_turn_task_ids.contains(n.source.task_id());
+                let keep = match n.source.task_id() {
+                    None => true,
+                    Some(_) if suppress_all => false,
+                    Some(task_id) => !goal_turn_task_ids.contains(task_id),
+                };
                 if !keep {
                     dropped += 1;
                 }
@@ -619,7 +627,8 @@ impl SessionActor {
             .filter_map(|notification| match &notification.source {
                 NotificationSource::MonitorCompleted { task_id } => Some(task_id.as_str()),
                 NotificationSource::MonitorEvent { .. }
-                | NotificationSource::BashTaskCompleted { .. } => None,
+                | NotificationSource::BashTaskCompleted { .. }
+                | NotificationSource::ChannelEvent { .. } => None,
             })
             .collect();
         let mut monitor_events: Vec<MonitorEventNotification> = Vec::new();
@@ -650,8 +659,11 @@ impl SessionActor {
                         sections.push(Vec::new());
                     }
                 }
+                // Channel events arrive pre-rendered as a `<channel>`
+                // envelope; keep their raw blocks like bash completions.
                 NotificationSource::MonitorCompleted { .. }
-                | NotificationSource::BashTaskCompleted { .. } => {
+                | NotificationSource::BashTaskCompleted { .. }
+                | NotificationSource::ChannelEvent { .. } => {
                     sections.push(notification.prompt_blocks.clone());
                 }
             }
@@ -719,6 +731,7 @@ impl SessionActor {
                 NotificationSource::MonitorEvent { task_id } => format!("monitor:{task_id}"),
                 NotificationSource::MonitorCompleted { task_id } => format!("monitor-completed:{task_id}"),
                 NotificationSource::BashTaskCompleted { task_id } => format!("bash:{task_id}"),
+                NotificationSource::ChannelEvent { server } => format!("channel:{server}"),
             }).collect::<Vec<_>>().join(","),
             "Drained pending notifications into single batched turn"
         );

@@ -142,7 +142,12 @@ Toggle it at runtime with `/vim-mode`, or from `/settings` → **Vim scrollback 
 | `"fullscreen"` | Sticky non-minimal. Fullscreen-vs-inline still follows the alt-screen policy (`--no-alt-screen`, `[terminal] alt_screen`, terminal auto-detection). |
 | `"minimal"` | Sticky minimal (scrollback-native) mode. |
 
-A CLI flag always wins over the config value for that invocation.
+You normally never edit this key by hand — Grok writes it whenever you pass an
+explicit `--minimal` / `--fullscreen` flag or run `/minimal` / `/fullscreen`.
+A plain `grok` launch only reads it. A CLI flag always wins over the config
+value for that invocation (and updates it), and `screen_mode` takes precedence
+over the legacy `[terminal] minimal` key in `pager.toml`. Delete the key to
+restore the legacy behavior.
 
 #### Snap prompt to top on send
 
@@ -271,6 +276,21 @@ headers = { "x-mcp-session-id" = "{{session_id}}" }
 MCP servers can also be set per-project in `.grok/config.toml`. Project-scoped config contributes `[mcp_servers]`, `[plugins]`, and `[permission]` rules; every other section loads only from `~/.grok/config.toml`.
 
 Priority for `[mcp_servers]` and `[plugins]`: `.grok/config.toml` (current dir) > `<repo-root>/.grok/config.toml` > `~/.grok/config.toml`. `[permission]` rules aren't overridden by priority — they merge across all files with `deny` > `ask` > `allow` (see [22-permissions-and-safety.md](22-permissions-and-safety.md)).
+
+### Channels
+
+Gate which MCP servers may push events into running sessions (see [25-channels.md](25-channels.md)). Channels are opted in per session with `grok --channels <entry>`; this section restricts what those entries may do.
+
+```toml
+[channels]
+enabled = true                        # master switch (default: true)
+allowed = [                           # optional allowlist of --channels entries;
+  "server:webhook",                   # unset = any entry may register,
+  "plugin:telegram@example-market",   # empty list = none may register
+]
+```
+
+`enabled = false` in `requirements.toml` enforces the block for managed deployments; user config cannot override it. The `GROK_CHANNELS_ENABLED` environment variable (`1`/`0`) sits between the requirements and user-config layers. Per-channel credentials live in `~/.grok/channels/<server>/.env` and are injected into that server's environment when it is channel-enabled.
 
 ### Memory
 

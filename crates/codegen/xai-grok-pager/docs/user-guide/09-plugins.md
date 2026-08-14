@@ -27,6 +27,8 @@ grok plugin marketplace add ./my-marketplace                     # a local folde
 
 List, refresh, and remove sources with `grok plugin marketplace list`, `grok plugin marketplace update [<name>]`, and `grok plugin marketplace remove <url>`.
 
+The Grok Build repository is itself a marketplace (named `grok-build`) carrying the bundled plugins under `plugins/` — currently the [Discord](25-channels.md#the-bundled-discord-plugin) and Slack channels: `grok plugin marketplace add lakerfan901/grok-build`, then `grok plugin install discord@grok-build --trust`.
+
 You can also declare sources in config so they are always present.
 
 ### In config.toml

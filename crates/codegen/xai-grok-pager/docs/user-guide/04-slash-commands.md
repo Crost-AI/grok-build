@@ -229,6 +229,16 @@ Open the extensions modal on the Marketplace tab to browse and install plugins.
 
 Open the extensions modal on the Skills tab to view installed skills.
 
+### `/channels`
+
+Show channel status for the session: every `--channels` entry, whether it is active or blocked (and why), and the live connection/capability state of each matched MCP server. See [25-channels.md](25-channels.md).
+
+```
+/channels
+```
+
+Channels are enabled per session at launch (`grok --channels server:<name>`); this command is read-only.
+
 ---
 
 ## Media Generation
