@@ -3956,7 +3956,7 @@ impl McpClient {
     /// a channel. `false` before a successful handshake.
     pub async fn declares_channel_capability(&self) -> bool {
         match &*self.state.lock().await {
-            ClientState::Ready(service) => service
+            ClientState::Ready { service, .. } => service
                 .peer_info()
                 .and_then(|info| info.capabilities.experimental.clone())
                 .is_some_and(|experimental| {
@@ -3975,7 +3975,7 @@ impl McpClient {
         &self,
     ) -> Option<crate::channel::ChannelCommandsDescriptor> {
         match &*self.state.lock().await {
-            ClientState::Ready(service) => service
+            ClientState::Ready { service, .. } => service
                 .peer_info()
                 .and_then(|info| info.capabilities.experimental.clone())
                 .and_then(|experimental| {

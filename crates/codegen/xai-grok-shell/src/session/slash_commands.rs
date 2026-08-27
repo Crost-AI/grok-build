@@ -239,6 +239,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         argument_hint: None,
         aliases: &[],
         gate: BuiltinGate::AlwaysOn,
+        workflow_projection: WorkflowProjection::None,
         resolve: |_args| BuiltinAction::ChannelsStatus,
     },
     BuiltinCommand {
