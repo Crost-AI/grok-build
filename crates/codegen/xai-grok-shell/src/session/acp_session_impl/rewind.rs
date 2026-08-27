@@ -466,6 +466,12 @@ impl SessionActor {
                 );
             }
 
+            // The rewind may have dropped failed-server reminders with the
+            // truncated turns; re-arm so still-down servers re-announce
+            // (see rearm_failed_server_announcements for why connected
+            // fingerprints stay latched).
+            self.rearm_failed_server_announcements().await;
+
             // Append a RewindMarker to updates.jsonl so the replay pipeline can
             // handle timeline branching (updates.jsonl is append-only).
             self.persist_xai_update_only(XaiSessionUpdate::RewindMarker {
@@ -473,13 +479,44 @@ impl SessionActor {
                 created_at: chrono::Utc::now().to_rfc3339(),
             });
 
-            // The summary describes turns the rewind just removed; an
-            // in-flight generation would re-persist one for them.
+            // The turn summary and recap describe turns the rewind just
+            // removed; abort in-flight side-calls and clear the persisted
+            // copies so listing surfaces don't show stale work. Bumping the
+            // recap epoch stops an in-flight recap from committing (and
+            // re-persisting `last_recap`) after the clear below.
+            self.recap_epoch.set(self.recap_epoch.get().wrapping_add(1));
             self.abort_turn_summary();
+            self.abort_title_refresh();
             let _ = self
                 .notifications
                 .persistence_tx
                 .send(PersistenceMsg::LastTurnSummary(None));
+            let _ = self
+                .notifications
+                .persistence_tx
+                .send(PersistenceMsg::LastRecap(None));
+
+            // Re-derive the AUTO title-refresh checkpoint from the shortened
+            // conversation: a rewind below a checkpoint re-opens refreshing,
+            // while one still past the window stays frozen. Persist it so the
+            // reopened state survives resume (unlike compaction, a rewind
+            // genuinely removes the turns those checkpoints described). A
+            // manually-titled session stays frozen — reopening would only spawn
+            // side-calls the manual-title guard rejects anyway.
+            let session_dir = crate::session::persistence::session_dir(&self.session_info);
+            if !crate::session::persistence::title_is_manual_in_dir(&session_dir) {
+                let post_rewind_turns = crate::session::helpers::session_recap::main_turn_count(
+                    &self.chat_state_handle.get_conversation().await,
+                );
+                let idx = crate::session::helpers::session_summary::checkpoints_reached(
+                    post_rewind_turns,
+                );
+                self.next_title_refresh_idx.set(idx);
+                crate::session::helpers::session_summary::save_title_refresh_watermark(
+                    &session_dir,
+                    idx,
+                );
+            }
         }
 
         // Update the file state tracker to reflect the rewind.

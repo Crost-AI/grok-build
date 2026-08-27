@@ -5,13 +5,6 @@ use super::*;
 pub(crate) fn test_auth_method_id(id: &str) -> crate::agent::auth_method::SharedAuthMethodId {
     crate::agent::auth_method::new_shared_auth_method_id(Some(acp::AuthMethodId::new(id)))
 }
-/// Harness contract sentence — both halves ("verifies what's complete" AND
-/// "tells you what's missing").
-pub(crate) const HARNESS_VERIFIES_SENTENCE: &str =
-    "verifies what's complete and tells you what's missing on the next nudge";
-/// Plan-aware seed-todos instruction (`goal_plan_block.md`).
-pub(crate) const PLAN_SEED_TODOS_PHRASE: &str =
-    "Seed todos from the plan's acceptance criteria via";
 #[cfg(test)]
 pub(crate) fn noop_observability_bridge() -> xai_computer_hub_sdk::ObservabilityBridge {
     xai_computer_hub_sdk::ObservabilityBridge::new(
@@ -255,6 +248,7 @@ pub(crate) async fn create_test_actor_with_terminal(
     );
     chat_state_handle.record_token_usage(total_tokens);
     let actor = SessionActor {
+        status_wake: Default::default(),
         session_info: SessionInfo {
             id: acp::SessionId::new("test-actor"),
             cwd: cwd.as_str().to_string(),
@@ -277,7 +271,7 @@ pub(crate) async fn create_test_actor_with_terminal(
         mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
         mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
         delivery_tools: std::cell::RefCell::new(Vec::new()),
-        attach_non_interactive: std::cell::Cell::new(false),
+        attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(false)),
         chat_state_handle,
         unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
         current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -336,6 +330,7 @@ pub(crate) async fn create_test_actor_with_terminal(
         session_start: std::time::Instant::now(),
         inference_idle_timeout: Duration::from_secs(300),
         max_retries: 3,
+        rate_limit_waits: crate::session::acp_session::RateLimitWaitConfig::default(),
         max_turns: None,
         pending_interjections: InterjectionBuffer::new(),
         pending_skill_reminders: Mutex::new(Vec::new()),
@@ -352,6 +347,7 @@ pub(crate) async fn create_test_actor_with_terminal(
         agent: std::cell::RefCell::new(test_agent_default().await),
         last_reported_branch: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         git_head_enabled: false,
+        status_line_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         models_manager: Default::default(),
         display_cwd: std::sync::OnceLock::new(),
         active_agent_type: parking_lot::Mutex::new(None),
@@ -396,7 +392,7 @@ pub(crate) async fn create_test_actor_with_terminal(
         managed_mcp_handle: Default::default(),
         initial_client_mcp_servers: vec![],
         tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
-        mcp_announced_servers: Mutex::new(HashMap::new()),
+        mcp_announcements: Default::default(),
         mcp_reminder_mode: McpReminderMode::Delta,
         mcp_reminder_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         mcp_connecting_reminder_injected: std::cell::Cell::new(false),
@@ -428,12 +424,17 @@ pub(crate) async fn create_test_actor_with_terminal(
         recap_epoch: std::cell::Cell::new(0),
         turn_summary_task: std::cell::RefCell::new(None),
         turn_summary_generation: std::cell::Cell::new(0),
+        title_refresh_task: std::cell::RefCell::new(None),
+        title_refresh_generation: std::cell::Cell::new(0),
+        next_title_refresh_idx: std::cell::Cell::new(0),
         turn_summary_enabled: false,
+        title_refresh_enabled: false,
         session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
         turn_stream_drained: parking_lot::Mutex::new(None),
         pending_image_strip: parking_lot::Mutex::new(None),
         sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
+        sampling_gate: None,
         rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
         image_description_model: crate::test_support::TEST_MODEL.to_owned(),
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
@@ -497,7 +498,7 @@ pub(crate) fn user_item_with_rx(
         screen_mode: None,
         verbatim: false,
         json_schema: None,
-        origin: crate::session::PromptOrigin::User,
+        input_origin: InputOrigin::new(crate::session::PromptOrigin::User),
         task_wake_fallback: None,
         tool_overrides_update: None,
         respond_to,
@@ -512,6 +513,7 @@ pub(crate) fn user_item_with_rx(
             text,
             combined_texts: None,
         }),
+        queue_mutation_policy: QueueMutationPolicy::editable(),
         send_now: false,
     };
     (item, rx)
@@ -529,6 +531,7 @@ pub(crate) fn input_with_origin_rx(
 ) -> (InputItem, oneshot::Receiver<PromptTurnResult>) {
     let (respond_to, rx) = oneshot::channel();
     let verbatim = origin.is_synthetic();
+    let input_origin = InputOrigin::new(origin);
     let item = InputItem {
         prompt_id: prompt_id.to_string(),
         prompt_blocks: vec![],
@@ -539,13 +542,14 @@ pub(crate) fn input_with_origin_rx(
         screen_mode: None,
         verbatim,
         json_schema: None,
-        origin,
+        input_origin,
         task_wake_fallback: None,
         tool_overrides_update: None,
         respond_to,
         persist_ack: None,
         parsed_prompt_tx: None,
         queue_meta: None,
+        queue_mutation_policy: QueueMutationPolicy::hidden(),
         send_now: false,
     };
     (item, rx)
@@ -557,7 +561,7 @@ pub(crate) fn queue_input_request(
     prompt_id: &str,
     respond_to: oneshot::Sender<PromptTurnResult>,
 ) -> QueueInputRequest {
-    QueueInputRequest::new(
+    QueueInputRequest::from_legacy_prompt_id(
         prompt_blocks,
         prompt_id.to_string(),
         PromptMode::Agent,
@@ -611,43 +615,6 @@ pub(crate) fn set_goal_harness_for_tests(actor: &SessionActor) {
         .goal_harness_enabled
         .store(true, std::sync::atomic::Ordering::Relaxed);
 }
-#[cfg(test)]
-pub(crate) fn assert_goal_discipline_in_reminder(reminder: &str, site: &str) {
-    let discipline_idx = reminder
-        .find("<task_completion_discipline>")
-        .unwrap_or_else(|| panic!("{site} must include <task_completion_discipline>:\n{reminder}"));
-    let tracking_idx = reminder
-        .find("TRACKING:")
-        .unwrap_or_else(|| panic!("{site} must include TRACKING:\n{reminder}"));
-    assert!(
-        discipline_idx < tracking_idx,
-        "{site} must place discipline before TRACKING (discipline={discipline_idx} tracking={tracking_idx}):\n{reminder}"
-    );
-    assert!(
-        reminder.contains("</task_completion_discipline>\nTRACKING:"),
-        "{site} must glue discipline directly before TRACKING:\n{reminder}"
-    );
-    for phrase in [
-        "Tool-call first",
-        "Don't ask permission to continue a task in flight",
-        "Track multi-step work with a",
-        "Don't stop with easy work left undone",
-    ] {
-        assert!(
-            reminder.contains(phrase),
-            "{site} must include discipline phrase `{phrase}`:\n{reminder}"
-        );
-    }
-    assert_eq!(
-        reminder.matches("</task_completion_discipline>").count(),
-        1,
-        "{site} must contain exactly one discipline closing tag:\n{reminder}"
-    );
-    assert!(
-        !reminder.contains("{DISCIPLINE_BLOCK}"),
-        "{site} must not leave {{DISCIPLINE_BLOCK}} unsubstituted:\n{reminder}"
-    );
-}
 /// An actor whose persistence channel answers the `FlushAndAck` barrier, so a
 /// turn driven with a `persist_ack` resolves (bare `build_actor` never acks).
 #[cfg(test)]
@@ -664,5 +631,14 @@ pub(crate) async fn actor_with_persistence_drain() -> std::sync::Arc<SessionActo
             }
         }
     });
-    std::sync::Arc::new(create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await)
+    let (actor, _) = create_test_actor_with_terminal(
+        0,
+        256_000,
+        85,
+        gateway_tx,
+        persistence_tx,
+        Arc::new(DummyTerminal),
+    )
+    .await;
+    std::sync::Arc::new(actor)
 }

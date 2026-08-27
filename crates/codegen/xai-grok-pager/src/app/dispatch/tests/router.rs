@@ -61,12 +61,18 @@ fn external_prompt_editor_arms_typed_request_and_preserves_composer_modes() {
     }
 }
 #[test]
-fn external_prompt_editor_refuses_nonminimal_and_owned_input() {
+fn external_prompt_editor_arms_in_fullscreen_and_refuses_owned_input() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     app.agents.get_mut(&id).unwrap().prompt.set_text("draft");
     let _ = dispatch(Action::EditPromptExternal, &mut app);
-    assert!(app.pending_editor.is_none(), "full TUI must refuse");
+    assert!(
+        matches!(
+            app.pending_editor.take(),
+            Some(crate::app::external_editor::PendingEditorRequest::PromptDraft { .. })
+        ),
+        "full TUI arms the request without requiring prompt-pane focus"
+    );
     app.screen_mode = crate::app::ScreenMode::Minimal;
     app.agents.get_mut(&id).unwrap().active_pane = ActivePane::Scrollback;
     let _ = dispatch(Action::EditPromptExternal, &mut app);
@@ -75,7 +81,7 @@ fn external_prompt_editor_refuses_nonminimal_and_owned_input() {
             app.pending_editor,
             Some(crate::app::external_editor::PendingEditorRequest::PromptDraft { .. })
         ),
-        "minimal's logical composer remains authoritative after Tab/Vim focus"
+        "the composer stays the editing surface with scrollback focused"
     );
     app.pending_editor = None;
     app.agents.get_mut(&id).unwrap().cancel_turn_view =
@@ -245,6 +251,7 @@ fn deferred_paste_completion_after_refused_editor_does_not_implicitly_send_witho
                 target: crate::app::actions::ClipboardPasteTarget::AgentPrompt {
                     agent_id: id,
                     images_dir: None,
+                    from_feedback_pane: false,
                 },
                 source: crate::app::actions::ClipboardPasteSource::ClipboardKey {
                     text: crate::app::actions::ClipboardTextRead::Success(Some(
@@ -356,7 +363,14 @@ fn send_feedback_clears_active_ephemeral_tip() {
         &mut std::collections::HashMap::new(),
     );
     assert!(agent.ephemeral_tip.is_active());
-    let _ = dispatch(Action::SendFeedback("it broke".into()), &mut app);
+    let _ = dispatch(
+        Action::SendFeedback {
+            text: "it broke".into(),
+            images: Default::default(),
+            trace: Some(crate::app::actions::FeedbackTraceChoice::NoUpload),
+        },
+        &mut app,
+    );
     assert!(
         !app.agents.get(&id).unwrap().ephemeral_tip.is_active(),
         "feedback submit must clear the tip"
@@ -551,7 +565,7 @@ fn mark_turn_finished_clears_start_and_stamps_active() {
     let agent = app.agents.get_mut(&id).unwrap();
     agent.turn_started_at = Some(std::time::Instant::now());
     agent.last_active_at = None;
-    agent.mark_turn_finished();
+    agent.mark_turn_finished(crate::app::cancel_latency::TurnEnd::Completed);
     assert!(
         agent.turn_started_at.is_none(),
         "turn_started_at must be cleared"
@@ -2719,9 +2733,12 @@ fn expand_build_card_still_loads_detail() {
         "expected LoadCardDetail, got {effects:?}"
     );
 }
-/// Welcome-screen variants of the conversation-card expand exemption.
+/// Welcome-screen variants of the conversation-card expand exemption, plus
+/// the welcome card-detail round trip: the expand stamps the welcome
+/// picker's identity, a stale-seq result is dropped, and a current one
+/// lands on the welcome entry.
 #[test]
-fn welcome_expand_conversation_card_skips_detail_load() {
+fn welcome_expand_skips_conversation_and_routes_build_card_detail() {
     let mut app = test_app();
     app.session_picker_entries = Some(vec![make_conversation_entry("conv-exp-w1")]);
     let effects = dispatch(
@@ -2748,9 +2765,67 @@ fn welcome_expand_conversation_card_skips_detail_load() {
         },
         &mut app,
     );
-    assert!(
-        matches!(&effects[..], [Effect::LoadCardDetail { .. }]),
-        "expected LoadCardDetail, got {effects:?}"
+    let [
+        Effect::LoadCardDetail {
+            host: SessionPickerHost::Welcome,
+            generation,
+            session_id,
+            seq,
+            ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("expected a welcome-stamped LoadCardDetail, got {effects:?}");
+    };
+    assert_eq!(*generation, app.session_picker_generation);
+    assert_eq!(*seq, app.session_picker_detail_seq);
+    assert_eq!(session_id, "local-exp-w1");
+    let stamped_seq = *seq;
+    let _ = dispatch(Action::CycleSessionSourceFilter, &mut app);
+    let detail = crate::app::app_view::CardDetail {
+        turn_count: 3,
+        tool_call_count: 1,
+        first_prompt_preview: "hello".into(),
+    };
+    let welcome_detail = |generation, seq, detail| {
+        Action::TaskComplete(TaskResult::CardDetailLoaded {
+            host: SessionPickerHost::Welcome,
+            generation,
+            source: "local".into(),
+            session_id: "local-exp-w1".into(),
+            seq,
+            detail,
+        })
+    };
+    let welcome_card_detail = |app: &AppView| {
+        app.session_picker_entries.as_ref().and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry.id == "local-exp-w1")
+                .and_then(|entry| entry.card_detail.as_ref().map(|d| d.turn_count))
+        })
+    };
+    let _ = dispatch(
+        welcome_detail(app.session_picker_generation, stamped_seq, detail.clone()),
+        &mut app,
+    );
+    assert_eq!(
+        welcome_card_detail(&app),
+        None,
+        "a stale-seq welcome card detail must be dropped"
+    );
+    let _ = dispatch(
+        welcome_detail(
+            app.session_picker_generation,
+            app.session_picker_detail_seq,
+            detail,
+        ),
+        &mut app,
+    );
+    assert_eq!(
+        welcome_card_detail(&app),
+        None,
+        "Headless must not resurrect a cleared Grok row from card detail"
     );
 }
 /// Collect the active agent's system-block texts.

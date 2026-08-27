@@ -343,6 +343,8 @@ fn baseline_env_from_parent(
         ("DISABLE_FEEDBACK_COMMAND", "1"),
         ("GROK_DISABLE_AUTOUPDATER", "1"),
         ("GROK_PROMPT_SUGGESTIONS", "false"),
+        // Pin so a developer-exported override cannot flake empty-home launch tests.
+        ("GROK_DEFAULT_PERMISSION_MODE", "ask"),
         // Post-turn summary side-calls would add unscripted requests to the
         // mock server and break exact wire-traffic assertions.
         ("GROK_TURN_SUMMARY", "0"),

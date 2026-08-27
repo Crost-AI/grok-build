@@ -6,6 +6,7 @@
 pub mod groups;
 mod layout;
 mod nav;
+mod pin_reserve;
 mod selection;
 mod timeline;
 mod types;
@@ -133,6 +134,32 @@ pub struct ScrollbackState {
     /// prompt at the viewport top while still enabling follow for new content.
     follow_preserve_scroll: bool,
 
+    /// Extra rows under the latest user prompt so a page-flip can keep that
+    /// prompt at the top. Independent of follow mode: a user scroll must not
+    /// collapse it (that clamp is the tail-jump). Dropped when the prompt
+    /// scrolls fully below the fold, or when the transcript is cleared.
+    pin_reserve_active: bool,
+
+    /// Rows currently added to `total_height` by [`Self::pin_reserve_active`].
+    /// Kept beside the flag so follow-preserve can still detect real overflow
+    /// against the unpadded content height.
+    pin_reserve_pad: usize,
+
+    /// Scroll offset of the page-flip pin, captured when the reserve is armed.
+    /// Re-deriving it from the last user prompt after a finish-time rebuild
+    /// (thinking collapse, "Worked for…" marker, group fold) can disagree
+    /// with the pose we scrolled to and drop the pad.
+    pin_reserve_target: Option<usize>,
+
+    /// Stable id of the prompt the pin targets, captured when armed. The pin
+    /// tracks this specific prompt, not "the last user prompt", so a mid-turn
+    /// interjection cannot move the above/below boundary the pad shift uses.
+    pin_reserve_prompt_id: Option<EntryId>,
+
+    /// The turn that armed the pin has finished. Midstream overflow still
+    /// chases the tail; after this, a remeasure or terminal marker must not.
+    pin_reserve_after_turn: bool,
+
     // Selection
     /// Currently selected entry index.
     selected: Option<usize>,
@@ -253,6 +280,11 @@ impl ScrollbackState {
             viewport_height: 0,
             follow_mode: true,
             follow_preserve_scroll: false,
+            pin_reserve_active: false,
+            pin_reserve_pad: 0,
+            pin_reserve_target: None,
+            pin_reserve_prompt_id: None,
+            pin_reserve_after_turn: false,
             selected: None,
             selection_box: None,
             turns: Vec::new(),
@@ -393,6 +425,7 @@ impl ScrollbackState {
 
     /// Update the appearance configuration.
     pub fn set_appearance(&mut self, appearance: AppearanceConfig) {
+        crate::render::bidi::set_enabled(appearance.scrollback.display.rtl_bidi);
         self.appearance = appearance;
         // Invalidate caches since appearance affects rendering
         self.layout_cache = None;
@@ -1095,6 +1128,11 @@ impl ScrollbackState {
         self.turns.clear();
         self.current_turn = None;
         self.scroll_offset = 0;
+        self.pin_reserve_active = false;
+        self.pin_reserve_pad = 0;
+        self.pin_reserve_target = None;
+        self.pin_reserve_prompt_id = None;
+        self.pin_reserve_after_turn = false;
         self.commit_scan_cursor = 0;
         self.commit_expand_ring.clear();
         self.invalidate_layout_cache();
@@ -1226,13 +1264,14 @@ impl ScrollbackState {
     /// the display-mode policy for lifecycle swaps (tracker refinement and
     /// completion):
     ///
-    /// - Edit-to-Edit swaps keep the entry's current mode, so a manual
-    ///   expand of the one-liner survives later refinements and completion.
-    ///   Exception: when the swap first turns the summary untrusted (a later
-    ///   Diff revealed a multi-file call), the entry escalates to Expanded —
-    ///   the one-liner it was collapsed to no longer tells the truth. The
-    ///   escalation fires only on that rising edge, so a user's collapse of
-    ///   an already-untrusted block sticks.
+    /// - Same-kind swaps (Execute→Execute progress ticks, Edit refinements)
+    ///   keep the entry's current mode, so a mid-run expand survives later
+    ///   stdout and completion. Edit-to-Edit exception: when the swap first
+    ///   turns the summary untrusted (a later Diff revealed a multi-file
+    ///   call), the entry escalates to Expanded — the one-liner it was
+    ///   collapsed to no longer tells the truth. The escalation fires only
+    ///   on that rising edge, so a user's collapse of an already-untrusted
+    ///   block sticks.
     /// - Pinned (user-folded) entries keep their mode under
     ///   `respect_manual_folds`.
     /// - Any other swap (e.g. the eager `Other` placeholder refining into
@@ -1264,7 +1303,7 @@ impl ScrollbackState {
             new_tc.set_started_at(t);
         }
         let kind_changed = verb_group::verb_group_kind_changed(&entry.block, &block);
-        let (edit_to_edit, untrusted_rising) = match (&entry.block, &block) {
+        let (is_same_kind, untrusted_rising) = match (&entry.block, &block) {
             (
                 RenderBlock::ToolCall(ToolCallBlock::Edit(old)),
                 RenderBlock::ToolCall(ToolCallBlock::Edit(new)),
@@ -1272,14 +1311,14 @@ impl ScrollbackState {
                 true,
                 new.is_success() && new.summary_untrusted && !old.summary_untrusted,
             ),
+            (RenderBlock::ToolCall(old), RenderBlock::ToolCall(new)) => (
+                std::mem::discriminant(old) == std::mem::discriminant(new),
+                false,
+            ),
             _ => (false, false),
         };
         entry.block = block;
-        if edit_to_edit {
-            // Keep the current mode: the entry was already an Edit, so any
-            // change since materialization is a user gesture — except on the
-            // untrusted rising edge, where the collapsed one-liner became a
-            // lie and Expanded is the only truthful default. Pins still win.
+        if is_same_kind {
             if untrusted_rising && !(respect_manual_folds && entry.display_mode_pinned) {
                 entry.display_mode = DisplayMode::Expanded;
             }
@@ -1441,10 +1480,7 @@ impl ScrollbackState {
                     entry.display_mode = thinking_mode;
                 }
             } else if let Some(mode) = entry.block.finished_display_mode() {
-                // A Collapsed entry keeps its fold (no snap-open). Best
-                // effort: the tracker's Completed refinement may reset the
-                // mode to the block default before this runs; surviving a
-                // reset is the fold-pin system's job (respect_manual_folds).
+                // Collapsed stays folded — finish must not snap-open.
                 if entry.display_mode != DisplayMode::Collapsed {
                     entry.display_mode = mode;
                 }
@@ -1619,6 +1655,14 @@ impl ScrollbackState {
             }
             // Full rebuild produces cheap height ESTIMATES for every entry.
             self.ensure_layout_cache(width);
+            // Width changes invalidate the captured row coordinate. Re-pin before the release
+            // logic compares the new target with `scroll_offset`.
+            if resized && self.pin_reserve_active {
+                self.pin_reserve_target = self.pin_reserve_prompt_scroll_target();
+                if let Some(target) = self.pin_reserve_target {
+                    self.scroll_offset = target;
+                }
+            }
             self.compute_total_height_from_cache();
             // Re-pin the anchored content to the viewport top now that virtual_y
             // is rebuilt at the new width (before settle clamps / re-pins to it).
@@ -1661,6 +1705,7 @@ impl ScrollbackState {
             let top_anchor = self.viewport_top_anchor_point();
             let changes = self.update_dirty_entry_heights(width);
             self.dirty_heights.clear();
+            self.shift_pin_reserve_target_for_changes(&changes);
 
             if !changes.is_empty() {
                 if self.gaps_may_be_dirty {
@@ -1674,11 +1719,12 @@ impl ScrollbackState {
                     // Patch virtual_y in O(n-k) where k is the earliest dirty index.
                     // For streaming (dirty entry at end), this is O(1).
                     let total_delta = self.patch_virtual_y_for_dirty(&changes);
-                    // Apply delta directly instead of re-summing entire visible range.
-                    // Clamp at 0 to avoid underflow; no upper cap (total_height is
-                    // usize, so tall sessions are not truncated).
-                    let new_total = (self.total_height as i64 + total_delta as i64).max(0);
-                    self.total_height = new_total as usize;
+                    // Streamed growth must shrink the reserve rather than inflate max_offset.
+                    let content = self.total_height.saturating_sub(self.pin_reserve_pad);
+                    let new_content = (content as i64 + total_delta as i64).max(0) as usize;
+                    self.release_pin_reserve_if_below_fold();
+                    self.pin_reserve_pad = self.pin_reserve_pad_rows(new_content);
+                    self.total_height = new_content.saturating_add(self.pin_reserve_pad);
                 }
             } else if self.gaps_may_be_dirty {
                 // Heights didn't change, but structural state is dirty (e.g.,
@@ -1806,6 +1852,7 @@ impl ScrollbackState {
             .saturating_sub(self.viewport_height as usize);
         self.scroll_offset = offset.min(max_offset);
         self.follow_mode = false;
+        self.maybe_release_pin_reserve();
         self.bump_generation();
     }
 
@@ -2204,6 +2251,137 @@ mod tests {
             state.get_by_id(id).unwrap().display_mode,
             DisplayMode::Collapsed,
             "untrusted-to-untrusted swap must preserve the user's collapse"
+        );
+    }
+
+    /// Same-kind Execute→Execute must keep a mid-run user expand (progress
+    /// ticks rebuild the row through `replace_tool_block` without pinning).
+    /// Kind upgrade Other→Execute still adopts the agent Collapsed default
+    /// even if the placeholder was expanded. Completion (`replace` then
+    /// `finish_running`) must not snap the expand shut; a user-collapsed
+    /// Execute must not auto-open.
+    #[test]
+    fn replace_tool_block_execute_same_kind_preserves_mode() {
+        use crate::scrollback::blocks::tool::ExecuteToolCallBlock;
+
+        let mut state = ScrollbackState::new();
+        let id = state.push_block(RenderBlock::tool_call("Other", "pending", true));
+        state.set_last_running(true);
+        state
+            .get_by_id_mut(id)
+            .unwrap()
+            .set_display_mode(DisplayMode::Expanded);
+        assert!(state.replace_tool_block(id, RenderBlock::execute("cargo build"), None));
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Collapsed,
+            "Other→Execute must reset even if the placeholder was expanded"
+        );
+
+        state
+            .get_by_id_mut(id)
+            .unwrap()
+            .set_display_mode(DisplayMode::Expanded);
+        assert!(
+            !state.get_by_id(id).unwrap().display_mode_pinned,
+            "→ expand without respect_manual_folds must not pin"
+        );
+        assert!(state.replace_tool_block(
+            id,
+            RenderBlock::execute_with_output("cargo build", "Compiling…\n", None::<String>),
+            None
+        ));
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Expanded,
+            "Execute→Execute progress must keep the user's expand"
+        );
+
+        assert!(state.replace_tool_block(
+            id,
+            RenderBlock::execute_with_output(
+                "cargo build",
+                "Compiling…\nFinished\n",
+                None::<String>
+            ),
+            None
+        ));
+        state.finish_running(id);
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Expanded,
+            "completion must not snap a user-expanded Execute shut"
+        );
+
+        let mut state = ScrollbackState::new();
+        let id = state.push_block(RenderBlock::execute("cargo test"));
+        state.set_last_running(true);
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Collapsed
+        );
+        assert!(state.replace_tool_block(
+            id,
+            RenderBlock::execute_with_output("cargo test", "running 1 test\n", None::<String>),
+            None
+        ));
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Collapsed,
+            "Execute→Execute progress must not auto-open a collapsed Execute"
+        );
+
+        // Search (`finished_display_mode() = None`): same-kind expand
+        // survives replace + completion.
+        let mut state = ScrollbackState::new();
+        let id = state.push_block(RenderBlock::search("todo", 0, vec![]));
+        state.set_last_running(true);
+        state
+            .get_by_id_mut(id)
+            .unwrap()
+            .set_display_mode(DisplayMode::Expanded);
+        assert!(state.replace_tool_block(id, RenderBlock::search("todo", 3, vec![]), None));
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Expanded,
+            "Search→Search must keep a user expand"
+        );
+        state.finish_running(id);
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Expanded,
+            "Search completion must not snap a user expand shut"
+        );
+
+        // bash_mode: Truncated progress stays Truncated (no snap-open);
+        // finish still expands.
+        let bash = |output: Option<&str>| {
+            let mut b = ExecuteToolCallBlock::new("pytest");
+            b.bash_mode = true;
+            if let Some(o) = output {
+                b = b.with_output(o);
+            }
+            RenderBlock::ToolCall(ToolCallBlock::Execute(b))
+        };
+        let mut state = ScrollbackState::new();
+        let id = state.push_block(bash(None));
+        state.set_last_running(true);
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Truncated
+        );
+        assert!(state.replace_tool_block(id, bash(Some("running 1 test\n")), None));
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Truncated,
+            "bash Execute→Execute progress must not snap-open Truncated"
+        );
+        assert!(state.replace_tool_block(id, bash(Some("lots\nof\noutput\n")), None));
+        state.finish_running(id);
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Expanded,
+            "bash finish must still expand from preserved Truncated"
         );
     }
 

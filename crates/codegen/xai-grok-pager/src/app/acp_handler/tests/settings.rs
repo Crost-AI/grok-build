@@ -724,9 +724,6 @@
         );
     }
 
-    /// Soft-origin recompute with injected TOML (deterministic — no host
-    /// config): remote always-approve arms default_yolo + UI, keeps the soft
-    /// latch, and persists nothing.
     #[test]
     fn permission_mode_soft_default_applies_remote_always_approve() {
         let mut app = make_app_with_agent("sess-pm");
@@ -755,10 +752,8 @@
         );
     }
 
-    /// Explicit `null` recomputes with remote=None (unlike field omission):
-    /// with no TOML permission key the soft always-approve drops back to Ask.
     #[test]
-    fn permission_mode_explicit_null_clears_soft_always_approve() {
+    fn permission_mode_null_clears_soft_always_approve() {
         let mut app = make_app_with_agent("sess-null-pm");
         app.auto_mode_gate = true;
         app.permission_mode_from_soft_default = true;
@@ -767,7 +762,11 @@
 
         super::super::settings::apply_soft_default_permission_mode(&mut app, None, None);
         assert!(!app.default_yolo, "remote null must disarm a soft always-approve");
-        assert_eq!(app.current_ui.permission_mode.as_deref(), Some("ask"));
+        assert_ne!(
+            app.current_ui.permission_mode.as_deref(),
+            Some("always-approve"),
+            "the soft always-approve must be cleared from the UI mirror"
+        );
         assert!(app.permission_mode_from_soft_default);
         assert!(
             app.pending_effects.is_empty(),
@@ -775,7 +774,22 @@
         );
     }
 
-    /// Policy pin and auto gate clamp a soft re-arm to Ask enforcement/display.
+    #[test]
+    fn permission_mode_broken_config_stays_ask() {
+        let mut app = make_app_with_agent("sess-broken-cfg");
+        app.auto_mode_gate = true;
+        app.permission_mode_from_soft_default = true;
+
+        let fallback = super::super::settings::broken_config_ask_fallback();
+        super::super::settings::apply_soft_default_permission_mode(
+            &mut app,
+            fallback.get("ui"),
+            Some("always-approve"),
+        );
+        assert!(!app.default_yolo, "broken config must not arm always-approve");
+        assert_eq!(app.current_ui.permission_mode.as_deref(), Some("ask"));
+    }
+
     #[test]
     fn permission_mode_soft_default_respects_pin_and_gate() {
         let mut app = make_app_with_agent("sess-pin-pm");

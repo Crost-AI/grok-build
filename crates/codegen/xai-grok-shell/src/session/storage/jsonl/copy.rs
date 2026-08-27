@@ -413,6 +413,39 @@ impl JsonlStorageAdapter {
             &self.announcement_state_file(source_info),
             &self.announcement_state_file(target_info),
         )?;
+        // A truncating or filtering copy can drop the failure announcement
+        // from the child's context while the copied state still marks it
+        // announced, permanently muting it. End the episodes so still-down
+        // servers re-announce — the same rule as the rewind/compaction
+        // re-arm. Connected fingerprints stay latched: connected tools
+        // remain visible in the tool definitions regardless.
+        if announcement_state_copied
+            && (options.target_prompt_index.is_some() || options.fork_filter)
+        {
+            clear_announced_failure_episodes(&self.announcement_state_file(target_info))?;
+        }
+
+        // Title-refresh watermark: only a managed parent (one with a watermark)
+        // passes managed state to the child, so a fork of a pre-feature session
+        // stays unmanaged (frozen) rather than being adopted. A full fork
+        // inherits the parent's checkpoint (keeping the inherited title frozen);
+        // a partial fork starts fresh at `0` so it can retitle its shorter
+        // conversation.
+        if let Some(parent_idx) =
+            crate::session::helpers::session_summary::load_title_refresh_watermark(
+                &self.session_dir(source_info),
+            )
+        {
+            let child_idx = if options.target_prompt_index.is_none() {
+                parent_idx
+            } else {
+                0
+            };
+            crate::session::helpers::session_summary::save_title_refresh_watermark(
+                &self.session_dir(target_info),
+                child_idx,
+            );
+        }
 
         // Copied verbatim: the archive is immutable, so no cwd rewrite.
         let compaction_segments_copied = if options.copy_compaction_segments {
@@ -538,7 +571,34 @@ fn fork_summary(
         } else {
             source.last_turn_summary_prompt_id
         },
+        // A recap describes the parent's whole session; a partial fork may not
+        // contain that work, so clear it there and keep it for full forks.
+        last_recap: if options.target_prompt_index.is_some() {
+            None
+        } else {
+            source.last_recap
+        },
     }
+}
+
+/// Remove `announced_failed_servers` from a copied `announcement_state.json`,
+/// preserving every other field (including ones this build doesn't know).
+/// A file that doesn't parse is left as copied: the next persist rewrites it.
+fn clear_announced_failure_episodes(path: &Path) -> io::Result<()> {
+    let bytes = std::fs::read(path)?;
+    let Ok(mut state) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Ok(());
+    };
+    let Some(fields) = state.as_object_mut() else {
+        return Ok(());
+    };
+    if fields.remove("announced_failed_servers").is_none() {
+        return Ok(());
+    }
+    crate::session::storage::write_bytes_atomic(
+        path,
+        &serde_json::to_vec(&state).map_err(invalid_data)?,
+    )
 }
 
 /// Copy one optional sidecar file (plan, signals, tool state, ...) when

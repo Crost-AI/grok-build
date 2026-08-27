@@ -217,8 +217,7 @@ mod tests {
         );
         assert!(
             uuid::Uuid::parse_str(&fork_id).is_ok(),
-            "Fork ID should be a valid UUID: {}",
-            fork_id
+            "Fork ID should be a valid UUID"
         );
     }
 
@@ -323,5 +322,62 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         // new_model_id should not be present in JSON when None
         assert!(!json.contains("new_model_id"));
+    }
+
+    #[tokio::test]
+    async fn fork_request_kind_materializes_on_child() {
+        use crate::session::persistence::default_model_id;
+        use crate::session::storage::StorageAdapter;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+        let source = Info {
+            id: acp::SessionId::new("parent-kind"),
+            cwd: "/src".to_string(),
+        };
+        adapter
+            .init_session(&source, default_model_id())
+            .await
+            .unwrap();
+
+        for (wire, expected) in [
+            (Some("headless"), "headless"),
+            (Some("fork"), "fork"),
+            (None, "fork"),
+        ] {
+            let mut body = serde_json::json!({
+                "sourceSessionId": source.id.to_string(),
+                "sourceCwd": source.cwd,
+                "newCwd": "/dst",
+                "newSessionId": format!("child-{expected}-{}", wire.unwrap_or("omit")),
+            });
+            if let Some(kind) = wire {
+                body["sessionKind"] = serde_json::Value::String(kind.into());
+            }
+            let request: ForkSessionRequest = serde_json::from_value(body).unwrap();
+            let target = Info {
+                id: acp::SessionId::new(request.new_session_id.clone().unwrap()),
+                cwd: request.new_cwd.clone(),
+            };
+            adapter
+                .copy_session_data(
+                    &source,
+                    &target,
+                    CopySessionOptions {
+                        parent_session_id: Some(request.source_session_id),
+                        session_kind: request.session_kind,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let loaded = adapter.load_session(&target).await.unwrap();
+            assert_eq!(
+                loaded.summary.session_kind.as_deref(),
+                Some(expected),
+                "wire sessionKind={wire:?}"
+            );
+        }
     }
 }

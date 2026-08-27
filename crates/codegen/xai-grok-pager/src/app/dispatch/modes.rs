@@ -235,6 +235,11 @@ pub(crate) fn downgrade_displayed_auto_if_gated(app: &mut AppView) {
     for agent in app.agents.values_mut() {
         agent.session.auto_mode = false;
     }
+    if let Some(dashboard) = app.dashboard.as_mut()
+        && dashboard.pending_mode == crate::views::dashboard::DashboardDispatchMode::Auto
+    {
+        dashboard.pending_mode = crate::views::dashboard::DashboardDispatchMode::Normal;
+    }
     if app.current_ui.permission_mode.as_deref() == Some("auto") {
         app.current_ui.permission_mode = Some("ask".into());
     }
@@ -752,13 +757,7 @@ fn dispatch_cycle_mode_inner(app: &mut AppView) -> Vec<Effect> {
         };
         refresh_open_settings_modals(app);
         let mut effects = Vec::new();
-        // Persist the displayed mode to disk like the with-session arms do —
-        // otherwise a restart re-reads the stale launch value (e.g. cycling
-        // Always-Approve off pre-session still relaunched in yolo).
-        // `session_id: None` skips the ACP yolo_mode_changed push because there is no session to address yet.
-        // Known gap: the `_meta` seeds were already frozen when CreateSession went out, so a yolo or auto choice made
-        // here reaches the shell only on the next explicit switch. Plan is the one mode that replays, via
-        // `deferred_session_mode` in `handle_session_created`.
+        // Persist the displayed mode for the next launch; the pending CreateSession snapshots this mutation before execution.
         if let Some(canonical) = persist_canonical {
             effects.push(Effect::PersistPermissionMode {
                 canonical,

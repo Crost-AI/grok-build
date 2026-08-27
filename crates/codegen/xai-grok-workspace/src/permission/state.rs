@@ -30,6 +30,14 @@ pub struct PermissionState {
     /// for which the user has granted "always allow" to every tool. Lookup
     /// validates and parses the complete qualified ID before matching.
     pub allowed_mcp_servers: HashSet<String>,
+    /// Exact MCP tool names the user has denied with "never allow". Checked
+    /// before every MCP grant (deny wins). Always tool-scoped — there is
+    /// deliberately no server-scope deny.
+    pub disallowed_mcp_tools: HashSet<String>,
+    /// Host keys the user has denied for `web_fetch` (lowercased, `www.` kept
+    /// — never collapsed to a parent domain). Checked before every web-fetch
+    /// grant (deny wins); a deny also covers subdomains of the entry.
+    pub disallowed_web_fetch_domains: HashSet<String>,
     /// Version proving server-wide grants were minted from validated qualified IDs.
     /// Missing or malformed markers are legacy; future integer versions are preserved.
     #[serde(
@@ -65,6 +73,8 @@ impl Default for PermissionState {
             allowed_web_fetch_domains: HashSet::new(),
             allowed_mcp_tools: HashSet::new(),
             allowed_mcp_servers: HashSet::new(),
+            disallowed_mcp_tools: HashSet::new(),
+            disallowed_web_fetch_domains: HashSet::new(),
             validated_mcp_server_grants_version: VALIDATED_MCP_SERVER_GRANTS_VERSION,
         }
     }
@@ -95,6 +105,8 @@ impl PermissionState {
             allowed_web_fetch_domains,
             allowed_mcp_tools,
             allowed_mcp_servers,
+            disallowed_mcp_tools,
+            disallowed_web_fetch_domains,
             validated_mcp_server_grants_version: _,
         } = other;
         self.allow_bash_execute |= allow_bash_execute;
@@ -106,6 +118,9 @@ impl PermissionState {
             .extend(allowed_web_fetch_domains);
         self.allowed_mcp_tools.extend(allowed_mcp_tools);
         self.allowed_mcp_servers.extend(allowed_mcp_servers);
+        self.disallowed_mcp_tools.extend(disallowed_mcp_tools);
+        self.disallowed_web_fetch_domains
+            .extend(disallowed_web_fetch_domains);
     }
 }
 
@@ -292,6 +307,64 @@ pub(crate) async fn load_state_from_disk(
     load_state_with_fallback(&dirs.dir, dirs.legacy_dir.as_deref(), client_identifier).await
 }
 
+/// Lets the permission actor pick up a concurrent session's grants without
+/// re-walking the repo root or re-parsing an unchanged store on every request.
+pub(crate) struct CachedStateStore {
+    dir: std::path::PathBuf,
+    legacy_dir: Option<std::path::PathBuf>,
+    client_identifier: Option<String>,
+    /// `(mtime, len)` at the last read; size pairs with mtime to catch a
+    /// same-tick write that coarse-granularity filesystems would hide.
+    last_sig: Option<(std::time::SystemTime, u64)>,
+}
+
+impl CachedStateStore {
+    /// The signature is snapshotted BEFORE the content read, so a concurrent
+    /// persist between the two can only cause a redundant reload later, never
+    /// leave the cache ahead of the loaded state.
+    pub(crate) async fn resolve_and_load(
+        cwd: &AbsPathBuf,
+        client_identifier: Option<&str>,
+    ) -> (Self, PermissionState) {
+        let dirs = resolve_store_dirs(cwd, false).await;
+        let mut store = Self {
+            dir: dirs.dir,
+            legacy_dir: dirs.legacy_dir,
+            client_identifier: client_identifier.map(str::to_owned),
+            last_sig: None,
+        };
+        store.last_sig = store.current_sig().await;
+        let state = store.read().await;
+        (store, state)
+    }
+
+    async fn current_sig(&self) -> Option<(std::time::SystemTime, u64)> {
+        let path = state_file_path(&self.dir, self.client_identifier.as_deref());
+        let meta = tokio::fs::metadata(path).await.ok()?;
+        Some((meta.modified().ok()?, meta.len()))
+    }
+
+    async fn read(&self) -> PermissionState {
+        load_state_with_fallback(
+            &self.dir,
+            self.legacy_dir.as_deref(),
+            self.client_identifier.as_deref(),
+        )
+        .await
+    }
+
+    /// Grants on disk when the file signature changed since the last read, else
+    /// `None` — an unchanged store costs only the `stat`.
+    pub(crate) async fn reload_if_changed(&mut self) -> Option<PermissionState> {
+        let sig = self.current_sig().await;
+        if sig == self.last_sig {
+            return None;
+        }
+        self.last_sig = sig;
+        Some(self.read().await)
+    }
+}
+
 async fn persist_state_to_path_with_writer<F>(
     path: &std::path::Path,
     state: &PermissionState,
@@ -455,6 +528,21 @@ mod tests {
         assert!(denied.contains("rm -rf"));
         assert!(denied.contains("git push --force"));
         assert_eq!(denied.len(), 2);
+    }
+
+    /// Pre-deny stores (no `disallowed_mcp_tools` / `disallowed_web_fetch_domains`
+    /// keys on disk) must load with empty deny sets.
+    #[test]
+    fn missing_deny_fields_default_empty() {
+        let restored: PermissionState = toml::from_str(
+            r#"
+allowed_mcp_tools = ["linear__list"]
+"#,
+        )
+        .unwrap();
+        assert!(restored.allowed_mcp_tools.contains("linear__list"));
+        assert!(restored.disallowed_mcp_tools.is_empty());
+        assert!(restored.disallowed_web_fetch_domains.is_empty());
     }
 
     #[test]
@@ -1067,6 +1155,36 @@ allowed_mcp_servers = ["a"]
         assert!(a.allow_bash_execute);
         // Scalar policy keeps the in-memory session's value.
         assert_eq!(a.edit_policy, EditPolicy::Ask);
+    }
+
+    /// The MCP/domain deny sets merge additively in both directions, like
+    /// `disallowed_bash_commands`: a deny persisted by another session
+    /// survives a merge with this session's state and vice versa.
+    #[test]
+    fn merge_grants_unions_mcp_and_domain_denies_both_directions() {
+        let mut a = PermissionState::default();
+        a.disallowed_mcp_tools.insert("linear__delete".to_string());
+        a.disallowed_web_fetch_domains
+            .insert("tracker.example".to_string());
+
+        let mut b = PermissionState::default();
+        b.disallowed_mcp_tools.insert("notion__purge".to_string());
+        b.disallowed_web_fetch_domains
+            .insert("evil.example".to_string());
+
+        let mut a2 = a.clone();
+        a2.merge_grants_from(b.clone());
+        assert!(a2.disallowed_mcp_tools.contains("linear__delete"));
+        assert!(a2.disallowed_mcp_tools.contains("notion__purge"));
+        assert!(a2.disallowed_web_fetch_domains.contains("tracker.example"));
+        assert!(a2.disallowed_web_fetch_domains.contains("evil.example"));
+
+        let mut b2 = b;
+        b2.merge_grants_from(a);
+        assert!(b2.disallowed_mcp_tools.contains("linear__delete"));
+        assert!(b2.disallowed_mcp_tools.contains("notion__purge"));
+        assert!(b2.disallowed_web_fetch_domains.contains("tracker.example"));
+        assert!(b2.disallowed_web_fetch_domains.contains("evil.example"));
     }
 
     // ── repo-root store keying ───────────────────────────────────

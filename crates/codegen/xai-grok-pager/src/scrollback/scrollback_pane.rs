@@ -839,8 +839,6 @@ impl ScrollbackPane {
         let output = entry.block.output(ctx);
         let block_has_vpad = entry.block.has_vpad(ctx);
 
-        // Get accent background preference and block background
-        let accent_has_bg = entry.block.accent_background(ctx);
         let block_bg = entry.block.background(ctx);
 
         // Resolve the background color from block_bg
@@ -899,8 +897,9 @@ impl ScrollbackPane {
             if y >= content_area.y + content_area.height {
                 break;
             }
-            // Render line in the content area (not overlapping with accent)
-            buf.set_line_safe(content_area.x, y, &line.content, content_area.width);
+            // Render line in the content area (not overlapping with accent).
+            // Bidi: content paint only — selection maps visual columns back.
+            buf.set_line_safe_bidi(content_area.x, y, &line.content, content_area.width);
             if let (Some(range_id), Some(cols)) = (
                 line.selection_range,
                 selectable_cols(&line.content, &line.selectable),
@@ -911,8 +910,12 @@ impl ScrollbackPane {
                     block_line_idx,
                     screen_y: y,
                     screen_x: content_area.x,
-                    selectable_cols: cols,
+                    // Visual span so the hit box matches the reordered cells
+                    // even when a non-selectable suffix shifts the region.
+                    selectable_cols: crate::scrollback::types::visual_selectable_cols(line)
+                        .unwrap_or(cols),
                     text: derive_selection_text(line),
+                    painted_region: Some(crate::scrollback::types::painted_selectable_region(line)),
                     joiner_to_previous: line.joiner.clone(),
                 });
             }
@@ -955,39 +958,13 @@ impl ScrollbackPane {
 
         // vpad bottom is just empty space - no need to track y further
 
-        // Draw accent line if entry has one, otherwise clear the accent column
-        // so stale content from previous frames doesn't bleed through.
-        if let Some(accent) = entry.block.accent(ctx) {
-            let color = accent.color;
-            let accent_area = layout.accent;
-
-            // Determine accent background color based on accent_has_bg and block_bg
-            let accent_bg = if accent_has_bg {
-                match block_bg {
-                    BlockBackground::None => theme.bg_base,
-                    BlockBackground::Light => theme.bg_light,
-                    BlockBackground::Dark => theme.bg_dark,
-                }
-            } else {
-                theme.bg_base
-            };
-
-            for y in accent_area.y..accent_area.y + total_height.min(area.height) {
-                if let Some(cell) = buf.cell_mut((accent_area.x, y)) {
-                    cell.set_char('┃');
-                    cell.set_style(ratatui::style::Style::default().fg(color).bg(accent_bg));
-                }
-            }
-        } else {
-            // No accent: clear the column with the block's bg so it matches.
-            let accent_area = layout.accent;
-            let clear_bg = bg_color.unwrap_or(theme.bg_base);
-            let clear_style = ratatui::style::Style::default().bg(clear_bg);
-            for y in accent_area.y..accent_area.y + total_height.min(area.height) {
-                if let Some(cell) = buf.cell_mut((accent_area.x, y)) {
-                    cell.set_char(' ');
-                    cell.set_style(clear_style);
-                }
+        // The accent column is kept for alignment but never painted. Clear it so content from a previous frame cannot bleed through.
+        let accent_area = layout.accent;
+        let clear_style = ratatui::style::Style::default().bg(bg_color.unwrap_or(theme.bg_base));
+        for y in accent_area.y..accent_area.y + total_height.min(area.height) {
+            if let Some(cell) = buf.cell_mut((accent_area.x, y)) {
+                cell.set_char(' ');
+                cell.set_style(clear_style);
             }
         }
 

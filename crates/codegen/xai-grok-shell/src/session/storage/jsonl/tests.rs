@@ -206,6 +206,42 @@ async fn workflow_run_manifest_round_trips_and_clear_tombstone_wins() {
     assert_eq!(loaded.workflow_runs.len(), 1);
     assert_eq!(loaded.workflow_runs[0].script, "complete(\"ok\");");
     assert_eq!(loaded.workflow_runs[0].args, serde_json::json!({"objective": "ship"}));
+    assert_eq!(loaded.workflow_runs[0].effort, None);
+    let effort_path = run_dir.join("effort");
+    std::fs::write(&effort_path, "high").unwrap();
+    let loaded_with_effort = adapter.load_session_without_updates(&info).await.unwrap();
+    assert_eq!(loaded_with_effort.workflow_runs[0].effort,
+            Some(xai_grok_sampling_types::ReasoningEffort::High));
+    for invalid in ["XHIGH", "turbo"] {
+        std::fs::write(&effort_path, invalid).unwrap();
+        assert!(
+                adapter
+                    .load_session_without_updates(&info)
+                    .await
+                    .unwrap()
+                    .workflow_runs
+                    .is_empty(),
+                "present effort sidecar must be canonical: {invalid}"
+            );
+    }
+    std::fs::remove_file(&effort_path).unwrap();
+    std::fs::create_dir(&effort_path).unwrap();
+    assert!(adapter.load_session_without_updates(&info).await.unwrap().workflow_runs.is_empty());
+    std::fs::remove_dir(&effort_path).unwrap();
+    std::fs::write(&effort_path, [0xff]).unwrap();
+    assert!(adapter.load_session_without_updates(&info).await.unwrap().workflow_runs.is_empty());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let effort_target = run_dir.join("effort-target");
+        std::fs::write(&effort_target, "high").unwrap();
+        std::fs::remove_file(&effort_path).unwrap();
+        symlink(&effort_target, &effort_path).unwrap();
+        assert!(adapter.load_session_without_updates(&info).await.unwrap().workflow_runs.is_empty());
+        std::fs::remove_file(&effort_path).unwrap();
+        std::fs::remove_file(&effort_target).unwrap();
+    }
+    std::fs::write(&effort_path, "high").unwrap();
     let mut legacy = manifest.clone();
     legacy.version = 2;
     adapter.write_workflow_run_state(&info, &legacy).await.unwrap();
@@ -1195,6 +1231,7 @@ fn write_test_summary(
         reasoning_effort: None,
         last_turn_summary: None,
         last_turn_summary_prompt_id: None,
+        last_recap: None,
     };
     let json = serde_json::to_vec_pretty(&summary).unwrap();
     std::fs::write(session_dir.join("summary.json"), json).unwrap();
@@ -1290,6 +1327,53 @@ async fn list_sessions_recent_excludes_hidden_sessions() {
     let recent = adapter.list_sessions_recent(100).await.unwrap();
     assert_eq!(recent.len(), 1);
     assert_eq!(recent[0].info.id, acp::SessionId::new("visible"));
+}
+#[tokio::test]
+async fn list_sessions_recent_skips_headless_without_shorting_the_page() {
+    let tmp = TempDir::new().unwrap();
+    let cwd = crate::util::grok_home::encode_cwd_dirname("/workspace");
+    let now = chrono::Utc::now();
+    let times: Vec<_> = (0..4).map(|i| now - chrono::Duration::hours(i)).collect();
+    for (i, (id, kind)) in [
+        ("h-new", Some("headless")),
+        ("h-mid", Some("headless")),
+        ("i-old", None),
+        ("i-older", None),
+    ]
+        .into_iter()
+        .enumerate()
+    {
+        let dir = write_test_summary(tmp.path(), &cwd, id, times[i], None, None, kind);
+        set_mtime(&dir.join("summary.json"), times[i]);
+    }
+    let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+    let recent = adapter.list_sessions_recent(2).await.unwrap();
+    let ids: Vec<&str> = recent.iter().map(|s| s.info.id.0.as_ref()).collect();
+    assert_eq!(
+            ids,
+            ["i-old", "i-older"],
+            "headless rows are skipped and their slots refilled from older candidates"
+        );
+}
+#[tokio::test]
+async fn list_sessions_recent_bounds_reads_on_headless_dominated_store() {
+    let tmp = TempDir::new().unwrap();
+    let cwd = crate::util::grok_home::encode_cwd_dirname("/workspace");
+    let now = chrono::Utc::now();
+    let newest_interactive = 40;
+    for i in 0..50 {
+        let id = format!("s{i}");
+        let kind = (i != newest_interactive).then_some("headless");
+        let ts = now - chrono::Duration::minutes(i);
+        let dir = write_test_summary(tmp.path(), &cwd, &id, ts, None, None, kind);
+        set_mtime(&dir.join("summary.json"), ts);
+    }
+    let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+    let recent = adapter.list_sessions_recent(2).await.unwrap();
+    assert!(
+            recent.is_empty(),
+            "interactive rows past the read bound must not force a full scan"
+        );
 }
 #[tokio::test]
 async fn list_sessions_recent_empty_dir() {

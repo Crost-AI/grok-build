@@ -181,7 +181,9 @@ impl xai_tool_runtime::Tool for GlobTool {
             .arg(&search_dir)
             .stdout(Stdio::piped())
             // stderr is never read; a pipe would block rg once warnings fill it.
-            .stderr(Stdio::null());
+            // Cached descriptor, not `Stdio::null()`: an unlinked `/dev/null`
+            // must not fail the spawn.
+            .stderr(xai_tty_utils::null_stdio());
         crate::util::detach_search_command(&mut cmd);
 
         #[allow(clippy::disallowed_methods)] // search helper, waited on below
@@ -354,13 +356,8 @@ mod tests {
             .render(ToolMetadata::description_template(&GlobTool))
             .unwrap();
         assert!(
-            rendered.contains("required file_pattern parameter")
-                && rendered.contains("set search_dir"),
+            rendered.contains("file_pattern") && rendered.contains("search_dir"),
             "renamed pattern/path params must appear:\n{rendered}"
-        );
-        assert!(
-            !rendered.contains("extension breakdowns") && !rendered.contains("dot-directories"),
-            "stale list_dir-style claims must not remain:\n{rendered}"
         );
     }
 

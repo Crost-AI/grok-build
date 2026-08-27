@@ -196,13 +196,17 @@ impl JsonlStorageAdapter {
         });
         Ok(summaries)
     }
+    /// Extra `summary.json` reads allowed past `limit` while skipping
+    /// hidden/headless rows. Keeps refill behavior for a mixed store without
+    /// scanning a headless-dominated tree.
+    const RECENT_LIST_READ_SLACK: usize = 8;
     /// List the N most recently modified session summaries across all
     /// workspaces.
     ///
     /// Instead of reading every `summary.json` (expensive at scale — ~12K
     /// files), this stats each file to get its mtime, sorts by mtime, and
-    /// only reads the top `limit` files. On a machine with ~12K sessions
-    /// this reduces cold-boot `workspace_list` from ~3s to ~200ms.
+    /// reads newest-first only until `limit` rows are kept. On a machine with
+    /// ~12K sessions this reduces cold-boot `workspace_list` from ~3s to ~200ms.
     /// Final order among candidates uses `last_active_at` else `updated_at`.
     pub async fn list_sessions_recent(&self, limit: usize) -> io::Result<Vec<Summary>> {
         let session_dirs = self.scan_session_dirs(None)?;
@@ -217,13 +221,19 @@ impl JsonlStorageAdapter {
             }
         }
         candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-        candidates.truncate(limit);
-        let mut summaries = Vec::with_capacity(candidates.len());
-        for (summary_path, _) in candidates {
+        let max_reads = limit
+            .saturating_mul(Self::RECENT_LIST_READ_SLACK)
+            .max(limit);
+        let mut summaries = Vec::with_capacity(limit.min(candidates.len()));
+        for (reads, (summary_path, _)) in candidates.into_iter().enumerate() {
+            if summaries.len() == limit || reads >= max_reads {
+                break;
+            }
             match std::fs::read(&summary_path) {
                 Ok(bytes) => {
                     if let Ok(summary) = serde_json::from_slice::<Summary>(&bytes)
                         && !summary.is_hidden()
+                        && !summary.is_headless()
                     {
                         summaries.push(summary);
                     }
@@ -676,8 +686,8 @@ impl JsonlStorageAdapter {
             .take(MAX_RESTORED_WORKFLOW_RUNS.saturating_add(1))
             .collect();
         let entries_truncated = entries.len() > MAX_RESTORED_WORKFLOW_RUNS;
-        entries.truncate(MAX_RESTORED_WORKFLOW_RUNS);
         entries.sort_by_key(|entry| entry.file_name());
+        entries.truncate(MAX_RESTORED_WORKFLOW_RUNS);
         if entries_truncated {
             tracing::warn!(
                 path = %workflows_dir.display(),
@@ -756,10 +766,46 @@ impl JsonlStorageAdapter {
                     continue;
                 }
             };
+            let effort_path = run_dir.join("effort");
+            let effort = match read_bounded_nofollow(
+                &effort_path,
+                crate::session::workflow::store::MAX_WORKFLOW_EFFORT_BYTES,
+            ) {
+                Ok(bytes) => {
+                    match String::from_utf8(bytes)
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+                        .and_then(|effort| {
+                            let parsed = effort
+                                .parse::<xai_grok_sampling_types::ReasoningEffort>()
+                                .map_err(|error| {
+                                    io::Error::new(io::ErrorKind::InvalidData, error)
+                                })?;
+                            if effort != parsed.as_str() {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "workflow effort is not canonical",
+                                ));
+                            }
+                            Ok(parsed)
+                        }) {
+                        Ok(effort) => Some(effort),
+                        Err(error) => {
+                            tracing::warn!(path = %effort_path.display(), %error, "skipping workflow with invalid immutable effort");
+                            continue;
+                        }
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    tracing::warn!(path = %effort_path.display(), %error, "skipping workflow with invalid immutable effort");
+                    continue;
+                }
+            };
             restored.push(crate::session::workflow::store::RestoredWorkflowRun {
                 manifest,
                 script,
                 args,
+                effort,
             });
         }
         Ok(restored)
@@ -1011,6 +1057,16 @@ impl StorageAdapter for JsonlStorageAdapter {
         )
         .await
     }
+    async fn set_session_kind_if_absent(&self, info: &Info, kind: String) -> io::Result<()> {
+        self.apply_summary_patch(
+            info,
+            super::summary_write::SummaryPatch {
+                session_kind_if_absent: Some(kind),
+                ..Default::default()
+            },
+        )
+        .await
+    }
     async fn set_generated_title_if_absent(
         &self,
         info: &Info,
@@ -1025,11 +1081,35 @@ impl StorageAdapter for JsonlStorageAdapter {
         )
         .await
     }
+    async fn regenerate_generated_title(
+        &self,
+        info: &Info,
+        session_title: String,
+    ) -> io::Result<bool> {
+        self.apply_summary_patch_reporting(
+            info,
+            super::summary_write::SummaryPatch {
+                generated_title_regenerate: Some(session_title),
+                ..Default::default()
+            },
+        )
+        .await
+    }
     async fn reset_title_to_auto(&self, info: &Info) -> io::Result<bool> {
         self.apply_summary_patch_reporting(
             info,
             super::summary_write::SummaryPatch {
                 reset_title_to_auto: true,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+    async fn set_last_recap(&self, info: &Info, recap: Option<String>) -> io::Result<()> {
+        self.apply_summary_patch(
+            info,
+            super::summary_write::SummaryPatch {
+                last_recap: Some(recap),
                 ..Default::default()
             },
         )

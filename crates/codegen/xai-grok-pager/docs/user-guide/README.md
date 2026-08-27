@@ -52,4 +52,7 @@ Automate, script, and integrate Grok Build with other systems.
 | 22 | [Permissions and Safety](22-permissions-and-safety.md) | Modes (always-approve, auto, ask), rules, matching, hooks, and examples |
 | 23 | [Agent Dashboard](23-dashboard.md) | Central overview of local sessions and forks |
 | 24 | [Monitoring Usage (External OpenTelemetry)](24-monitoring-usage.md) | Customer OTEL export |
-| 25 | [Channels](25-channels.md) | Push chat messages, webhooks, and alerts into a running session; two-way chat bridges |
+| 25 | [Status Line](25-status-line.md) | The bottom status row: built-in segments, command scripts, and the stdin JSON contract |
+| 26 | [Configuration Reference](26-config-reference.md) | Field list for `config.toml`, `managed_config.toml`, and `requirements.toml` |
+| 27 | [grok clone](27-grok-clone.md) | Depth-1 Grove clone, `--full-history`, and safe deepen/switch commands |
+| 28 | [Channels](25-channels.md) | Crost: push chat messages, webhooks, and alerts into a running session; two-way chat bridges |

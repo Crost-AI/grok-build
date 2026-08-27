@@ -1,4 +1,16 @@
+use super::mcp_failed_reminder::{classify_failed_servers, render_failed_section};
 use super::*;
+/// Wire the session's elicitation inbox into a freshly built client so its
+/// `elicitation/create` requests reach the coordinator. Takes the
+/// already-locked `McpState` so each caller keeps its own lock scope.
+fn attach_elicitation_tx(
+    state: &crate::session::mcp_servers::McpState,
+    client: &crate::session::mcp_servers::McpClient,
+) {
+    if let Some(tx) = state.elicitation_tx() {
+        client.set_elicitation_tx(Some(tx));
+    }
+}
 impl SessionActor {
     /// Wait for MCP tools to be initialized.
     /// If initialization is in progress by another task, this will poll until complete.
@@ -91,6 +103,7 @@ impl SessionActor {
             .strip_prefix(&prefix)
             .unwrap_or(&qualified_name)
             .to_string();
+        mcp_state.record_tool_icons(qualified_name.clone(), reg.icons.clone());
         if let Some(meta) = reg.meta.as_ref() {
             mcp_state
                 .mcp_tool_meta
@@ -108,6 +121,7 @@ impl SessionActor {
                         display_name: None,
                         description: Some(reg.description.clone()),
                         meta: Some(meta.clone()),
+                        icons: reg.icons.clone(),
                         enabled: !mcp_state.is_tool_disabled(server_name, &unqualified),
                     });
             }
@@ -280,6 +294,7 @@ impl SessionActor {
         if let Some(tx) = event_tx {
             new_client.set_event_tx(Some(tx));
         }
+        attach_elicitation_tx(&*self.mcp_state.lock().await, &new_client);
         let arc = std::sync::Arc::new(new_client);
         {
             let mut mcp_state = self.mcp_state.lock().await;
@@ -404,13 +419,20 @@ impl SessionActor {
     /// Called after MCP fingerprint changes, skill update effects, and
     /// compaction so that resumed sessions start with accurate tracking state.
     pub(super) async fn persist_announcement_state(&self) {
-        let mcp_fingerprints = self.mcp_announced_servers.lock().clone();
         let skill_names = self.tool_bridge_handle().get_announced_skill_names().await;
+        let (mcp_server_fingerprints, announced_failed) = {
+            let announced = self.mcp_announcements.lock();
+            (
+                crate::session::announcement_state::to_persisted_fingerprints(
+                    &announced.fingerprints,
+                ),
+                announced.persisted_failed(),
+            )
+        };
         let state = crate::session::announcement_state::AnnouncementState {
-            mcp_server_fingerprints: crate::session::announcement_state::to_persisted_fingerprints(
-                &mcp_fingerprints,
-            ),
+            mcp_server_fingerprints,
             announced_skill_names: skill_names,
+            announced_failed_servers: announced_failed,
         };
         let _ = self
             .notifications
@@ -418,8 +440,14 @@ impl SessionActor {
             .send(PersistenceMsg::AnnouncementState(state));
     }
     /// Inject an MCP server system-reminder if the set changed since the
-    /// last announcement. Idempotent — clears the dirty flag after injection,
-    /// skips if not dirty.
+    /// last announcement. Skips if not dirty; clears the dirty flag up
+    /// front so a cancelled run degrades to a missed (re-triggerable)
+    /// injection, never an in-session duplicate. (A cancel landing between
+    /// the push and the trailing persist can still yield one duplicate
+    /// after a crash-resume — the benign direction of that tradeoff.)
+    ///
+    /// Connected servers are deduped by fingerprint, failed servers by
+    /// episode (see [`crate::session::announcement_state::McpAnnounced`]).
     ///
     /// Called at turn-start (`handle_prompt`) and inside the agentic loop
     /// (before `build_request`) so that mid-turn MCP connections (Progressive
@@ -434,85 +462,99 @@ impl SessionActor {
         {
             return;
         }
-        use xai_grok_tools::implementations::search_tool::{
-            build_delta_reminder, build_server_reminder, fingerprint_servers,
-        };
+        use xai_grok_tools::implementations::search_tool::fingerprint_servers;
+        self.mcp_reminder_dirty
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        struct RearmOnDrop<'a>(Option<&'a std::sync::atomic::AtomicBool>);
+        impl Drop for RearmOnDrop<'_> {
+            fn drop(&mut self) {
+                if let Some(dirty) = self.0.take() {
+                    dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        let mut rearm_on_drop = RearmOnDrop(Some(&self.mcp_reminder_dirty));
         let server_summaries = self.connected_server_summaries();
         let new_fingerprints = fingerprint_servers(&server_summaries);
-        let (reminder_text, mcp_fingerprints_changed) = {
-            let mut announced = self.mcp_announced_servers.lock();
+        let (currently_failed, unconnected_configured) = {
+            let mcp_state = self.mcp_state.lock().await;
+            let connected_names: std::collections::HashSet<&str> =
+                server_summaries.iter().map(|s| s.name.as_str()).collect();
+            classify_failed_servers(&mcp_state, &connected_names)
+        };
+        let hint = self.rendered_mcp_hint().await;
+        let announcements_changed = self.latch_and_push_mcp_reminder(
+            &server_summaries,
+            new_fingerprints,
+            currently_failed,
+            &unconnected_configured,
+            hint.as_deref(),
+        );
+        rearm_on_drop.0 = None;
+        if announcements_changed {
+            self.persist_announcement_state().await;
+        }
+    }
+    /// Latch fingerprints and failure episodes under one lock (so a
+    /// concurrent persist cannot snapshot half an update) and push the
+    /// resulting reminder, if any. Returns whether the announced state
+    /// changed (the caller persists on change).
+    ///
+    /// Deliberately sync: a latched episode announces exactly once, so no
+    /// await point may separate the latch from the push — a future dropped
+    /// there by a turn cancel would swallow the announcement for good.
+    fn latch_and_push_mcp_reminder(
+        &self,
+        server_summaries: &[xai_grok_tools::types::tool_index::ServerSummary],
+        new_fingerprints: std::collections::HashMap<
+            String,
+            xai_grok_tools::implementations::search_tool::ServerFingerprint,
+        >,
+        currently_failed: Vec<crate::session::announcement_state::FailedServer>,
+        unconnected_configured: &std::collections::HashSet<String>,
+        hint: Option<&str>,
+    ) -> bool {
+        use xai_grok_tools::implementations::search_tool::{
+            build_delta_reminder, build_server_reminder,
+        };
+        let (mut reminder_text, announcements_changed, to_announce) = {
+            let mut announced = self.mcp_announcements.lock();
             let text = match self.mcp_reminder_mode {
-                McpReminderMode::Delta => build_delta_reminder(&announced, &server_summaries),
+                McpReminderMode::Delta => {
+                    build_delta_reminder(&announced.fingerprints, server_summaries)
+                }
                 McpReminderMode::Full => {
-                    if *announced == new_fingerprints {
+                    if announced.fingerprints == new_fingerprints {
                         None
                     } else if server_summaries.is_empty() {
                         Some("All MCP servers have disconnected.".to_string())
                     } else {
-                        build_server_reminder(&server_summaries)
+                        build_server_reminder(server_summaries)
                     }
                 }
             };
-            let changed = *announced != new_fingerprints;
-            if changed {
-                *announced = new_fingerprints;
+            let fingerprints_changed = announced.fingerprints != new_fingerprints;
+            if fingerprints_changed {
+                announced.fingerprints = new_fingerprints;
             }
-            (text, changed)
+            let (to_announce, failed_changed) =
+                announced.note_failures(currently_failed, unconnected_configured);
+            (text, fingerprints_changed || failed_changed, to_announce)
         };
-        self.mcp_reminder_dirty
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        let failed_section = {
-            let mcp_state = self.mcp_state.lock().await;
-            let connected_names: std::collections::HashSet<&str> =
-                server_summaries.iter().map(|s| s.name.as_str()).collect();
-            let mut failed: Vec<(String, String)> = Vec::new();
-            for cfg in &mcp_state.configs {
-                let name = mcp_server_name(cfg);
-                if !connected_names.contains(name) && !mcp_state.is_server_handshaking(name) {
-                    let base = if mcp_state.auth_required.contains(name) {
-                        "auth required".to_string()
-                    } else if let Some(detail) =
-                        mcp_state.init_failed.get(name).filter(|d| !d.is_empty())
-                    {
-                        detail.clone()
-                    } else {
-                        "connection failed".to_string()
-                    };
-                    let retries_on_use = !mcp_state.auth_required.contains(name)
-                        && matches!(cfg, acp::McpServer::Http(_) | acp::McpServer::Sse(_));
-                    let reason = if retries_on_use {
-                        format!("{base} — retries automatically on next tool call")
-                    } else {
-                        base
-                    };
-                    failed.push((name.to_string(), reason));
-                }
-            }
-            failed.sort_by(|a, b| a.0.cmp(&b.0));
-            if failed.is_empty() {
-                None
-            } else {
-                let mut s = "\nMCP servers that failed to connect:\n".to_string();
-                for (name, reason) in &failed {
-                    s.push_str(&format!("- {name} ({reason})\n"));
-                }
-                Some(s)
-            }
-        };
-        let mut reminder_text = reminder_text;
-        if let Some(ref section) = failed_section {
+        let has_failed = !to_announce.is_empty();
+        if has_failed {
             reminder_text
                 .get_or_insert_with(String::new)
-                .push_str(section);
+                .push_str(&render_failed_section(&to_announce));
         }
-        if let Some(mut text) = reminder_text {
-            if let Some(hint) = self.rendered_mcp_hint().await {
-                text.push_str(&hint);
-            }
+        if let (Some(text), Some(hint)) = (reminder_text.as_mut(), hint) {
+            text.push_str(hint);
+        }
+        if let Some(text) = reminder_text {
             self.push_system_reminder(&text);
             tracing::info!(
                 servers = server_summaries.len(),
-                has_failed = failed_section.is_some(),
+                has_failed,
                 mode = ?self.mcp_reminder_mode,
                 "Injected MCP server system-reminder"
             );
@@ -522,9 +564,23 @@ impl SessionActor {
                 "MCP servers unchanged, skipping reminder injection"
             );
         }
-        if mcp_fingerprints_changed {
-            self.persist_announcement_state().await;
-        }
+        announcements_changed
+    }
+    /// Re-arm failure announcements after an event that dropped reminders
+    /// from context (compaction, rewind): clear the announced episodes and
+    /// mark the reminder dirty so the next injection re-announces servers
+    /// that are still down. Persists the cleared tracking so a resume
+    /// starts from it.
+    ///
+    /// Connected fingerprints stay latched: compaction carries the listing
+    /// in its context, a rewind's kept prefix usually retains the initial
+    /// listing (clearing would inject a duplicate), and connected tools
+    /// remain visible in the tool definitions regardless.
+    pub(crate) async fn rearm_failed_server_announcements(&self) {
+        self.mcp_announcements.lock().rearm_failed();
+        self.mcp_reminder_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.persist_announcement_state().await;
     }
     /// Returns `true` iff `server` has a `Stdio` entry in
     /// [`McpState::configs`] AND is not on the per-cwd disabled list
@@ -761,6 +817,7 @@ impl SessionActor {
         )
         .await
         .map_err(|e| e.to_string())?;
+        attach_elicitation_tx(&*self.mcp_state.lock().await, &new_client);
         new_client
             .ensure_initialized()
             .await
@@ -1192,6 +1249,7 @@ impl SessionActor {
                     if let Some(tx) = task_channel_tx {
                         client.set_channel_event_tx(Some(tx));
                     }
+                    attach_elicitation_tx(&*mcp_state.lock().await, client);
                     let init_budget = std::time::Duration::from_secs(
                         timeout_sec.saturating_mul(2).saturating_add(5),
                     );
@@ -1302,6 +1360,8 @@ impl SessionActor {
                                     .strip_prefix(&prefix)
                                     .unwrap_or(&qualified_name)
                                     .to_string();
+                                mcp_state
+                                    .record_tool_icons(qualified_name.clone(), reg.icons.clone());
                                 if let Some(meta) = reg.meta.as_ref() {
                                     mcp_state
                                         .mcp_tool_meta
@@ -1319,6 +1379,7 @@ impl SessionActor {
                                                 display_name: None,
                                                 description: Some(reg.description.clone()),
                                                 meta: Some(meta.clone()),
+                                                icons: reg.icons.clone(),
                                                 enabled: !mcp_state
                                                     .is_tool_disabled(&server_name, &unqualified),
                                             });
@@ -1374,6 +1435,10 @@ impl SessionActor {
                                 "sse" => xai_grok_telemetry::events::McpTransport::Sse,
                                 _ => xai_grok_telemetry::events::McpTransport::Http,
                             };
+                            debug_assert!(
+                                xai_grok_telemetry::activity::MCP_SERVERS_CONNECTED.get() >= 1,
+                                "McpServerConnected must stamp a self-inclusive count"
+                            );
                             xai_grok_telemetry::session_ctx::log_event(
                                 xai_grok_telemetry::events::McpServerConnected {
                                     server_name: server_name.clone(),
@@ -1543,6 +1608,7 @@ impl SessionActor {
                         .strip_prefix(&prefix)
                         .unwrap_or(&qualified_name)
                         .to_string();
+                    mcp_state.record_tool_icons(qualified_name.clone(), reg.icons.clone());
                     if let Some(meta) = reg.meta.as_ref() {
                         mcp_state
                             .mcp_tool_meta

@@ -623,12 +623,22 @@ const EXEC_VEHICLE_HEAD_FAMILIES: &[&str] = &["python", "node", "ruby", "perl", 
 /// [`EXEC_VEHICLE_HEADS`] or a versioned [`EXEC_VEHICLE_HEAD_FAMILIES`]
 /// spelling. `pub(crate)` so [`minimum_always_allow_scope`] floors these to
 /// the full command like dangerous verbs.
+/// Normalized command basename for name matching: leading path stripped,
+/// lowercased, trailing `.exe` removed — so `/usr/bin/GH.EXE` reads as `gh`.
+pub(crate) fn normalized_command_head(words: &[String]) -> Option<String> {
+    let head = words
+        .first()?
+        .rsplit(['/', '\\'])
+        .next()?
+        .to_ascii_lowercase();
+    Some(head.strip_suffix(".exe").unwrap_or(&head).to_owned())
+}
+
 pub(crate) fn head_is_exec_vehicle(words: &[String]) -> bool {
-    let Some(head) = words.first().and_then(|w| w.rsplit(['/', '\\']).next()) else {
+    let Some(head) = normalized_command_head(words) else {
         return false;
     };
-    let head = head.to_ascii_lowercase();
-    let head = head.strip_suffix(".exe").unwrap_or(&head);
+    let head = head.as_str();
     if EXEC_VEHICLE_HEADS.contains(&head) {
         return true;
     }
@@ -1132,6 +1142,51 @@ mod tests {
         assert!(matches(&access, &rule_for("/path/**")));
         assert!(matches(&access, &rule_for("/path/**/file.rs")));
         assert!(matches(&access, &rule_for("**/*.rs")));
+    }
+
+    #[test]
+    fn write_scoped_access_respects_edit_deny_and_not_read_allow() {
+        use crate::permission::rules::parse_permission_rule;
+        use xai_grok_tools::implementations::opencode::edit::EditInput;
+        use xai_grok_tools::types::ToolInput;
+        use xai_tool_types::TaskToolInput;
+
+        let edit = AccessKind::from(&ToolInput::from(EditInput {
+            file_path: "/tmp/denied.txt".into(),
+            old_string: "ORIGINAL".into(),
+            new_string: "BYPASS".into(),
+            replace_all: false,
+        }));
+        let task = AccessKind::from(&ToolInput::Task(TaskToolInput {
+            prompt: "edit config.toml".into(),
+            description: "spawn".into(),
+            subagent_type: "general-purpose".into(),
+            run_in_background: false,
+            capability_mode: None,
+            isolation: None,
+            resume_from: None,
+            cwd: None,
+            model: None,
+            task_id: None,
+        }));
+
+        let deny_edits = CompiledPolicy::new(PermissionConfig::new(vec![
+            parse_permission_rule("Edit(*)", RuleAction::Deny).unwrap(),
+        ]));
+        assert!(matches!(
+            deny_edits.evaluate(&edit),
+            Some(Decision::Reject(_))
+        ));
+        assert!(matches!(
+            deny_edits.evaluate(&task),
+            Some(Decision::Reject(_))
+        ));
+
+        let allow_read = CompiledPolicy::new(PermissionConfig::new(vec![
+            parse_permission_rule("Read", RuleAction::Allow).unwrap(),
+        ]));
+        assert!(allow_read.evaluate(&task).is_none());
+        assert!(allow_read.evaluate(&edit).is_none());
     }
 
     #[test]
