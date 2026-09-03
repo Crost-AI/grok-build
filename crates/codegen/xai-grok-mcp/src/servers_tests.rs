@@ -2559,6 +2559,7 @@ async fn try_call_tool_reconnects_then_succeeds_after_retriable_transport_error(
             info: McpClient::make_client_info("dead", /* advertise_elicitation */ true),
             server_name: "dead".to_string(),
             notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+            channel_tx: Arc::new(parking_lot::Mutex::new(None)),
             elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
         };
         let transport = rmcp::transport::async_rw::AsyncRwTransport::<RoleClient, _, _>::new(
@@ -2669,6 +2670,7 @@ async fn watched_live_client(name: &str) -> Arc<McpClient> {
         info: McpClient::make_client_info(name, /* advertise_elicitation */ true),
         server_name: name.to_string(),
         notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+        channel_tx: Arc::new(parking_lot::Mutex::new(None)),
         elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
     };
     let transport = rmcp::transport::async_rw::AsyncRwTransport::<RoleClient, _, _>::new(
@@ -3336,6 +3338,7 @@ async fn client_handler_routes_tools_changed() {
         info: McpClient::make_client_info("test", /* advertise_elicitation */ true),
         server_name: "test".to_string(),
         notify_tx: Arc::new(parking_lot::Mutex::new(Some(tx))),
+        channel_tx: Arc::new(parking_lot::Mutex::new(None)),
         elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
     };
     handler.emit(McpClientEvent::ToolsChanged {

@@ -1384,6 +1384,22 @@ pub(super) async fn run_session(
                             // and a cap-only edit changes no server configs.
                             session.reseed_mcp_output_cap().await;
 
+                            let mut mcp_servers = mcp_servers;
+                            let active_servers = {
+                                let registry = session
+                                    .channel_registry
+                                    .lock()
+                                    .expect("channel_registry mutex poisoned");
+                                registry.active_servers.clone()
+                            };
+                            let loaded = crate::session::channels::load_active_channel_env(
+                                &active_servers,
+                            );
+                            crate::session::channels::apply_loaded_channel_env_overlay(
+                                &mut mcp_servers,
+                                &loaded,
+                            );
+
                             // Capture the dispatcher's event sender alongside the diff
                             // `McpClientEvent::ConfigDiff` can then fan out right after the in-memory swap
                             // The emit happens without holding the `mcp_state` lock
@@ -1477,6 +1493,22 @@ pub(super) async fn run_session(
                                 configs.retain(|c| crate::session::mcp_servers::mcp_server_name(c) != server_name);
                             }
 
+                            drop(mcp_state);
+                            let active_servers = {
+                                let registry = session
+                                    .channel_registry
+                                    .lock()
+                                    .expect("channel_registry mutex poisoned");
+                                registry.active_servers.clone()
+                            };
+                            let loaded = crate::session::channels::load_active_channel_env(
+                                &active_servers,
+                            );
+                            crate::session::channels::apply_loaded_channel_env_overlay(
+                                &mut configs,
+                                &loaded,
+                            );
+                            let mut mcp_state = session.mcp_state.lock().await;
                             let diff = mcp_state.update_configs_diff(configs);
                             // Snapshot the dispatcher sender BEFORE dropping the lock so the emit below survives any later mutation
                             let dispatch_event_tx = mcp_state.client_event_tx();

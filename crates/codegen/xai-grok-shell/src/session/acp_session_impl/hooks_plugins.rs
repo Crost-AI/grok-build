@@ -923,11 +923,23 @@ impl SessionActor {
         // The order-sensitive `update_configs` would tear everything down instead, because merge order is non-deterministic
         // This mirrors the `UpdateMcpServers` command handler
         let t_mcp = std::time::Instant::now();
-        let new_mcp_servers = crate::session::managed_mcp::merge_managed_mcp_servers(
+        let mut new_mcp_servers = crate::session::managed_mcp::merge_managed_mcp_servers(
             self.initial_client_mcp_servers.clone(),
             session_cwd,
             new_registry_snapshot.as_deref(),
             &self.rebuild_spec.compat,
+        );
+        let active_servers = {
+            let registry = self
+                .channel_registry
+                .lock()
+                .expect("channel_registry mutex poisoned");
+            registry.active_servers.clone()
+        };
+        let loaded = crate::session::channels::load_active_channel_env(&active_servers);
+        crate::session::channels::apply_loaded_channel_env_overlay(
+            &mut new_mcp_servers,
+            &loaded,
         );
         let (mcp_diff, dispatch_event_tx) = {
             let mut mcp_state = self.mcp_state.lock().await;

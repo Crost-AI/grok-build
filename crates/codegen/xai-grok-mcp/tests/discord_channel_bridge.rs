@@ -8,7 +8,8 @@
 //! bridge serves MCP without a gateway connection in that mode.
 
 use agent_client_protocol as acp;
-use xai_grok_mcp::servers::{OauthInteractivity, start_mcp_server};
+use xai_grok_mcp::servers::{McpSpawnCtx, start_mcp_server};
+use xai_grok_session_events::EventWriter;
 
 fn bridge_path() -> std::path::PathBuf {
     // tests run with CWD = crate root (crates/codegen/xai-grok-mcp)
@@ -36,17 +37,11 @@ async fn bridge_declares_channel_capability_through_real_handshake() {
             .args(vec![bridge_path().to_string_lossy().into_owned()])
             .env(vec![]),
     );
-    let client = start_mcp_server(
-        config,
-        None,
-        None,
-        None,
-        None,
-        &xai_file_utils::events::EventWriter::noop(),
-        OauthInteractivity::NonInteractive,
-    )
-    .await
-    .expect("bridge spawns");
+    let event_writer = EventWriter::noop();
+    let ctx = McpSpawnCtx::standalone(&event_writer);
+    let client = start_mcp_server(config, None, None, None, &ctx)
+        .await
+        .expect("bridge spawns");
 
     let service = client
         .ensure_initialized()
@@ -88,6 +83,7 @@ async fn bridge_declares_channel_capability_through_real_handshake() {
             "read_attachment",
             "read_messages",
             "read_poll",
+            "reload_config",
             "rename_thread",
             "send_file",
             "send_message",

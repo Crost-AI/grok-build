@@ -247,7 +247,7 @@ impl SessionActor {
         server_name: &str,
         discovery: McpOauthDiscovery,
     ) -> Result<std::sync::Arc<crate::session::mcp_servers::McpClient>, String> {
-        let (server_config, meta_config, event_tx) = {
+        let (server_config, meta_config, event_tx, channel_tx) = {
             let mcp_state = self.mcp_state.lock().await;
             let server_config = mcp_state
                 .configs
@@ -263,7 +263,8 @@ impl SessionActor {
             }
             let meta_config = mcp_state.meta_config_map.get(server_name).cloned();
             let event_tx = mcp_state.client_event_tx();
-            (server_config, meta_config, event_tx)
+            let channel_tx = mcp_state.channel_event_tx();
+            (server_config, meta_config, event_tx, channel_tx)
         };
         let cwd = std::path::Path::new(&self.session_info.cwd);
         let session_id = self.session_info.id.0.as_ref();
@@ -305,6 +306,9 @@ impl SessionActor {
         }
         if let Some(tx) = event_tx {
             new_client.set_event_tx(Some(tx));
+        }
+        if let Some(tx) = channel_tx {
+            new_client.set_channel_event_tx(Some(tx));
         }
         attach_elicitation_tx(&*self.mcp_state.lock().await, &new_client);
         let arc = std::sync::Arc::new(new_client);
@@ -502,6 +506,9 @@ impl SessionActor {
                         let state = self.mcp_state.lock().await;
                         if let Some(tx) = state.client_event_tx() {
                             client.set_event_tx(Some(tx));
+                        }
+                        if let Some(tx) = state.channel_event_tx() {
+                            client.set_channel_event_tx(Some(tx));
                         }
                         attach_elicitation_tx(&state, &client);
                     }
@@ -997,7 +1004,7 @@ impl SessionActor {
     /// On `false` it drops the new `Arc<McpClient>`; `kill_on_drop(true)` then SIGKILLs the spawned child.
     /// It returns an explicit error so the auto-restart loop can emit `Reason::Disabled`.
     pub(crate) async fn respawn_stdio(&self, server: &str) -> Result<(), String> {
-        let (server_config, meta_config, event_tx, channel_tx) = {
+        let (mut server_config, meta_config, event_tx, channel_tx) = {
             let mcp_state = self.mcp_state.lock().await;
             let server_config = mcp_state
                 .configs
@@ -1012,6 +1019,18 @@ impl SessionActor {
             let channel_tx = mcp_state.channel_event_tx();
             (server_config, meta_config, event_tx, channel_tx)
         };
+        {
+            let active_servers = self
+                .channel_registry
+                .lock()
+                .expect("channel_registry mutex poisoned")
+                .active_servers
+                .clone();
+            let loaded = crate::session::channels::load_active_channel_env(&active_servers);
+            let mut configs = vec![server_config];
+            crate::session::channels::apply_loaded_channel_env_overlay(&mut configs, &loaded);
+            server_config = configs.remove(0);
+        }
         let cwd = std::path::Path::new(&self.session_info.cwd);
         let session_id = self.session_info.id.0.as_ref();
         let (_, oauth_config_map) =
@@ -1033,6 +1052,12 @@ impl SessionActor {
         )
         .await
         .map_err(|e| e.to_string())?;
+        if let Some(tx) = event_tx.clone() {
+            new_client.set_event_tx(Some(tx));
+        }
+        if let Some(tx) = channel_tx.clone() {
+            new_client.set_channel_event_tx(Some(tx));
+        }
         attach_elicitation_tx(&*self.mcp_state.lock().await, &new_client);
         new_client
             .ensure_initialized()
@@ -1068,13 +1093,9 @@ impl SessionActor {
             ));
         }
         if let Some(tx) = event_tx {
-            new_client.set_event_tx(Some(tx.clone()));
             let _ = tx.send(xai_grok_mcp::servers::McpClientEvent::ToolsChanged {
                 server: server.to_string(),
             });
-        }
-        if let Some(tx) = channel_tx {
-            new_client.set_channel_event_tx(Some(tx));
         }
         let arc_client = std::sync::Arc::new(new_client);
         let _ = arc_client

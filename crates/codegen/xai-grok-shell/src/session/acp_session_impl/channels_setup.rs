@@ -12,8 +12,8 @@
 
 use super::*;
 use crate::session::channels::{
-    ChannelEntry, ChannelRegistry, ChannelSpec, ChannelState, channel_command_help,
-    channel_env_dir, describe_plugin_origin, format_channel_event, load_channel_env_file,
+    ChannelEntry, ChannelRegistry, ChannelSpec, ChannelState, apply_loaded_channel_env_overlay,
+    channel_command_help, describe_plugin_origin, format_channel_event, load_active_channel_env,
     parse_channel_command, plugin_origin_marketplace, resolve_channels_policy,
 };
 
@@ -183,38 +183,13 @@ impl SessionActor {
 
         // Credentials: merge `~/.grok/channels/<server>/.env` into the
         // stdio spawn env of each active channel server. Explicit `env`
-        // entries in the server config win over the .env file.
+        // entries in the server config win over the .env file. Read the
+        // files before taking `mcp_state` so home-directory latency does
+        // not stall the session actor.
         if !registry.active_servers.is_empty() {
+            let loaded = load_active_channel_env(&registry.active_servers);
             let mut mcp_state = self.mcp_state.lock().await;
-            for config in mcp_state.configs.iter_mut() {
-                let acp::McpServer::Stdio(stdio) = config else {
-                    continue;
-                };
-                if !registry.active_servers.contains_key(stdio.name.as_str()) {
-                    continue;
-                }
-                let env_path = channel_env_dir(&stdio.name).join(".env");
-                let vars = load_channel_env_file(&env_path);
-                if vars.is_empty() {
-                    continue;
-                }
-                let existing: std::collections::HashSet<&str> =
-                    stdio.env.iter().map(|e| e.name.as_str()).collect();
-                let fresh: Vec<(String, String)> = vars
-                    .into_iter()
-                    .filter(|(k, _)| !existing.contains(k.as_str()))
-                    .collect();
-                if fresh.is_empty() {
-                    continue;
-                }
-                tracing::info!(
-                    server = %stdio.name, count = fresh.len(), path = %env_path.display(),
-                    "loaded channel credentials into server environment"
-                );
-                for (name, value) in fresh {
-                    stdio.env.push(acp::EnvVariable::new(name, value));
-                }
-            }
+            apply_loaded_channel_env_overlay(&mut mcp_state.configs, &loaded);
         }
 
         let any_active = !registry.active_servers.is_empty();
@@ -434,7 +409,14 @@ impl SessionActor {
                 // `/help`) short-circuit injection: the host answers
                 // through the channel itself and the model never sees
                 // the event.
-                if session.try_handle_channel_command(&event).await {
+                if let Some(command) = parse_channel_command(&event.content)
+                    && event.meta.iter().all(|(key, _)| key != "bot")
+                    && matches!(command.as_str(), "help" | "status" | "session" | "channels")
+                {
+                    let session = Arc::clone(&session);
+                    tokio::task::spawn_local(async move {
+                        let _ = session.try_handle_channel_command(&event).await;
+                    });
                     continue;
                 }
                 let envelope = format_channel_event(&event);

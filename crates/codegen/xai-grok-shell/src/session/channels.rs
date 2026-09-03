@@ -26,7 +26,10 @@
 //! the webhook) is the channel server's responsibility.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::path::PathBuf;
 
+use agent_client_protocol as acp;
 use toml::Value as TomlValue;
 use xai_grok_mcp::channel::ChannelInboundEvent;
 
@@ -349,6 +352,111 @@ pub fn channel_env_dir(server: &str) -> std::path::PathBuf {
         .join(server)
 }
 
+/// Merge channel `.env` credentials into a stdio server's spawn env.
+/// Existing `env` entries in the server config win over the file.
+pub fn merge_channel_env_into_stdio(
+    stdio: &mut acp::McpServerStdio,
+    vars: Vec<(String, String)>,
+) -> usize {
+    if vars.is_empty() {
+        return 0;
+    }
+    let existing: HashSet<&str> = stdio.env.iter().map(|e| e.name.as_str()).collect();
+    let fresh: Vec<(String, String)> = vars
+        .into_iter()
+        .filter(|(k, _)| !existing.contains(k.as_str()))
+        .collect();
+    let added = fresh.len();
+    for (name, value) in fresh {
+        stdio.env.push(acp::EnvVariable::new(name, value));
+    }
+    added
+}
+
+/// Read `~/.grok/channels/<server>/.env` for every active channel
+/// server. Call this *before* taking `mcp_state` / `channel_registry`
+/// so filesystem latency is not held under those locks.
+pub fn load_active_channel_env(
+    active_servers: &HashMap<String, String>,
+) -> HashMap<String, (PathBuf, Vec<(String, String)>)> {
+    active_servers
+        .keys()
+        .map(|name| {
+            let path = channel_env_dir(name).join(".env");
+            let vars = load_channel_env_file(&path);
+            (name.clone(), (path, vars))
+        })
+        .collect()
+}
+
+/// Merge a previously loaded channel-env snapshot into stdio configs
+/// and inject Grok-host spawn variables (`CHANNEL_NAMESPACES`,
+/// `CHANNEL_ENV_FILE`). Explicit config `env` entries still win.
+pub fn apply_loaded_channel_env_overlay(
+    configs: &mut [acp::McpServer],
+    loaded: &HashMap<String, (PathBuf, Vec<(String, String)>)>,
+) {
+    if loaded.is_empty() {
+        return;
+    }
+    for config in configs.iter_mut() {
+        let acp::McpServer::Stdio(stdio) = config else {
+            continue;
+        };
+        let Some((env_path, vars)) = loaded.get(stdio.name.as_str()) else {
+            continue;
+        };
+        let config_had_namespaces = stdio
+            .env
+            .iter()
+            .any(|variable| variable.name == "CHANNEL_NAMESPACES");
+        let config_had_env_file = stdio
+            .env
+            .iter()
+            .any(|variable| variable.name == "CHANNEL_ENV_FILE");
+        let added = merge_channel_env_into_stdio(stdio, vars.clone());
+        if !config_had_namespaces {
+            stdio
+                .env
+                .retain(|variable| variable.name != "CHANNEL_NAMESPACES");
+            stdio.env.push(acp::EnvVariable::new(
+                "CHANNEL_NAMESPACES".to_string(),
+                "grok".to_string(),
+            ));
+        }
+        if !config_had_env_file {
+            stdio
+                .env
+                .retain(|variable| variable.name != "CHANNEL_ENV_FILE");
+            stdio.env.push(acp::EnvVariable::new(
+                "CHANNEL_ENV_FILE".to_string(),
+                env_path.display().to_string(),
+            ));
+        }
+        if added > 0 {
+            tracing::info!(
+                server = %stdio.name,
+                count = added,
+                path = %env_path.display(),
+                "loaded channel credentials into server environment"
+            );
+        }
+    }
+}
+
+/// Overlay `~/.grok/channels/<server>/.env` onto each active stdio
+/// channel server in `configs` before spawn or config-diff. Call this
+/// on every MCP update path, not only first-time `setup_channels`.
+/// Prefer [`load_active_channel_env`] + [`apply_loaded_channel_env_overlay`]
+/// when a lock is held around the merge.
+pub fn apply_channel_env_overlay(
+    configs: &mut [acp::McpServer],
+    active_servers: &HashMap<String, String>,
+) {
+    let loaded = load_active_channel_env(active_servers);
+    apply_loaded_channel_env_overlay(configs, &loaded);
+}
+
 /// Parse a `.env`-style file (`KEY=VALUE` lines, `#` comments, blank
 /// lines, optional single/double quotes around the value). Returns an
 /// empty list when the file is missing or unreadable — credentials are
@@ -655,5 +763,92 @@ mod tests {
     #[test]
     fn missing_env_file_is_empty() {
         assert!(load_channel_env_file(std::path::Path::new("/nonexistent/.env")).is_empty());
+    }
+
+    #[test]
+    fn overlay_does_not_clobber_explicit_env_and_is_idempotent() {
+        let mut stdio = acp::McpServerStdio::new("discord".to_string(), "node")
+            .args(vec!["bridge.mjs".to_string()])
+            .env(vec![acp::EnvVariable::new(
+                "DISCORD_BOT_TOKEN".to_string(),
+                "from-config".to_string(),
+            )]);
+        let added = merge_channel_env_into_stdio(
+            &mut stdio,
+            vec![
+                (
+                    "DISCORD_BOT_TOKEN".to_string(),
+                    "from-dotenv".to_string(),
+                ),
+                ("DISCORD_CHANNEL_IDS".to_string(), "1,2".to_string()),
+            ],
+        );
+        assert_eq!(added, 1);
+        let names: Vec<&str> = stdio.env.iter().map(|e| e.name.as_str()).collect();
+        let values: Vec<&str> = stdio.env.iter().map(|e| e.value.as_str()).collect();
+        assert_eq!(names, vec!["DISCORD_BOT_TOKEN", "DISCORD_CHANNEL_IDS"]);
+        assert_eq!(values, vec!["from-config", "1,2"]);
+        let added_again = merge_channel_env_into_stdio(
+            &mut stdio,
+            vec![("DISCORD_CHANNEL_IDS".to_string(), "9".to_string())],
+        );
+        assert_eq!(added_again, 0);
+        assert_eq!(stdio.env.len(), 2);
+    }
+
+    #[test]
+    fn overlay_injects_host_namespace_even_without_dotenv() {
+        let mut configs = vec![acp::McpServer::Stdio(
+            acp::McpServerStdio::new("discord".to_string(), "node")
+                .args(vec!["bridge.mjs".to_string()]),
+        )];
+        let loaded = HashMap::from([(
+            "discord".to_string(),
+            (
+                PathBuf::from("/tmp/channels/discord/.env"),
+                Vec::<(String, String)>::new(),
+            ),
+        )]);
+        apply_loaded_channel_env_overlay(&mut configs, &loaded);
+        let acp::McpServer::Stdio(stdio) = &configs[0] else {
+            panic!("expected stdio");
+        };
+        let env: Vec<(&str, &str)> = stdio
+            .env
+            .iter()
+            .map(|variable| (variable.name.as_str(), variable.value.as_str()))
+            .collect();
+        assert!(env.contains(&("CHANNEL_NAMESPACES", "grok")));
+        assert!(env.contains(&("CHANNEL_ENV_FILE", "/tmp/channels/discord/.env")));
+    }
+
+    #[test]
+    fn overlay_does_not_override_explicit_namespace() {
+        let mut configs = vec![acp::McpServer::Stdio(
+            acp::McpServerStdio::new("discord".to_string(), "node").env(vec![
+                acp::EnvVariable::new(
+                    "CHANNEL_NAMESPACES".to_string(),
+                    "codex".to_string(),
+                ),
+            ]),
+        )];
+        let loaded = HashMap::from([(
+            "discord".to_string(),
+            (
+                PathBuf::from("/tmp/channels/discord/.env"),
+                Vec::<(String, String)>::new(),
+            ),
+        )]);
+        apply_loaded_channel_env_overlay(&mut configs, &loaded);
+        let acp::McpServer::Stdio(stdio) = &configs[0] else {
+            panic!("expected stdio");
+        };
+        let namespaces: Vec<&str> = stdio
+            .env
+            .iter()
+            .filter(|variable| variable.name == "CHANNEL_NAMESPACES")
+            .map(|variable| variable.value.as_str())
+            .collect();
+        assert_eq!(namespaces, vec!["codex"]);
     }
 }
