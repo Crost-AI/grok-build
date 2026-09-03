@@ -410,7 +410,7 @@ impl SessionActor {
     /// teardown).
     pub(super) fn spawn_channel_forwarder(
         session: Arc<SessionActor>,
-        completion_tx: mpsc::UnboundedSender<(String, PromptTurnResult)>,
+        completion_tx: mpsc::UnboundedSender<super::turn_task::TurnCompletionMsg>,
         mut channel_rx: mpsc::UnboundedReceiver<xai_grok_mcp::channel::ChannelInboundEvent>,
     ) {
         tokio::task::spawn_local(async move {

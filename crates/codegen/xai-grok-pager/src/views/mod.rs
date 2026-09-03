@@ -1,4 +1,3 @@
-//! Screen rendering — each screen type has its own rendering module.
 pub mod agent;
 pub mod agent_status;
 pub mod agents_modal;
@@ -10,6 +9,7 @@ pub mod context_bar;
 pub mod credit_bar;
 pub mod dashboard;
 pub mod debug_style;
+pub mod dock;
 pub mod elicitation_view;
 pub mod extensions_modal;
 pub mod file_search;

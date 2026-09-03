@@ -2,8 +2,9 @@
 //!
 //! Decline / unreachable-before-send → copy fallback (no side effects).
 //! Timeout / lost reply → poll `QueryWorktreeCreate`; copy fallback only when
-//! the daemon reports `aborted` or is provably dead (socket gone + flock free)
-//! *and* dest is not a mountpoint. `committed` after poll → adopt, never copy.
+//! the daemon reports terminal `aborted`/`cancelled` or is provably dead
+//! (socket gone + flock free) *and* dest is not a mountpoint. `cancelling` is
+//! in-flight. `committed` after poll → adopt, never copy.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -31,6 +32,7 @@ const DETACH_RPC_TIMEOUT: Duration = Duration::from_secs(600);
 pub enum NfsTryError {
     StorageFull,
     InFlight { phase: String },
+    IdentityConflict(String),
     Other(anyhow::Error),
 }
 
@@ -90,6 +92,11 @@ impl NfsStatusView {
 }
 
 #[derive(Debug, Clone)]
+pub struct NfsDaemonStatus {
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct NfsAdopted {
     pub dest: PathBuf,
     pub mount_id: String,
@@ -100,7 +107,7 @@ pub struct NfsAdopted {
 #[derive(Debug)]
 pub enum NfsCreateDecision {
     Adopted(NfsAdopted),
-    /// Typed decline, ping-unreachable, abort complete, or provably-dead + unmounted.
+    /// Typed decline, ping-unreachable, terminal aborted/cancelled, or provably-dead + unmounted.
     Fallback,
 }
 
@@ -211,19 +218,47 @@ impl NfsWorktreeClient {
                 declined: body.declined,
                 storage_full: body.storage_full,
                 unknown: false,
-                error: None,
                 mount: body.mount,
             }),
-            Ok(Response::Err(e)) => Ok(QuerySnapshot {
+            Ok(Response::Err(e)) if e.error.contains("unknown worktree_id") => Ok(QuerySnapshot {
                 phase: None,
                 declined: None,
                 storage_full: false,
-                unknown: e.error.contains("unknown worktree_id"),
-                error: Some(e.error),
+                unknown: true,
                 mount: None,
-            }
-            .normalized()),
+            }),
+            Ok(Response::Err(e)) => Err(NfsTryError::Other(anyhow!(e.error))),
             Err(e) => Err(NfsTryError::Other(e)),
+        }
+    }
+
+    pub fn cancel_worktree_create(&self, worktree_id: &str) -> Result<(), anyhow::Error> {
+        if !self.ping() {
+            anyhow::bail!("grove daemon unreachable");
+        }
+        let req = Request::CancelWorktreeCreate {
+            v: PROTOCOL_VERSION,
+            worktree_id: worktree_id.to_owned(),
+        };
+        match self.call(&req, REMOVE_RPC_TIMEOUT) {
+            Ok(Response::Ok(_)) => Ok(()),
+            Ok(Response::Err(e)) => Err(anyhow!(e.error)),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn cleanup_worktree_create(&self, worktree_id: &str) -> Result<(), anyhow::Error> {
+        if !self.ping() {
+            anyhow::bail!("grove daemon unreachable");
+        }
+        let req = Request::CleanupWorktreeCreate {
+            v: PROTOCOL_VERSION,
+            worktree_id: worktree_id.to_owned(),
+        };
+        match self.call(&req, REMOVE_RPC_TIMEOUT) {
+            Ok(Response::Ok(_)) => Ok(()),
+            Ok(Response::Err(e)) => Err(anyhow!(e.error)),
+            Err(e) => Err(e),
         }
     }
 
@@ -297,6 +332,24 @@ impl NfsWorktreeClient {
             Ok(Response::Ok(body)) => Ok(CleanArtifactsReply {
                 purged_entries: body.purged_entries.unwrap_or(0),
                 no_escapes: body.no_escapes,
+            }),
+            Ok(Response::Err(e)) => Err(anyhow!(e.error)),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn daemon_status(&self) -> Result<NfsDaemonStatus, anyhow::Error> {
+        let req = Request::Status {
+            v: PROTOCOL_VERSION,
+            dir: None,
+        };
+        match self.call(&req, self.ping_timeout.max(Duration::from_millis(250))) {
+            Ok(Response::Ok(body)) => Ok(NfsDaemonStatus {
+                capabilities: body
+                    .status
+                    .and_then(|status| status.get("capabilities").cloned())
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .unwrap_or_default(),
             }),
             Ok(Response::Err(e)) => Err(anyhow!(e.error)),
             Err(e) => Err(e),
@@ -386,7 +439,11 @@ impl NfsWorktreeClient {
             // the query timeout then InFlight because the socket still answers.
             return Ok(NfsCreateDecision::Fallback);
         }
-        // Daemon may have journaled before failing; poll rather than copy.
+        // Query is ID-only; polling would adopt a different request's worktree.
+        if lower.contains(super::IDENTITY_CONFLICT_MARK) {
+            return Err(NfsTryError::IdentityConflict(error.to_owned()));
+        }
+        // Register-refuse can fire while the original worker still owns dest.
         tracing::warn!(error, "nfs create ErrBody; polling journal");
         self.poll_after_lost_reply(plan)
     }
@@ -397,7 +454,7 @@ impl NfsWorktreeClient {
             match self.query_phase(&plan.worktree_id) {
                 Ok(snap) if snap.storage_full => return Err(NfsTryError::StorageFull),
                 Ok(snap) if snap.declined.is_some() => return Ok(NfsCreateDecision::Fallback),
-                Ok(snap) if snap.phase.as_deref() == Some("aborted") => {
+                Ok(snap) if matches!(snap.phase.as_deref(), Some("aborted" | "cancelled")) => {
                     return Ok(NfsCreateDecision::Fallback);
                 }
                 Ok(snap) if snap.phase.as_deref() == Some("committed") => {
@@ -414,9 +471,8 @@ impl NfsWorktreeClient {
                 }
                 Ok(snap) => {
                     // `unknown worktree_id` is not proof the create never started:
-                    // dest is mkdir'd before the first journal persist. Keep
-                    // polling; only deadline_decision (aborted is handled above;
-                    // else provably-dead and not a mountpoint) may Fallback.
+                    // dest is mkdir'd before the first journal persist.
+                    // `cancelling` is still a live dest owner.
                     if Instant::now() >= deadline {
                         let phase = snap.phase.unwrap_or_else(|| {
                             if snap.unknown {
@@ -507,21 +563,7 @@ pub struct QuerySnapshot {
     pub declined: Option<String>,
     pub storage_full: bool,
     pub unknown: bool,
-    pub error: Option<String>,
     pub mount: Option<MountInfo>,
-}
-
-impl QuerySnapshot {
-    fn normalized(mut self) -> Self {
-        if self
-            .error
-            .as_ref()
-            .is_some_and(|e| e.contains("unknown worktree_id"))
-        {
-            self.unknown = true;
-        }
-        self
-    }
 }
 
 /// `UnixStream::connect` has no deadline. Non-blocking connect + `poll` so a
@@ -702,6 +744,14 @@ enum Request {
         worktree_id: String,
     },
     QueryWorktreeCreate {
+        v: u32,
+        worktree_id: String,
+    },
+    CancelWorktreeCreate {
+        v: u32,
+        worktree_id: String,
+    },
+    CleanupWorktreeCreate {
         v: u32,
         worktree_id: String,
     },
@@ -1014,6 +1064,23 @@ mod tests {
     }
 
     #[test]
+    fn query_phase_errbody_is_error_except_unknown_id() {
+        let tmp = TempDir::new().unwrap();
+        let runtime = tmp.path();
+        let sock = runtime.join("control.sock");
+        let script = Script {
+            query_replies: Arc::new(Mutex::new(vec![
+                r#"{"status":"err","data":{"v":1,"error":"daemon.db failed"}}"#.into(),
+            ])),
+            ..Script::default()
+        };
+        let _server = spawn_server(sock.clone(), script);
+        let client = NfsWorktreeClient::from_opts(&opts(&sock, runtime));
+        let error = client.query_phase("id").unwrap_err();
+        assert!(format!("{error:?}").contains("daemon.db failed"));
+    }
+
+    #[test]
     fn connect_missing_socket_fails_quickly() {
         let tmp = TempDir::new().unwrap();
         let start = Instant::now();
@@ -1224,6 +1291,34 @@ mod tests {
     }
 
     #[test]
+    fn timeout_then_cancelling_then_cancelled_falls_back_without_second_create() {
+        let tmp = TempDir::new().unwrap();
+        let sock = tmp.path().join("c.sock");
+        let script = Script {
+            create_hold: Duration::from_millis(300),
+            query_replies: Arc::new(Mutex::new(vec![
+                r#"{"status":"ok","data":{"v":1,"create_phase":"cancelling"}}"#.into(),
+                r#"{"status":"ok","data":{"v":1,"create_phase":"cancelled"}}"#.into(),
+            ])),
+            ..Default::default()
+        };
+        let _h = spawn_server(sock.clone(), script.clone());
+        thread::sleep(Duration::from_millis(20));
+        let o = opts(&sock, tmp.path());
+        let client = NfsWorktreeClient::from_opts(&o);
+        let plan = plan_at(&tmp, "d", o);
+        match client.create_worktree(&plan).unwrap() {
+            NfsCreateDecision::Fallback => {}
+            other => panic!("cancelled must fallback, got {other:?}"),
+        }
+        assert_eq!(script.creates.load(Ordering::SeqCst), 1);
+        assert!(
+            script.queries.load(Ordering::SeqCst) >= 2,
+            "must not fallback on cancelling; wait for cancelled"
+        );
+    }
+
+    #[test]
     fn storage_full_is_typed_error_not_fallback() {
         let tmp = TempDir::new().unwrap();
         let sock = tmp.path().join("c.sock");
@@ -1268,6 +1363,102 @@ mod tests {
             other => panic!("must not fallback while in-flight, got {other:?}"),
         }
         drop(lock_file);
+    }
+
+    #[test]
+    fn timeout_still_cancelling_does_not_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let sock = tmp.path().join("c.sock");
+        let script = Script {
+            create_hold: Duration::from_millis(300),
+            query_replies: Arc::new(Mutex::new(vec![
+                r#"{"status":"ok","data":{"v":1,"create_phase":"cancelling"}}"#.into(),
+            ])),
+            ..Default::default()
+        };
+        let _h = spawn_server(sock.clone(), script.clone());
+        thread::sleep(Duration::from_millis(20));
+        let o = timeout_opts(&sock, tmp.path());
+        let lock_file = hold_daemon_lock(tmp.path());
+        let client = NfsWorktreeClient::from_opts(&o);
+        let plan = plan_at(&tmp, "d", o);
+        match client.create_worktree(&plan) {
+            Err(NfsTryError::InFlight { phase }) => {
+                assert!(
+                    phase.contains("cancelling"),
+                    "deadline must fail closed on cancelling, got {phase:?}"
+                );
+            }
+            other => panic!("must not fallback while cancelling, got {other:?}"),
+        }
+        assert_eq!(script.creates.load(Ordering::SeqCst), 1);
+        drop(lock_file);
+    }
+
+    #[test]
+    fn create_cancelled_while_cancelling_does_not_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let sock = tmp.path().join("c.sock");
+        let script = Script {
+            create_reply: Some(
+                r#"{"status":"err","data":{"v":1,"error":"worktree create cancelled"}}"#.into(),
+            ),
+            query_replies: Arc::new(Mutex::new(vec![
+                r#"{"status":"ok","data":{"v":1,"create_phase":"cancelling"}}"#.into(),
+            ])),
+            ..Default::default()
+        };
+        let _h = spawn_server(sock.clone(), script.clone());
+        thread::sleep(Duration::from_millis(20));
+        let o = timeout_opts(&sock, tmp.path());
+        let lock_file = hold_daemon_lock(tmp.path());
+        let client = NfsWorktreeClient::from_opts(&o);
+        let plan = plan_at(&tmp, "d", o);
+        match client.create_worktree(&plan) {
+            Err(NfsTryError::InFlight { phase }) => {
+                assert!(
+                    phase.contains("cancelling"),
+                    "refused create while cancelling must not copy, got {phase:?}"
+                );
+            }
+            other => panic!("refused create while cancelling must not fallback, got {other:?}"),
+        }
+        assert_eq!(script.creates.load(Ordering::SeqCst), 1);
+        assert!(
+            script.queries.load(Ordering::SeqCst) >= 1,
+            "register-refuse must poll, not copy immediately"
+        );
+        drop(lock_file);
+    }
+
+    #[test]
+    fn create_cancelled_then_cancelled_falls_back_without_second_create() {
+        let tmp = TempDir::new().unwrap();
+        let sock = tmp.path().join("c.sock");
+        let script = Script {
+            create_reply: Some(
+                r#"{"status":"err","data":{"v":1,"error":"worktree create cancelled"}}"#.into(),
+            ),
+            query_replies: Arc::new(Mutex::new(vec![
+                r#"{"status":"ok","data":{"v":1,"create_phase":"cancelling"}}"#.into(),
+                r#"{"status":"ok","data":{"v":1,"create_phase":"cancelled"}}"#.into(),
+            ])),
+            ..Default::default()
+        };
+        let _h = spawn_server(sock.clone(), script.clone());
+        thread::sleep(Duration::from_millis(20));
+        let o = opts(&sock, tmp.path());
+        let client = NfsWorktreeClient::from_opts(&o);
+        let plan = plan_at(&tmp, "d", o);
+        match client.create_worktree(&plan).unwrap() {
+            NfsCreateDecision::Fallback => {}
+            other => panic!("cancelled after refuse must fallback, got {other:?}"),
+        }
+        assert_eq!(script.creates.load(Ordering::SeqCst), 1);
+        assert!(
+            script.queries.load(Ordering::SeqCst) >= 2,
+            "must not fallback on cancelling; wait for cancelled"
+        );
     }
 
     #[test]
@@ -1422,5 +1613,43 @@ mod tests {
                 panic!("unreachable daemon + mounted dest must not copy-fallback, got {other:?}")
             }
         }
+    }
+
+    #[test]
+    fn identity_conflict_is_hard_error_without_poll_or_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let sock = tmp.path().join("c.sock");
+        let script = Script {
+            create_reply: Some(
+                r#"{"status":"err","data":{"v":1,"error":"worktree w1 identity conflict: mismatched git_ref"}}"#
+                    .into(),
+            ),
+            query_replies: Arc::new(Mutex::new(vec![
+                r#"{"status":"ok","data":{"v":1,"create_phase":"committed","mount":{"port":9,"mount_id":"1","transport":"nfs"}}}"#
+                    .into(),
+            ])),
+            ..Default::default()
+        };
+        let _h = spawn_server(sock.clone(), script.clone());
+        thread::sleep(Duration::from_millis(20));
+        let o = opts(&sock, tmp.path());
+        let client = NfsWorktreeClient::from_opts(&o);
+        let plan = plan_at(&tmp, "d", o);
+        match client.create_worktree(&plan) {
+            Err(NfsTryError::IdentityConflict(msg)) => {
+                assert!(
+                    msg.to_ascii_lowercase()
+                        .contains(crate::nfs::IDENTITY_CONFLICT_MARK),
+                    "{msg}"
+                );
+            }
+            other => panic!("conflict must be a hard error, got {other:?}"),
+        }
+        assert_eq!(
+            script.queries.load(Ordering::SeqCst),
+            0,
+            "identity conflict must not poll QueryWorktreeCreate"
+        );
+        assert_eq!(script.creates.load(Ordering::SeqCst), 1);
     }
 }

@@ -77,16 +77,17 @@ use super::settings::setters::{
     preview_auto_light_theme, preview_theme, set_ask_user_question_timeout_enabled,
     set_auto_dark_theme, set_auto_light_theme, set_auto_update, set_collapsed_edit_blocks,
     set_combine_queued_prompts, set_compact_mode, set_confirm_before_rewind,
-    set_contextual_hint_image_input, set_contextual_hint_plan_mode, set_contextual_hint_send_now,
-    set_contextual_hint_small_screen, set_contextual_hint_ssh_wrap, set_contextual_hint_undo,
-    set_contextual_hint_word_select, set_default_model, set_default_selected_permission,
-    set_display_refresh_auto_cadence, set_follow_up_behavior, set_fork_secondary_model,
-    set_group_tool_verbs, set_hunk_tracker_mode, set_invert_scroll, set_keep_text_selection,
-    set_max_thoughts_width, set_multiline_mode, set_page_flip_on_send, set_prompt_suggestions,
-    set_remember_tool_approvals, set_render_mermaid, set_respect_manual_folds, set_screen_mode,
-    set_scroll_lines, set_scroll_mode, set_scroll_speed, set_show_thinking_blocks, set_show_tips,
-    set_simple_mode, set_theme, set_timeline, set_timestamps, set_vim_mode, set_voice_capture_mode,
-    set_voice_keybind_enabled, set_voice_stt_language,
+    set_contextual_hint_export_copy, set_contextual_hint_image_input,
+    set_contextual_hint_plan_mode, set_contextual_hint_send_now, set_contextual_hint_small_screen,
+    set_contextual_hint_ssh_wrap, set_contextual_hint_undo, set_contextual_hint_word_select,
+    set_default_model, set_default_selected_permission, set_display_refresh_auto_cadence,
+    set_follow_up_behavior, set_fork_secondary_model, set_group_tool_verbs, set_hunk_tracker_mode,
+    set_invert_scroll, set_keep_text_selection, set_max_thoughts_width, set_multiline_mode,
+    set_page_flip_on_send, set_prompt_suggestions, set_remember_tool_approvals, set_render_mermaid,
+    set_respect_manual_folds, set_screen_mode, set_scroll_lines, set_scroll_mode, set_scroll_speed,
+    set_show_thinking_blocks, set_show_tips, set_simple_mode, set_theme, set_timeline,
+    set_timestamps, set_vim_mode, set_voice_capture_mode, set_voice_keybind_enabled,
+    set_voice_stt_language,
 };
 use super::settings::ui::{
     dispatch_confirm_reset_setting, dispatch_open_command_palette, dispatch_open_howto_guides,
@@ -138,14 +139,11 @@ pub(super) fn dispatch_copy_auth_url(
 }
 /// Dispatch an action: mutate state, return effects to execute.
 ///
-/// The returned `Vec<Effect>` may be empty (pure state mutation) or contain
-/// async work that the event loop should spawn.
+/// The returned `Vec<Effect>` may be empty (pure state mutation) or contain async work that the event loop should spawn.
 ///
-/// The match feeds the `sync_sleep_inhibitor(app)` tail below it; arms that
-/// `return` early bypass that tail deliberately. Do not extract a returning
-/// arm into a handler: as a delegation its `return`s become plain arm values
-/// and start flowing through the tail. The fat inline arms stayed inline for
-/// this reason; audit an arm's `return`s before moving it.
+/// The match feeds the `sync_sleep_inhibitor(app)` tail below it; arms that `return` early bypass that tail deliberately.
+/// Do not extract a returning arm into a handler: as a delegation its `return`s become plain arm values and start flowing through the tail.
+/// The fat inline arms stayed inline for this reason; audit an arm's `return`s before moving it.
 pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
     app.reconcile_foreign_resume_launch();
     let effects = match action {
@@ -408,6 +406,28 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::ShowWordSelectTip => dispatch_show_word_select_tip(app),
         Action::AcceptWordSelectTip => dispatch_accept_word_select_tip(app),
         Action::DrainQueue => dispatch_drain_queue(app),
+        Action::PromptBlockAnswered { row_id, choice } => {
+            use crate::app::actions::PromptBlockChoice;
+            with_active_agent(app, |agent| match choice {
+                PromptBlockChoice::Edit => {
+                    agent.enter_queue_edit(row_id, false, None);
+                }
+                PromptBlockChoice::Resend => {
+                    agent.release_hook_block_hold();
+                }
+                PromptBlockChoice::Discard => {
+                    if let Some(removed) = agent.remove_local_queue_row(row_id) {
+                        for image in &removed.images {
+                            crate::prompt_images::cleanup_temp_file(image);
+                        }
+                    }
+                }
+            });
+            match choice {
+                PromptBlockChoice::Edit => vec![],
+                PromptBlockChoice::Resend | PromptBlockChoice::Discard => dispatch_drain_queue(app),
+            }
+        }
         Action::QueueRemoveShared {
             id,
             expected_version,
@@ -660,35 +680,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             if group_toggled {
                 return vec![];
             }
-            let mut credit_card: Option<(String, xai_grok_telemetry::events::CreditLimitChoice)> =
-                None;
-            with_scrollback(app, |s| {
-                if let Some(idx) = s.selected()
-                    && let Some(entry) = s.entry(idx)
-                    && let crate::scrollback::block::RenderBlock::CreditLimit(ref blk) = entry.block
-                {
-                    use crate::scrollback::blocks::CreditLimitCardAction;
-                    let choice = match blk.action {
-                        CreditLimitCardAction::PurchaseCredits => {
-                            xai_grok_telemetry::events::CreditLimitChoice::PurchaseCredits
-                        }
-                        CreditLimitCardAction::EnablePayg
-                        | CreditLimitCardAction::IncreasePaygLimit => {
-                            xai_grok_telemetry::events::CreditLimitChoice::PayAsYouGo
-                        }
-                    };
-                    credit_card = Some((blk.url.clone(), choice));
-                }
-            });
-            if let Some((url, choice)) = credit_card {
-                log_event(xai_grok_telemetry::events::CreditLimitUpsellClicked {
-                    surface: xai_grok_telemetry::events::CreditLimitUpsellSurface::InlineCard,
-                    choice,
-                });
-                open_url_or_show(app, &url);
-            } else {
-                dispatch_open_block_viewer(app);
-            }
+            dispatch_open_block_viewer(app);
             vec![]
         }
         Action::OpenExtensionsModal { tab, trigger } => {
@@ -1102,6 +1094,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::SetContextualHintSendNow(v) => set_contextual_hint_send_now(app, v),
         Action::SetContextualHintSmallScreen(v) => set_contextual_hint_small_screen(app, v),
         Action::SetContextualHintWordSelect(v) => set_contextual_hint_word_select(app, v),
+        Action::SetContextualHintExportCopy(v) => set_contextual_hint_export_copy(app, v),
         Action::SetContextualHintSshWrap(v) => set_contextual_hint_ssh_wrap(app, v),
         Action::SetTheme(v) => set_theme(app, v),
         Action::SetAutoDarkTheme(v) => set_auto_dark_theme(app, v),
@@ -1133,6 +1126,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::SwitchAccount => dispatch_switch_account(app),
         Action::CheckSubscription => vec![Effect::CheckSubscription { verify: None }],
         Action::OpenSupergrokUrl => dispatch_open_supergrok_url(app),
+        Action::RetryCreditLimitPrompt => super::billing::dispatch_retry_credit_limit_prompt(app),
         Action::OpenUrl(url) => {
             if url.starts_with("file://") {
                 let opened = url::Url::parse(&url)
@@ -1503,8 +1497,8 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
     sync_sleep_inhibitor(app);
     effects
 }
-/// Drains the agent and its focused subagent: the paste drain reports on the parent while `with_active_agent` would pick the child,
-/// and a stranded flag restores on a later dispatch.
+/// Drains the agent and its focused subagent: the paste drain reports on the parent while `with_active_agent` would pick the child.
+/// A stranded flag restores on a later dispatch.
 fn restore_stash_where_the_draft_was_consumed(app: &mut AppView) {
     let ActiveView::Agent(id) = app.active_view else {
         return;

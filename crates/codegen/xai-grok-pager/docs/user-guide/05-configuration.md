@@ -48,6 +48,9 @@ auto_update = true                     # check for updates on launch
 [models]
 default = "grok-4.5"                   # model used for new sessions
 web_search = "grok-4.5"                # model used by the web_search tool
+# Optional picker allowlist (globs on catalog key or model id). Empty = unrestricted.
+# A signed policy pin replaces this list (model id only) and cannot be widened from here.
+# allowed_models = ["grok-4.5", "grok-4*"]
 
 # Defaults applied to every model; a per-model [model.<id>] value always wins.
 # See "Custom Models" for the per-model overrides and full details.
@@ -276,7 +279,7 @@ Credential resolution: `api_key` > `env_key` > signed-in session token > `XAI_AP
 To override a built-in model, use its name as the section key and set only the fields you need:
 
 ```toml
-[model.grok-build]
+[model.grok-4.6]
 api_key = "my-api-key"
 ```
 
@@ -365,7 +368,7 @@ explore = true                        # enable/disable specific types
 plan = false
 
 [subagents.models]
-explore = "grok-build"               # route to different models
+explore = "grok-4.6"               # route to different models
 ```
 
 To pin the model a subagent uses, set its entry under `[subagents.models]`.
@@ -592,9 +595,16 @@ otel_protocol = "http/protobuf"                           # http/protobuf | grpc
 otel_certificate = "/etc/ssl/corp-ca.pem"                 # optional: trust private CA (path only)
 otel_client_certificate = "/etc/ssl/client.crt"           # optional: mTLS client cert (path only)
 otel_client_key = "/etc/ssl/client.key"                   # optional: mTLS client key (path only)
-otel_log_user_prompts = false                             # content gate (admins can pin via requirements)
-otel_log_tool_details = false                             # content gate (admins can pin via requirements)
+otel_log_user_prompts = false                             # content gate (admins pin via requirements)
+otel_log_assistant_responses = false                      # unset follows prompts; pin false for prompts-only
+otel_log_tool_details = true                              # metadata/preview; enterprise default on for SIEM join
+otel_log_tool_content = false                             # full-body gate; independent of details — does not imply names/paths
 ```
+
+Listed `[telemetry] otel_*` keys in signed `requirements.toml` **pin** over
+process env (destination lock). `managed_config.toml` does not. There is no
+`headers` key — collector tokens stay in `OTEL_EXPORTER_OTLP_HEADERS`. See
+[Monitoring & Usage](24-monitoring-usage.md).
 
 ### Version pinning
 
@@ -648,9 +658,9 @@ auth_token_ttl = 3600
 default = "company-grok"
 
 [model.company-grok]
-model = "grok-build"
+model = "grok-4.6"
 base_url = "https://grok-proxy.acme.com/"
-name = "Grok Build Latest (Proxy)"
+name = "Grok 4.6 (Proxy)"
 context_window = 128000
 
 [features]
