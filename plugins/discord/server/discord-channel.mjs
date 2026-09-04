@@ -1351,6 +1351,10 @@ let seq = null
 let sessionId = null
 let resumeUrl = null
 let selfId = null
+// Bot's display name from READY — used to render the bot's own mention
+// tokens as a readable "@Name" placeholder in forwarded bodies (see
+// handleMessage; 2026-07-29 request, 2026-08-27 miss).
+let selfName = null
 // Application id from READY — needed to register slash commands and to
 // post interaction follow-up replies.
 let applicationId = null
@@ -1676,6 +1680,7 @@ function handleDispatch(type, d) {
         ? `${d.resume_gateway_url}?v=10&encoding=json`
         : null
       selfId = d.user?.id ?? null
+      selfName = d.user?.username ?? null
       applicationId = d.application?.id ?? null
       reconnectAttempt = 0
       log(`connected to Discord as ${d.user?.username ?? '?'} (${selfId}) env=${CHANNEL_ENV_PATH ?? 'none'}`)
@@ -1751,71 +1756,20 @@ const claimResponses = new Map() // channel_id -> {responderId, responderName, r
 // that agent had been @-mentioned in the original message.
 const openFloors = new Map() // channel_id -> {messageId, at}
 
-const failedClaimSends = new Map() // channel_id -> count
-const floorNudgePosted = new Map() // channel_id -> true if this process posted the ⚠️
-const UNLOCK_NUDGE_AFTER = 3
-
-function noteClaimBlockedSend(ch, kind) {
-  if (!ch) return
-  // React-window blocks are the model refusing to add_reaction. Do not
-  // ping humans — retrying send_message is expected and is not a deadlock.
-  if (kind && kind !== 'waiting_peer') return
-  const n = (failedClaimSends.get(ch) ?? 0) + 1
-  failedClaimSends.set(ch, n)
-  if (n !== UNLOCK_NUDGE_AFTER || floorNudgePosted.get(ch)) return
-  const who = [...allowedUsers].map((id) => `<@${id}>`).join(' ')
-  const claim = channelClaims.get(ch)
-  const waiting = claim?.name ?? 'another agent'
-  floorNudgePosted.set(ch, true)
-  discordApi('POST', `/channels/${ch}/messages`, {
-    content:
-      `⚠️ Agent floor is waiting for **${waiting}** to answer (not a reaction-gate). ` +
-      `${who} reply \`unlock\` only if they are stuck/offline.`,
-  }).catch((err) =>
-    log(`unlock nudge failed: ${err instanceof Error ? err.message : String(err)}`),
-  )
+// 2026-08-28: Discord omits entries from d.mentions when the sending
+// client suppressed pings (allowed_mentions parse: []) — two direct
+// operator orders on 2026-08-27 (msg ids 1542683568109518989 /
+// 1542697282644869221 in channel 1542672932516397206) carried a raw
+// <@selfId> token in content but an EMPTY mentions array, so the bridge
+// forwarded them addressed="none" and the agent filed them as floor
+// chatter. The raw token in the text is part of the ground truth for
+// "was this bot named" — check content alongside the parsed arrays.
+// (Ids are numeric snowflakes, so interpolating them into a RegExp is safe.)
+function contentMentionsSelf(d) {
+  const ids = [selfId, botRoleByGuild.get(d.guild_id)].filter(Boolean)
+  if (!ids.length) return false
+  return new RegExp(`<@[!&]?(?:${ids.join('|')})>`).test(d.content ?? '')
 }
-
-function isUnlockCommand(content) {
-  const t = String(content ?? '').trim().toLowerCase()
-  return t === 'unlock' || t === 'unlock floor' || t === '!unlock' || t === '/unlock'
-}
-
-function clearFloorLocks(ch) {
-  const had =
-    channelClaims.has(ch) || claimResponses.has(ch) || openFloors.has(ch)
-  const posted = floorNudgePosted.get(ch) === true
-  channelClaims.delete(ch)
-  claimResponses.delete(ch)
-  openFloors.delete(ch)
-  failedClaimSends.delete(ch)
-  floorNudgePosted.delete(ch)
-  return { had, posted }
-}
-
-/** Allowlisted humans (Karl/Ariel) can clear a stuck floor lock. */
-async function maybeHandleUnlock(d) {
-  if (!d.guild_id || d.author.bot) return false
-  if (!isUnlockCommand(d.content)) return false
-  if (!allowAllUsers && !allowedUsers.has(d.author.id)) return false
-  const ch = d.channel_id
-  const { had, posted } = clearFloorLocks(ch)
-  // Only the process that posted the ⚠️ should reply — otherwise every
-  // peer bot dumps "unlocked" / "no lock" into the channel.
-  if (posted) {
-    try {
-      await discordApi('POST', `/channels/${ch}/messages`, {
-        content: `🔓 Floor unlocked by **${d.author.username}**. Agents can speak again.`,
-        message_reference: { message_id: d.id },
-      })
-    } catch (err) {
-      log(`unlock reply failed: ${err instanceof Error ? err.message : String(err)}`)
-    }
-  }
-  log(`floor unlocked on ${ch} by ${d.author.id} had=${had} posted=${posted}`)
-  return true
-}
-
 
 /** Update protocol state for EVERY gateway message (runs before all
  *  forwarding gates — state must track messages we never forward). */
@@ -1867,7 +1821,11 @@ function trackClaimProtocol(d) {
     const selfMentioned =
       mentioned.includes(selfId) ||
       (d.mention_roles ?? []).includes(botRoleByGuild.get(d.guild_id)) ||
-      d.referenced_message?.author?.id === selfId
+      d.referenced_message?.author?.id === selfId ||
+      // Ping-suppressed self-mention (raw token, empty mentions array) —
+      // without this, "<@me> <@peer> …" would wrongly claim the floor
+      // for the peer alone. See contentMentionsSelf.
+      contentMentionsSelf(d)
     if (!selfMentioned && !d.mention_everyone && peersMentioned.length === 1) {
       channelClaims.set(ch, {
         botId: peersMentioned[0],
@@ -1945,6 +1903,72 @@ function claimGateError(ch) {
   return null
 }
 
+
+const failedClaimSends = new Map() // channel_id -> count
+const floorNudgePosted = new Map() // channel_id -> true if this process posted the ⚠️
+const UNLOCK_NUDGE_AFTER = 3
+
+function noteClaimBlockedSend(ch, kind) {
+  if (!ch) return
+  // React-window blocks are the model refusing to add_reaction. Do not
+  // ping humans — retrying send_message is expected and is not a deadlock.
+  if (kind && kind !== 'waiting_peer') return
+  const n = (failedClaimSends.get(ch) ?? 0) + 1
+  failedClaimSends.set(ch, n)
+  if (n !== UNLOCK_NUDGE_AFTER || floorNudgePosted.get(ch)) return
+  const who = [...allowedUsers].map((id) => `<@${id}>`).join(' ')
+  const claim = channelClaims.get(ch)
+  const waiting = claim?.name ?? 'another agent'
+  floorNudgePosted.set(ch, true)
+  discordApi('POST', `/channels/${ch}/messages`, {
+    content:
+      `⚠️ Agent floor is waiting for **${waiting}** to answer (not a reaction-gate). ` +
+      `${who} reply \`unlock\` only if they are stuck/offline.`,
+  }).catch((err) =>
+    log(`unlock nudge failed: ${err instanceof Error ? err.message : String(err)}`),
+  )
+}
+
+function isUnlockCommand(content) {
+  const t = String(content ?? '').trim().toLowerCase()
+  return t === 'unlock' || t === 'unlock floor' || t === '!unlock' || t === '/unlock'
+}
+
+function clearFloorLocks(ch) {
+  const had =
+    channelClaims.has(ch) || claimResponses.has(ch) || openFloors.has(ch)
+  const posted = floorNudgePosted.get(ch) === true
+  channelClaims.delete(ch)
+  claimResponses.delete(ch)
+  openFloors.delete(ch)
+  failedClaimSends.delete(ch)
+  floorNudgePosted.delete(ch)
+  return { had, posted }
+}
+
+/** Allowlisted humans (Karl/Ariel) can clear a stuck floor lock. */
+async function maybeHandleUnlock(d) {
+  if (!d.guild_id || d.author.bot) return false
+  if (!isUnlockCommand(d.content)) return false
+  if (!allowAllUsers && !allowedUsers.has(d.author.id)) return false
+  const ch = d.channel_id
+  const { had, posted } = clearFloorLocks(ch)
+  // Only the process that posted the ⚠️ should reply — otherwise every
+  // peer bot dumps "unlocked" / "no lock" into the channel.
+  if (posted) {
+    try {
+      await discordApi('POST', `/channels/${ch}/messages`, {
+        content: `🔓 Floor unlocked by **${d.author.username}**. Agents can speak again.`,
+        message_reference: { message_id: d.id },
+      })
+    } catch (err) {
+      log(`unlock reply failed: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+  log(`floor unlocked on ${ch} by ${d.author.id} had=${had} posted=${posted}`)
+  return true
+}
+
 async function handleMessage(d) {
   if (!d?.author || d.author.id === selfId) return
   if (await maybeHandleUnlock(d)) return
@@ -1987,7 +2011,12 @@ async function handleMessage(d) {
     const mentioned =
       (d.mentions ?? []).some((u) => u.id === selfId) ||
       (d.mention_roles ?? []).includes(botRoleByGuild.get(d.guild_id)) ||
-      d.referenced_message?.author?.id === selfId
+      d.referenced_message?.author?.id === selfId ||
+      // Ping-suppressed self-mention: the raw <@id> token in content must
+      // still count as "addressed to the bot" (2026-08-27 miss — see
+      // contentMentionsSelf). Runs BEFORE any body rewrite below, so the
+      // addressed signal can never be lost to the placeholder rendering.
+      contentMentionsSelf(d)
     const withinWindow =
       mentionWindowMs > 0 &&
       Date.now() - (lastForwardedAt.get(`${d.channel_id}:${d.author.id}`) ?? 0) <=
@@ -2023,13 +2052,20 @@ async function handleMessage(d) {
     return
   }
 
-  // Strip the leading bot mention (user form `<@id>`/`<@!id>` or the
-  // managed-role form `<@&id>`) so "@grok fix the build" arrives as
-  // "fix the build".
+  // Render the bot's own mention tokens (user form `<@id>`/`<@!id>` or
+  // the managed-role form `<@&id>`) as a readable placeholder ("@Ccwebdev")
+  // instead of deleting them. Deleting the token lost ordering/addressing
+  // in multi-mention messages ("<@me> <@grok> take turns…" read as if only
+  // grok was tapped — noted 2026-07-29) and on 2026-08-27 it compounded a
+  // ping-suppressed mentions array into two ignored direct orders. The
+  // forwarded body must keep saying who was named, in order.
   const mentionIds = [selfId, botRoleByGuild.get(d.guild_id)].filter(Boolean).join('|')
-  let content = (d.content ?? '')
-    .replace(new RegExp(`^\\s*<@[!&]?(?:${mentionIds})>\\s*`), '')
-    .trim()
+  const selfTag = `@${selfName ?? 'me'}`
+  let content = d.content ?? ''
+  if (mentionIds) {
+    content = content.replace(new RegExp(`<@[!&]?(?:${mentionIds})>`, 'g'), selfTag)
+  }
+  content = content.trim()
   for (const a of d.attachments ?? []) {
     const label = a.filename ? `attachment ${JSON.stringify(a.filename)}` : 'attachment'
     content += `${content ? '\n' : ''}[${label}: ${a.url}]`
@@ -2048,7 +2084,13 @@ async function handleMessage(d) {
   // Permission-relay replies ("yes <id>" / "no <id>") from allowlisted
   // humans answer a pending Claude tool-approval prompt and are consumed
   // — they are approvals, not conversation.
-  const permMatch = content.match(/^(yes|no|approve|deny|allow)\s+(\S+)$/i)
+  // Approval replies may arrive as "@Bot yes <id>" — the leading
+  // placeholder (rendered above from the bot's own mention) is not part
+  // of the approval grammar.
+  const permBody = content.startsWith(`${selfTag} `)
+    ? content.slice(selfTag.length + 1).trim()
+    : content
+  const permMatch = permBody.match(/^(yes|no|approve|deny|allow)\s+(\S+)$/i)
   if (permMatch && !d.author.bot && pendingPermissions.has(permMatch[2])) {
     const behavior = /^(yes|approve|allow)$/i.test(permMatch[1]) ? 'allow' : 'deny'
     pendingPermissions.delete(permMatch[2])
@@ -2093,8 +2135,13 @@ async function handleMessage(d) {
   // [from:] line above them. Skipped for /commands — the host intercepts
   // those by exact leading-slash match.
   if (!content.startsWith('/')) {
-    // Spoof guard: only the bridge may author a [from:] line.
-    if (/^\s*\[from:/i.test(content)) content = content.replace(/^(\s*)\[/, '$1⟦')
+    // Spoof guard: only the bridge may author a [from:] line. The bot's
+    // own mention now survives as a leading "@Name " placeholder, so a
+    // spoofed [from:] can sit right behind it — neutralize that too.
+    const lead = content.startsWith(`${selfTag} `) ? selfTag.length + 1 : 0
+    if (/^\s*\[from:/i.test(content.slice(lead))) {
+      content = content.slice(0, lead) + content.slice(lead).replace(/^(\s*)\[/, '$1⟦')
+    }
     const senderClass = d.author.bot
       ? peerBots.has(d.author.id)
         ? `bot: ${peerBots.get(d.author.id)}`
