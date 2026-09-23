@@ -1,8 +1,11 @@
 //! Session title generation via LLM tool call.
 
+use xai_grok_sampler::SamplerConfig;
+use xai_grok_sampling_types::ApiBackend;
+
 use crate::sampling::{
     Client as OaiCompatClient, ConversationItem, ConversationRequest, ConversationToolChoice,
-    ToolSpec,
+    SamplingClient, ToolSpec,
 };
 use crate::session::helpers::chat::floor_char_boundary;
 
@@ -11,7 +14,6 @@ use crate::session::helpers::chat::floor_char_boundary;
 const TITLE_SOURCE_MAX_BYTES: usize = 8_000;
 
 /// Real-user turn counts at which the auto title is refreshed from the whole conversation, then frozen.
-/// Turn 1's title comes from the fast first-prompt path.
 /// Refreshing at a couple of early turns lets the title catch up to the real topic without churning enough to make sessions hard to recognize.
 /// A manual `/rename` always wins and stops refreshes.
 pub(crate) const TITLE_REFRESH_TURNS: [usize; 2] = [3, 6];
@@ -27,11 +29,57 @@ pub(crate) fn checkpoints_reached(turns: usize) -> usize {
 /// Applied on a char boundary, so a multibyte title is capped a little shorter, which is fine for a safety bound.
 const TITLE_MAX_BYTES: usize = 80;
 
+/// An explicit sampler route a backend pins its titles to, instead of the configured default.
+#[derive(Clone)]
+pub struct DirectSessionTitleRoute {
+    base_url: String,
+    model: String,
+    api_key: String,
+}
+
+impl DirectSessionTitleRoute {
+    pub fn new(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        api_key: impl Into<String>,
+    ) -> Self {
+        DirectSessionTitleRoute {
+            base_url: base_url.into(),
+            model: model.into(),
+            api_key: api_key.into(),
+        }
+    }
+}
+
+/// Builds the title client for a daemon pinned to a direct Grok model endpoint. The route is
+/// authoritative: its credential never falls through to the configured public endpoints.
+pub fn build_direct_session_title_client(
+    direct: DirectSessionTitleRoute,
+    client_version: Option<String>,
+) -> crate::sampling::Result<(SamplingClient, String)> {
+    let sampling_config = direct_session_title_sampling_config(direct, client_version);
+    let model = sampling_config.model.clone();
+    let client = SamplingClient::new(sampling_config)?;
+    Ok((client, model))
+}
+
+fn direct_session_title_sampling_config(
+    direct: DirectSessionTitleRoute,
+    client_version: Option<String>,
+) -> SamplerConfig {
+    SamplerConfig {
+        api_key: Some(direct.api_key),
+        base_url: direct.base_url,
+        model: direct.model,
+        api_backend: ApiBackend::Responses,
+        context_window: 200_000,
+        client_version,
+        ..SamplerConfig::default()
+    }
+}
+
 /// Durable title-refresh checkpoint watermark under `{session_dir}/`: the number of [`TITLE_REFRESH_TURNS`] checkpoints already consumed.
-/// It is written on every completed attempt (success or failure) so the freeze survives resume, restart, and compaction.
 /// Only a committed value is persisted, so an aborted refresh still retries.
-/// See [`load_title_refresh_watermark`].
-/// It is public so the fork/copy path can carry it alongside the inherited title.
 pub(crate) const TITLE_REFRESH_WATERMARK_FILE: &str = "title_refresh_idx";
 
 /// Load the persisted checkpoint index, clamped to the number of checkpoints so a stale larger value still means "frozen".
@@ -45,12 +93,8 @@ pub(crate) fn load_title_refresh_watermark(session_dir: &std::path::Path) -> Opt
 }
 
 /// The checkpoint index a session starts at on spawn.
-/// It depends on the persisted `watermark` (`None` if unmanaged), whether the feature is `enabled`, and the current real-user-turn count.
-///
 /// A managed session (has a watermark) uses it; the watermark is authoritative and durable across compaction.
 /// An unmanaged session is *adopted* as open (`0`) only when the feature is enabled and it is brand new (no turns); otherwise it freezes.
-/// That freezes pre-feature sessions, sessions created while the feature was off, and anything already past the window, so they are never retitled.
-/// There is no turn-count guessing that compaction could distort.
 pub(crate) fn initial_title_refresh_idx(
     watermark: Option<usize>,
     enabled: bool,
@@ -89,13 +133,21 @@ fn strip_system_reminder_blocks(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find(OPEN) {
-        out.push_str(&rest[..start]);
-        let after_open = &rest[start + OPEN.len()..];
+        let Some(before) = rest.get(..start) else {
+            break;
+        };
+        out.push_str(before);
+        let Some(after_open) = rest.get(start + OPEN.len()..) else {
+            return out.trim().to_string();
+        };
         // An unterminated reminder drops the remainder; it is system text
         let Some(end) = after_open.find(CLOSE) else {
             return out.trim().to_string();
         };
-        rest = &after_open[end + CLOSE.len()..];
+        let Some(next) = after_open.get(end + CLOSE.len()..) else {
+            return out.trim().to_string();
+        };
+        rest = next;
     }
     out.push_str(rest);
     out.trim().to_string()
@@ -103,7 +155,8 @@ fn strip_system_reminder_blocks(text: &str) -> String {
 
 /// Text the session title is derived from: strip system reminders and skill XML markup, then cap to the first few KB.
 /// Stripping runs before the cap so a leading reminder larger than the cap is still removed.
-fn title_source_text(user_message: &str) -> String {
+/// Callers that retain a prompt for later titling keep this, not the raw text.
+pub fn title_source_text(user_message: &str) -> String {
     let without_reminders = strip_system_reminder_blocks(user_message);
     let base = if without_reminders.is_empty() {
         user_message
@@ -117,7 +170,8 @@ fn title_source_text(user_message: &str) -> String {
     display
 }
 
-pub(crate) fn title_fallback_from_user_text(user_message: &str) -> String {
+/// The deterministic first-ten-words fallback shared by every initial-title path.
+pub fn title_fallback_from_user_text(user_message: &str) -> String {
     let text = title_source_text(user_message);
     let s = text
         .split_whitespace()
@@ -203,7 +257,6 @@ Just generate the session_title and nothing else"#,
 
 /// Instruction turn appended to a conversation snapshot to refresh the auto title.
 /// Like the recap / turn-summary side-calls, all directions live in one reminder-wrapped turn.
-/// The conversation prefix is thus reused verbatim and the prompt cache stays warm.
 /// The model sees the whole conversation, so the title reflects the real topic rather than a possibly-useless first prompt.
 pub(crate) fn title_refresh_instruction(tag: &str) -> String {
     format!(
@@ -232,9 +285,22 @@ pub(crate) fn clean_title_text(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        TITLE_SOURCE_MAX_BYTES, clean_title_text, strip_system_reminder_blocks,
+        DirectSessionTitleRoute, TITLE_SOURCE_MAX_BYTES, clean_title_text,
+        direct_session_title_sampling_config, strip_system_reminder_blocks,
         title_fallback_from_user_text, title_refresh_instruction, title_source_text,
     };
+
+    #[test]
+    fn direct_title_route_builds_its_own_sampler_config() {
+        let config = direct_session_title_sampling_config(
+            DirectSessionTitleRoute::new("http://127.0.0.1:4242/v1", "local-model", "direct-key"),
+            Some("test-version".to_owned()),
+        );
+
+        assert_eq!("http://127.0.0.1:4242/v1", config.base_url);
+        assert_eq!("local-model", config.model);
+        assert_eq!(Some("direct-key"), config.api_key.as_deref());
+    }
 
     #[test]
     fn checkpoints_reached_counts_and_catches_up() {
