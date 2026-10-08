@@ -48,7 +48,7 @@ impl SessionActor {
                 )
                 .into_iter()
                 .filter_map(|(server, source)| match source {
-                    xai_grok_tools::types::config_source::ConfigSource::Plugin {
+                    xai_grok_config::mcp_servers::McpServerOrigin::Plugin {
                         plugin_name,
                         ..
                     } => Some((
