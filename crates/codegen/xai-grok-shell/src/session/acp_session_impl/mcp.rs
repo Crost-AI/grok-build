@@ -1178,10 +1178,18 @@ impl SessionActor {
         mcp_state: &mut McpState,
         mut configs: Vec<acp::McpServer>,
     ) -> Option<crate::session::mcp_servers::McpConfigChange> {
-        // Crost channels: a server-set change is rematerialized from the raw
-        // config sources, so the per-channel `.env` credential overlay that
-        // `setup_channels` applied at startup has to be re-applied here or an
-        // opted-in channel server would be respawned without its credentials.
+        self.apply_active_channel_env_overlay(&mut configs);
+        let change = mcp_state.change_configs(configs)?;
+        self.init_publication().reset();
+        Some(change)
+    }
+    /// Crost channels: a server-set change is rematerialized from the raw
+    /// config sources, so the per-channel `.env` credential overlay that
+    /// `setup_channels` applied at startup has to be re-applied before the
+    /// config diff or an opted-in channel server would be respawned without
+    /// its credentials. Every path that diffs `mcp_state.configs` against a
+    /// rematerialized list must call this first.
+    pub(super) fn apply_active_channel_env_overlay(&self, configs: &mut [acp::McpServer]) {
         let active_servers = self
             .channel_registry
             .lock()
@@ -1190,11 +1198,8 @@ impl SessionActor {
             .clone();
         if !active_servers.is_empty() {
             let loaded = crate::session::channels::load_active_channel_env(&active_servers);
-            crate::session::channels::apply_loaded_channel_env_overlay(&mut configs, &loaded);
+            crate::session::channels::apply_loaded_channel_env_overlay(configs, &loaded);
         }
-        let change = mcp_state.change_configs(configs)?;
-        self.init_publication().reset();
-        Some(change)
     }
     pub(super) fn restart_mcp_init(
         &self,

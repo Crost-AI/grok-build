@@ -1,6 +1,6 @@
 use xai_grok_sampling_types::conversation::ConversationItem;
 
-use super::support::{build_actor, running_task_stub};
+use super::support::{actor_with_mcp, build_actor, running_task_stub, stdio};
 use crate::session::SwitchContextWindow;
 use crate::session::compaction_config::AsyncCompactionCache;
 
@@ -118,6 +118,56 @@ async fn zero_turn_rebuild_renders_switch_target_label() {
                 agent.prompt_context().system_prompt_label
             );
             assert_eq!(agent.system_prompt(), head);
+        })
+        .await;
+}
+
+/// Crost channels: a zero-turn rebuild rematerializes MCP servers from the raw config sources,
+/// which drops the per-channel `.env` overlay; the rebuild must re-apply it so the diff keeps
+/// the live channel server instead of respawning it without credentials.
+#[tokio::test(flavor = "current_thread")]
+async fn zero_turn_rebuild_keeps_channel_env_overlay() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            const CHANNEL: &str = "crost-rebuild-test-channel";
+            let raw = stdio(CHANNEL, "/nonexistent/crost-rebuild-test-channel");
+            let active_servers = std::collections::HashMap::from([(
+                CHANNEL.to_owned(),
+                format!("server:{CHANNEL}"),
+            )]);
+            let mut live = vec![raw.clone()];
+            crate::session::channels::apply_channel_env_overlay(&mut live, &active_servers);
+            let actor = actor_with_mcp(live.clone(), true, Vec::new()).await;
+            actor
+                .channel_registry
+                .lock()
+                .expect("channel_registry mutex poisoned")
+                .active_servers = active_servers;
+            *actor.initial_client_mcp_servers.borrow_mut() = vec![raw];
+            let mut definition = xai_grok_agent::AgentDefinition::default_grok_build();
+            definition.mcp_servers = vec![xai_grok_agent::config::McpServerRef::Inline {
+                name: "seat-adder".to_owned(),
+                config: serde_json::json!({
+                    "type": "stdio",
+                    "command": "/nonexistent/seat-adder",
+                    "args": [],
+                }),
+            }];
+
+            actor
+                .handle_rebuild_agent_for_definition(definition, SWITCH_TARGET_LABEL.to_owned())
+                .await
+                .expect("zero-turn rebuild succeeds");
+
+            let configs = actor.mcp_state.lock().await.configs.clone();
+            let channel = configs
+                .iter()
+                .find(|c| crate::session::mcp_servers::mcp_server_name(c) == CHANNEL)
+                .expect("channel server survives the rebuild");
+            assert_eq!(
+                &live[0], channel,
+                "rebuilt channel server must carry the same channel env overlay as the live one"
+            );
         })
         .await;
 }

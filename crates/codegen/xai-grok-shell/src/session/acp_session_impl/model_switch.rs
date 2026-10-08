@@ -388,20 +388,23 @@ impl SessionActor {
         } else {
             let client_seed = self.initial_client_mcp_servers.borrow().clone();
             let live = self.mcp_state.lock().await.configs.clone();
-            Some(
-                crate::session::agent_mcp::rematerialize_live_for_agent_seat(
-                    &live,
-                    &previous_mcp_servers,
-                    crate::session::agent_mcp::RematerializeParams {
-                        initial_client_mcp_servers: client_seed,
-                        cwd: session_cwd,
-                        parent_cwd: self.startup_hints.parent_cwd.as_deref(),
-                        plugin_registry: plugin_registry.as_deref(),
-                        compat: &self.rebuild_spec.compat,
-                        definition: &overlay_definition,
-                    },
-                ),
-            )
+            let mut servers = crate::session::agent_mcp::rematerialize_live_for_agent_seat(
+                &live,
+                &previous_mcp_servers,
+                crate::session::agent_mcp::RematerializeParams {
+                    initial_client_mcp_servers: client_seed,
+                    cwd: session_cwd,
+                    parent_cwd: self.startup_hints.parent_cwd.as_deref(),
+                    plugin_registry: plugin_registry.as_deref(),
+                    compat: &self.rebuild_spec.compat,
+                    definition: &overlay_definition,
+                },
+            );
+            // Crost channels: the rematerialized channel servers lack the
+            // `.env` overlay the live ones carry, so without it the diff
+            // below respawns them without credentials.
+            self.apply_active_channel_env_overlay(&mut servers);
+            Some(servers)
         };
         let (claim, config_diff, dispatch_event_tx) = {
             let mut mcp_state = self.mcp_state.lock().await;
