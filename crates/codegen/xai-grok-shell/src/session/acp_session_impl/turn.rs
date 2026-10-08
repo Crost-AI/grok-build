@@ -525,6 +525,9 @@ impl SessionActor {
         } = request;
         let prompt_id = prompt_id.as_str();
         let handle_prompt_start = std::time::Instant::now();
+        self.chat_state_handle
+            .record_turn_start(chrono::Utc::now().timestamp_millis());
+        self.apply_supported_context_window_selection().await;
         *self.active_skill.lock() = None;
         xai_grok_telemetry::unified_log::info(
             "shell.handle_prompt.start",
@@ -2145,6 +2148,7 @@ impl SessionActor {
             return None;
         }
         if is_v2 {
+            let compact_index = self.memory.v2_config.compact_index_enabled;
             let conversation = self.chat_state_handle.get_conversation().await;
             if crate::session::helpers::memory_context::conversation_has_memory_context(
                 &conversation,
@@ -2174,6 +2178,7 @@ impl SessionActor {
                         injected_bytes,
                         estimated_tokens,
                         was_reused: true,
+                        compact_index,
                         ..Default::default()
                     },
                 );
@@ -2182,7 +2187,10 @@ impl SessionActor {
             let inject_start = std::time::Instant::now();
             let storage = self.memory.storage()?;
             let context = tokio::task::spawn_blocking(move || {
-                crate::session::helpers::memory_context::format_v2_memory_context(&storage)
+                crate::session::helpers::memory_context::format_v2_memory_context(
+                    &storage,
+                    compact_index,
+                )
             })
             .await
             .map_err(|error| error.to_string())
@@ -2204,6 +2212,7 @@ impl SessionActor {
                             ),
                             global_entry_count: context.global_entry_count,
                             workspace_entry_count: context.workspace_entry_count,
+                            compact_index,
                             duration_ms: inject_start.elapsed().as_millis() as u64,
                             ..Default::default()
                         },
@@ -2222,7 +2231,10 @@ impl SessionActor {
                     crate::session::memory_observation::log_memory_injection(
                         self.session_info.id.to_string(),
                         xai_grok_telemetry::memory_telemetry::MemoryInjectionOutcome::Error,
-                        Default::default(),
+                        crate::session::memory_observation::MemoryInjectionMetrics {
+                            compact_index,
+                            ..Default::default()
+                        },
                     );
                     None
                 }
@@ -2435,22 +2447,28 @@ impl SessionActor {
         if signals.turn_count == 0 {
             return;
         }
-        match self.chat_state_handle.try_get_session_usage().await {
-            Ok(ledger) => {
-                let _ = self
-                    .notifications
-                    .persistence_tx
-                    .send(PersistenceMsg::UsageTurn {
-                        turn_number: signals.turn_count,
-                        live: crate::session::usage_file::UsageSummary::from_ledger(&ledger),
-                    });
-            }
-            Err(()) => {
-                tracing::warn!(
-                    turn_number = signals.turn_count,
-                    "failed to snapshot session usage for persist"
-                );
-            }
+        let Ok(ledger) = self.chat_state_handle.try_get_session_usage().await else {
+            tracing::warn!(
+                turn_number = signals.turn_count,
+                "failed to snapshot session usage for persist"
+            );
+            return;
+        };
+        let (respond_to, ack) = oneshot::channel();
+        if self
+            .notifications
+            .persistence_tx
+            .send(PersistenceMsg::UsageTurn {
+                turn_number: signals.turn_count,
+                live: crate::session::usage_file::UsageSummary::from_ledger(&ledger),
+                respond_to,
+            })
+            .is_err()
+        {
+            return;
+        }
+        if let Ok(Err(e)) = ack.await {
+            tracing::warn!(?e, "session usage persist failed");
         }
     }
     /// Shared round-completion bookkeeping (plan cleanup, cancel-streak reset, token sums, feedback prompt).
@@ -2988,9 +3006,10 @@ impl SessionActor {
             request.x_grok_transient_retry =
                 (transient_retry_attempts > 0).then(|| transient_retry_attempts.to_string());
             if request.x_grok_deployment_id.is_none() {
-                request.x_grok_deployment_id = crate::managed_config::resolve_deployment_id(
-                    crate::managed_config::resolve_deployment_key().as_deref(),
-                );
+                request.x_grok_deployment_id =
+                    xai_grok_cloud_config::managed_config::resolve_deployment_id(
+                        xai_grok_cloud_config::managed_config::resolve_deployment_key().as_deref(),
+                    );
             }
             if structured_output_native {
                 request.json_schema = json_schema.clone();

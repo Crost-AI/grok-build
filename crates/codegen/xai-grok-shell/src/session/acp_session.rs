@@ -50,7 +50,6 @@ use crate::session::signals::{SessionSignalsHandle, TurnDeltaSnapshot};
 use crate::session::slash_commands::{self, BuiltinAction, SlashCommandOutcome};
 use crate::session::storage::SessionUpdate;
 use crate::session::user_message::construct_user_message_minimal;
-use crate::session::user_message::extract_user_query;
 use crate::terminal::TerminalRunRequest;
 use crate::tools::ToolContext;
 use agent_client_protocol as acp;
@@ -217,6 +216,8 @@ use extensions::*;
 #[path = "acp_session_impl/memory_dream.rs"]
 mod memory_dream;
 use memory_dream::*;
+#[path = "acp_session_impl/batch_memory_dream.rs"]
+mod batch_memory_dream;
 #[path = "acp_session_impl/goal_support.rs"]
 mod goal_support;
 #[path = "acp_session_impl/memory_capture.rs"]
@@ -2073,6 +2074,9 @@ mod turn_end_guard_tests;
 #[cfg(test)]
 #[path = "acp_session_tests/turn_end_reporting_tests.rs"]
 mod turn_end_reporting_tests;
+#[cfg(test)]
+#[path = "acp_session_tests/turn/turn_start_anchor_tests.rs"]
+mod turn_start_anchor_tests;
 #[cfg(test)]
 #[path = "acp_session_tests/wait_for_mcp_prefix_tests.rs"]
 mod wait_for_mcp_prefix_tests;

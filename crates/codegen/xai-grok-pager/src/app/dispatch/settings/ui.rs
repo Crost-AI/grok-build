@@ -16,7 +16,7 @@ use super::setters::{
     set_timestamps, set_timestamps_inner, set_vim_mode_inner, set_voice_capture_mode_inner,
     set_voice_keybind_enabled_inner, set_voice_stt_language_inner,
 };
-use crate::app::actions::{Action, Effect};
+use crate::app::actions::{Action, Effect, ModelChoice};
 use crate::app::app_view::{ActiveView, AppView};
 use crate::app::dispatch::ctx::with_active_agent;
 use crate::app::dispatch::modes::{set_yolo_mode_inner, sync_active_auto_flag};
@@ -35,6 +35,7 @@ pub(in crate::app::dispatch) fn save_success_toast(label: &str, on: bool) -> Str
 /// The modal stores snapshots by value; without this, toggles would appear stuck.
 pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
     use crate::views::modal::ActiveModal;
+    use crate::views::settings_modal::SettingsModalMode;
     // Early exit when no settings modal is open (common case).
     if !app.agents.values().any(|a| {
         matches!(
@@ -94,6 +95,14 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                 voice_stt_language: voice_stt_language_from_app.clone(),
                 subagent_model_inheritance: subagent_model_inheritance_from_app,
             };
+            if coding_data_sharing_lock_from_app.is_some()
+                && matches!(
+                    state.mode(),
+                    SettingsModalMode::PickingEnum { key, .. } if crate::settings::is_consent_chooser(key)
+                )
+            {
+                state.transition_to_browse();
+            }
         }
     }
 }
@@ -972,8 +981,7 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
                             companion_effects.push(Effect::SwitchModel {
                                 agent_id: aid,
                                 session_id: sid,
-                                model_id: id,
-                                effort: None,
+                                choice: ModelChoice::new(id),
                                 prev_model_id: None,
                             });
                         }

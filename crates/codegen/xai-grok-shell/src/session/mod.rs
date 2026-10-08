@@ -1,6 +1,7 @@
 pub mod acp_types;
 pub mod announcement_state;
-pub(crate) mod auto_mode;
+pub mod auto_mode;
+pub mod batch_dream;
 pub mod channels;
 pub mod commands;
 pub(crate) mod compaction_config;
@@ -524,6 +525,7 @@ pub(crate) mod events;
 pub mod export;
 pub mod feedback;
 pub mod feedback_manager;
+pub(crate) mod file_acceleration;
 pub mod file_system;
 pub mod fork;
 pub(crate) mod fs_watch;

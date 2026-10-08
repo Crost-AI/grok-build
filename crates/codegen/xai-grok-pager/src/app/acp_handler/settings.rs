@@ -35,6 +35,7 @@ pub(super) fn handle_models_update(notif: &acp::ExtNotification, app: &mut AppVi
                 .session
                 .models
                 .update_catalog(new_models.available.clone());
+            agent.refresh_context_total();
         }
         true
     } else {
@@ -61,8 +62,8 @@ pub(super) fn handle_settings_update(notif: &acp::ExtNotification, app: &mut App
         xai_grok_shell::util::config::set_remote_campaigns_from_settings(Some(&rs));
         // The settings row read its campaign layer at startup; the same re-read the shell does on `/new` keeps its value and lock current
         match xai_grok_shell::config::load_effective_config_with_layers() {
-            Ok((layers, _)) => {
-                app.subagent_model_inheritance.reseed_config_layers(&layers);
+            Ok(loaded) => {
+                app.subagent_model_inheritance.reseed_config_layers(&loaded);
                 crate::app::dispatch::refresh_open_settings_modals(app);
             }
             Err(e) => {
@@ -394,25 +395,26 @@ pub(super) fn apply_soft_default_permission_mode(
 /// `yolo_mode` is deliberately OMITTED: the agent skips the yolo branch when the key is absent.
 /// A sibling tab's always-approve is thus preserved; only auto is cleared.
 pub(super) fn notify_sessions_leave_auto(app: &AppView, session_ids: &[acp::SessionId]) {
-    if session_ids.is_empty() {
-        return;
+    for session_id in session_ids {
+        let params = serde_json::json!({
+            "sessionId": session_id,
+            "auto_mode": false,
+            "permission_mode": "ask",
+        });
+        let notification = acp::ExtNotification::new(
+            "x.ai/yolo_mode_changed",
+            serde_json::value::to_raw_value(&params)
+                .expect("serialize yolo_mode_changed params")
+                .into(),
+        );
+
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let args = xai_acp_lib::AcpArgs {
+            request: notification,
+            response_tx,
+        };
+        let _ = app.acp_tx.send(args.into());
     }
-    let params = serde_json::json!({
-        "auto_mode": false,
-        "permission_mode": "ask",
-    });
-    let notification = acp::ExtNotification::new(
-        "x.ai/yolo_mode_changed",
-        serde_json::value::to_raw_value(&params)
-            .expect("serialize yolo_mode_changed params")
-            .into(),
-    );
-    let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
-    let args = xai_acp_lib::AcpArgs {
-        request: notification,
-        response_tx,
-    };
-    let _ = app.acp_tx.send(args.into());
 }
 
 /// Handle `x.ai/sessions/changed`: the leader broadcasts roster upserts/removals to all clients (FleetView dashboard).

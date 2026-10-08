@@ -503,6 +503,7 @@ impl SessionActor {
             had_queued_user_prompt,
             turn_epoch,
             message_completions,
+            captures_cancelled_turn,
         ) = {
             let mut state = self.state.lock().await;
             debug_assert!(
@@ -636,6 +637,12 @@ impl SessionActor {
                 }
                 return CancelOutcome::noop();
             }
+            // Read before the front drains; teardown ends the session and rewind drops the turn.
+            let captures_cancelled_turn = kind != Some(crate::session::CancelKind::Teardown)
+                && rewound_input.is_none()
+                && cancelled_prompt_id
+                    .as_deref()
+                    .is_some_and(|prompt_id| Self::is_capturable_front(&state, prompt_id));
 
             // Only an interactive stop (Ctrl+C / Esc / [stop]) also removes queued task/workflow completion wakes.
             // Preserve real user prompts and unrelated synthetic entries so `maybe_start_running_task` can promote the next genuine user turn.
@@ -709,6 +716,7 @@ impl SessionActor {
                 had_queued_user_prompt,
                 turn_epoch,
                 message_completions,
+                captures_cancelled_turn,
             )
         };
         // True iff this cancel aborted a live task: the Keep-with-task rail and
@@ -905,10 +913,7 @@ impl SessionActor {
             stop_reason: acp::StopReason::Cancelled,
             total_tokens,
             turn_snapshot: None,
-            completion_kind: PromptCompletionKind::Cancelled {
-                category: Some(crate::session::events::CancellationCategory::MidTurnAbort),
-                context: None,
-            },
+            completion_kind: PromptCompletionKind::mid_turn_abort(None),
             structured_output: None,
             usage: cancelled_usage.clone(),
             tool_overrides: self.effective_tool_overrides(),
@@ -929,21 +934,17 @@ impl SessionActor {
                     stop_reason: acp::StopReason::Cancelled,
                     total_tokens,
                     turn_snapshot: None,
-                    completion_kind: PromptCompletionKind::Cancelled {
-                        // Running turn only, matching events.jsonl's category; queued prompts were removed, not mid-turn aborted
-                        category: is_running_turn
-                            .then_some(crate::session::events::CancellationCategory::MidTurnAbort),
-                        // Attach the trigger to the running turn only (idx 0); MvpAgent stamps it on the `PromptResponse` `_meta`
-                        context: if is_running_turn {
-                            trigger.as_ref().map(|t| {
-                                crate::session::commands::CancellationContext {
-                                    trigger: Some(t.as_str().to_string()),
-                                    ..Default::default()
-                                }
-                            })
-                        } else {
-                            None
-                        },
+                    // Category and trigger go to the running turn only (idx 0), matching events.jsonl's category
+                    // Queued prompts were removed, not mid-turn aborted; MvpAgent stamps the trigger on the `PromptResponse` `_meta`
+                    completion_kind: if is_running_turn {
+                        PromptCompletionKind::mid_turn_abort(
+                            trigger.as_ref().map(crate::session::CancelTrigger::as_str),
+                        )
+                    } else {
+                        PromptCompletionKind::Cancelled {
+                            category: None,
+                            context: None,
+                        }
                     },
                     structured_output: None,
                     usage: if is_running_turn {
@@ -960,6 +961,12 @@ impl SessionActor {
                     },
                 }))
                 .ok();
+        }
+        // The aborted task skips the completion arm; no next turn starts before this returns.
+        if captures_cancelled_turn && let Some(session) = self.weak_self.upgrade() {
+            let source_prompt_index = *self.tool_context.prompt_index.lock().await;
+            session.enqueue_v2_turn_capture(source_prompt_index).await;
+            session.schedule_v2_dream_check_after_turn();
         }
         let settled = match &mut finalization {
             CancelFinalization::Keep(lease) => self.finish_finalization_lease(lease).await,
